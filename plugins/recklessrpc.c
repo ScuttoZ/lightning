@@ -95,7 +95,7 @@ static void dup_listavailable_result(struct reckless *reckless,
 			json_add_string(response, "short_description", short_description);
 		if (!streq(long_description, "null"))
 			json_add_string(response, "long_description", long_description);
-		json_add_string(response, "entypoint", entrypoint);
+		json_add_string(response, "entrypoint", entrypoint);
 
 		json_array_start(response, "requirements");
 		requirements_tok = json_get_member(reckless_result, result, "requirements");
