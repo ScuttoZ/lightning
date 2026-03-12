@@ -10,6 +10,7 @@ from utils import (
     mine_funding_to_announce, first_scid, serialize_payload_tlv, serialize_payload_final_tlv,
     tu64_encode
 )
+import allure
 import copy
 import json
 import os
@@ -24,65 +25,90 @@ import unittest
 
 @pytest.mark.openchannel('v1')
 @pytest.mark.openchannel('v2')
+@allure.title("Basic payment flow between two nodes")
+@allure.description("""
+Verifies the end-to-end payment flow using `pay` and `dev_pay` between two
+directly connected nodes (l1 -> l2). Covers:
+
+- Fixed-amount invoice payment and result field validation
+- Idempotency: repeat payment of a settled invoice is a NOP
+- Rejection of amount overrides on fixed-amount invoices
+- Any-amount invoice payments (must supply an amount)
+- listsendpays filtering by bolt11
+- HTLC settlement confirmation
+- Bookkeeper channel APY accounting sanity check
+""")
 def test_pay(node_factory):
+    # Set up a two-node line graph with a shared channel.
     l1, l2 = node_factory.line_graph(2)
 
-    inv = l2.rpc.invoice(123000, 'test_pay', 'description')['bolt11']
-    before = int(time.time())
-    details = l1.dev_pay(inv, dev_use_shadow=False)
-    after = time.time()
-    preimage = details['payment_preimage']
-    assert details['status'] == 'complete'
-    assert details['amount_msat'] == Millisatoshi(123000)
-    assert details['destination'] == l2.info['id']
-    assert details['created_at'] >= before
-    assert details['created_at'] <= after
+    with allure.step("Create fixed-amount invoice on l2 and pay it from l1"):
+        inv = l2.rpc.invoice(123000, 'test_pay', 'description')['bolt11']
+        before = int(time.time())
+        details = l1.dev_pay(inv, dev_use_shadow=False)
+        after = time.time()
+        preimage = details['payment_preimage']
+        # Validate all expected fields in the payment result.
+        assert details['status'] == 'complete'
+        assert details['amount_msat'] == Millisatoshi(123000)
+        assert details['destination'] == l2.info['id']
+        assert details['created_at'] >= before
+        assert details['created_at'] <= after
 
-    invoices = l2.rpc.listinvoices('test_pay')['invoices']
-    assert len(invoices) == 1
-    invoice = invoices[0]
-    assert invoice['status'] == 'paid' and invoice['paid_at'] >= before and invoice['paid_at'] <= after
+    with allure.step("Verify invoice is marked paid on l2"):
+        invoices = l2.rpc.listinvoices('test_pay')['invoices']
+        assert len(invoices) == 1
+        invoice = invoices[0]
+        assert invoice['status'] == 'paid' and invoice['paid_at'] >= before and invoice['paid_at'] <= after
 
-    # Repeat payments are NOPs (if valid): we can hand null.
-    l1.dev_pay(inv, dev_use_shadow=False)
-    # This won't work: can't provide an amount (even if correct!)
-    with pytest.raises(RpcError):
-        l1.rpc.pay(inv, 123000)
-    with pytest.raises(RpcError):
-        l1.rpc.pay(inv, 122000)
+    with allure.step("Verify repeat payment of settled invoice is a NOP"):
+        # Repeat payments are NOPs (if valid): we can hand null.
+        l1.dev_pay(inv, dev_use_shadow=False)
 
-    # Check pay_index is not null
-    outputs = l2.db_query('SELECT pay_index IS NOT NULL AS q FROM invoices WHERE label="label";')
-    assert len(outputs) == 1 and outputs[0]['q'] != 0
-
-    # Check payment of any-amount invoice.
-    for i in range(5):
-        label = "any{}".format(i)
-        inv2 = l2.rpc.invoice("any", label, 'description')['bolt11']
-        # Must provide an amount!
+    with allure.step("Verify amount override on fixed-amount invoice is rejected"):
+        # This won't work: can't provide an amount (even if correct!)
         with pytest.raises(RpcError):
-            l1.rpc.pay(inv2)
-        l1.dev_pay(inv2, random.randint(1000, 999999), dev_use_shadow=False)
+            l1.rpc.pay(inv, 123000)
+        with pytest.raises(RpcError):
+            l1.rpc.pay(inv, 122000)
 
-    # Should see 6 completed payments
-    assert len(l1.rpc.listsendpays()['payments']) == 6
+    with allure.step("Verify pay_index is not null in l2 database"):
+        outputs = l2.db_query('SELECT pay_index IS NOT NULL AS q FROM invoices WHERE label="label";')
+        assert len(outputs) == 1 and outputs[0]['q'] != 0
 
-    # Test listsendpays indexed by bolt11.
-    payments = l1.rpc.listsendpays(inv)['payments']
-    assert len(payments) == 1 and payments[0]['payment_preimage'] == preimage
+    with allure.step("Pay five any-amount invoices from l1 to l2"):
+        # Check payment of any-amount invoice.
+        for i in range(5):
+            label = "any{}".format(i)
+            inv2 = l2.rpc.invoice("any", label, 'description')['bolt11']
+            # Must provide an amount!
+            with pytest.raises(RpcError):
+                l1.rpc.pay(inv2)
+            l1.dev_pay(inv2, random.randint(1000, 999999), dev_use_shadow=False)
 
-    # Make sure they're completely settled, so accounting correct.
-    wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+    with allure.step("Verify total of 6 completed payments in listsendpays"):
+        # Should see 6 completed payments
+        assert len(l1.rpc.listsendpays()['payments']) == 6
 
-    # Check channels apy summary view of channel activity
-    apys_1 = l1.rpc.bkpr_channelsapy()['channels_apy']
-    apys_2 = l2.rpc.bkpr_channelsapy()['channels_apy']
+    with allure.step("Verify listsendpays filtered by bolt11 returns correct preimage"):
+        # Test listsendpays indexed by bolt11.
+        payments = l1.rpc.listsendpays(inv)['payments']
+        assert len(payments) == 1 and payments[0]['payment_preimage'] == preimage
 
-    assert apys_1[0]['channel_start_balance_msat'] == apys_2[0]['channel_start_balance_msat']
-    assert apys_1[0]['channel_start_balance_msat'] == apys_1[0]['our_start_balance_msat']
-    assert apys_2[0]['our_start_balance_msat'] == Millisatoshi(0)
-    assert apys_1[0]['routed_out_msat'] == apys_2[0]['routed_in_msat']
-    assert apys_1[0]['routed_in_msat'] == apys_2[0]['routed_out_msat']
+    with allure.step("Wait for all HTLCs to settle"):
+        # Make sure they're completely settled, so accounting correct.
+        wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['htlcs'] == [])
+
+    with allure.step("Validate bookkeeper channel APY accounting"):
+        # Check channels apy summary view of channel activity
+        apys_1 = l1.rpc.bkpr_channelsapy()['channels_apy']
+        apys_2 = l2.rpc.bkpr_channelsapy()['channels_apy']
+
+        assert apys_1[0]['channel_start_balance_msat'] == apys_2[0]['channel_start_balance_msat']
+        assert apys_1[0]['channel_start_balance_msat'] == apys_1[0]['our_start_balance_msat']
+        assert apys_2[0]['our_start_balance_msat'] == Millisatoshi(0)
+        assert apys_1[0]['routed_out_msat'] == apys_2[0]['routed_in_msat']
+        assert apys_1[0]['routed_in_msat'] == apys_2[0]['routed_out_msat']
 
 
 def test_pay_amounts(node_factory):
