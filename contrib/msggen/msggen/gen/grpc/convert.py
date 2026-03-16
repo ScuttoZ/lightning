@@ -71,6 +71,7 @@ class GrpcConverterGenerator(IGenerator):
                     "short_channel_id": f"i.to_string()",
                     "short_channel_id_dir": f"i.to_string()",
                     "pubkey": f"i.serialize().to_vec()",
+                    "txid": f"hex::decode(i).unwrap()",
                 }.get(typ, f"i.into()")
 
                 self.write(f"// Field: {f.path}\n", numindent=3)
@@ -126,9 +127,12 @@ class GrpcConverterGenerator(IGenerator):
                     "feerate?": f"c.{name}.map(|o|o.into())",
                     "feerate": f"Some(c.{name}.into())",
                     "outpoint?": f"c.{name}.map(|o|o.into())",
+                    "outpoint": f"Some(c.{name}.into())",
                     "TlvStream?": f"c.{name}.map(|s| s.into())",
                     "RoutehintList?": f"c.{name}.map(|rl| rl.into())",
                     "DecodeRoutehintList?": f"c.{name}.map(|drl| drl.into())",
+                    "string_map": f"Some(c.{name})",
+                    "string_map?": f"c.{name}.unwrap_or(HashMap::new())",
                 }.get(
                     typ, f"c.{name}"  # default to just assignment
                 )
@@ -201,6 +205,7 @@ class GrpcConverterGenerator(IGenerator):
         use cln_rpc::notifications;
         use crate::pb;
         use std::str::FromStr;
+        use std::collections::HashMap;
         use bitcoin::hashes::sha256::Hash as Sha256;
         use bitcoin::hashes::Hash;
         use cln_rpc::primitives::PublicKey;

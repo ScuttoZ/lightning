@@ -3,21 +3,11 @@
 #define LIGHTNING_PLUGINS_LIBPLUGIN_H
 #include "config.h"
 
-#include <bitcoin/tx.h>
-#include <ccan/intmap/intmap.h>
-#include <ccan/membuf/membuf.h>
-#include <ccan/strmap/strmap.h>
-#include <ccan/time/time.h>
 #include <ccan/timer/timer.h>
-#include <common/errcode.h>
-#include <common/features.h>
 #include <common/htlc.h>
 #include <common/json_command.h>
-#include <common/jsonrpc_errors.h>
 #include <common/node_id.h>
-#include <common/status_levels.h>
 #include <common/utils.h>
-#include <stdarg.h>
 
 struct json_out;
 struct htable;
@@ -109,6 +99,14 @@ struct plugin_hook {
 	                                 const jsmntok_t *params);
 	/* If non-NULL, these are NULL-terminated arrays of deps */
 	const char **before, **after;
+
+	/* String filters (you can only set this *or* intfilters) */
+	const char **strfilters;
+	size_t num_strfilters;
+
+	/* Integer filters */
+	const u64 *intfilters;
+	size_t num_intfilters;
 };
 
 /* Return the feature set of the current lightning node */
@@ -272,7 +270,7 @@ struct json_stream *jsonrpc_stream_fail_data(struct command *cmd,
 struct command_result *jsonrpc_set_datastore_(struct command *cmd,
 					      const char *path,
 					      const void *value,
-					      bool value_is_string,
+					      int len_or_str,
 					      const char *mode,
 					      struct command_result *(*cb)(struct command *command,
 									   const char *method,
@@ -288,7 +286,7 @@ struct command_result *jsonrpc_set_datastore_(struct command *cmd,
 	NON_NULL_ARGS(1, 2, 3, 5);
 
 #define jsonrpc_set_datastore_string(cmd, path, str, mode, cb, errcb, arg) \
-	jsonrpc_set_datastore_((cmd), (path), (str), true, (mode),	\
+	jsonrpc_set_datastore_((cmd), (path), (str), -1, (mode),	\
 			       typesafe_cb_preargs(struct command_result *, void *, \
 						   (cb), (arg),		\
 						   struct command *command, \
@@ -303,8 +301,8 @@ struct command_result *jsonrpc_set_datastore_(struct command *cmd,
 						   const jsmntok_t *result), \
 			       (arg))
 
-#define jsonrpc_set_datastore_binary(cmd, path, tal_ptr, mode, cb, errcb, arg) \
-	jsonrpc_set_datastore_((cmd), (path), (tal_ptr), false, (mode), \
+#define jsonrpc_set_datastore_binary(cmd, path, ptr, len, mode, cb, errcb, arg) \
+	jsonrpc_set_datastore_((cmd), (path), (ptr), (len), (mode),	\
 			       typesafe_cb_preargs(struct command_result *, void *, \
 						   (cb), (arg),		\
 						   struct command *command, \
@@ -365,11 +363,18 @@ WARN_UNUSED_RESULT
 struct command_result *command_still_pending(struct command *cmd)
 	NON_NULL_ARGS(1);
 
+/* Forward this raw JSON string as the command response */
+WARN_UNUSED_RESULT
+struct command_result *command_finish_rawstr(struct command *cmd,
+					     const char *json,
+					     size_t json_len)
+	NO_NULL_ARGS;
+
 /* Helper to create a zero or single-value JSON object; if @str is NULL,
  * object is empty. */
 struct json_out *json_out_obj(const tal_t *ctx,
 			      const char *fieldname,
-			      const char *str);
+			      const char *str TAKES);
 
 /* Return this iff the param() call failed in your handler. */
 struct command_result *command_param_failed(void);
@@ -378,6 +383,13 @@ struct command_result *command_param_failed(void);
 bool command_deprecated_in_named_ok(struct command *cmd,
 				    const char *cmdname,
 				    const char *param,
+				    const char *depr_start,
+				    const char *depr_end);
+
+/* Should we include this field in the notification? */
+bool notification_deprecated_out_ok(struct plugin *plugin,
+				    const char *method,
+				    const char *fieldname,
 				    const char *depr_start,
 				    const char *depr_end);
 
@@ -411,14 +423,12 @@ command_success(struct command *cmd, const struct json_out *result)
 	NON_NULL_ARGS(1, 2);
 
 /* End a hook normally (with "result": "continue") */
-struct command_result *WARN_UNUSED_RESULT
-command_hook_success(struct command *cmd)
-	NON_NULL_ARGS(1);
+struct command_result *command_hook_success(struct command *cmd)
+	WARN_UNUSED_RESULT NON_NULL_ARGS(1);
 
 /* End a notification handler.  */
-struct command_result *WARN_UNUSED_RESULT
-notification_handled(struct command *cmd)
-	NON_NULL_ARGS(1);
+struct command_result *notification_handled(struct command *cmd)
+	WARN_UNUSED_RESULT NON_NULL_ARGS(1);
 
 /* End a command created with aux_command.  */
 struct command_result *WARN_UNUSED_RESULT
@@ -438,24 +448,24 @@ bool command_deprecated_ok_flag(const struct command *cmd)
 #define notification_handler_pending(cmd) command_still_pending(cmd)
 
 /* Synchronous helper to send command and extract fields from
- * response; can only be used in init callback. */
-void rpc_scan(struct command *init_cmd,
+ * response. */
+void rpc_scan(struct command *cmd,
 	      const char *method,
 	      const struct json_out *params TAKES,
 	      const char *guide,
 	      ...);
 
-/* Helper to scan datastore: can only be used in init callback.  Returns error
- * msg (usually meaning field does not exist), or NULL on success. path is
- * /-separated.  Final arg is JSON_SCAN or JSON_SCAN_TAL.
+/* Helper to scan datastore.  Returns error msg (usually meaning field
+ * does not exist), or NULL on success. path is /-separated.  Final
+ * arg is JSON_SCAN or JSON_SCAN_TAL.
  */
 const char *rpc_scan_datastore_str(const tal_t *ctx,
-				   struct command *init_cmd,
+				   struct command *cmd,
 				   const char *path,
 				   ...);
 /* This variant scans the hex encoding, not the string */
 const char *rpc_scan_datastore_hex(const tal_t *ctx,
-				   struct command *init_cmd,
+				   struct command *cmd,
 				   const char *path,
 				   ...);
 
@@ -534,10 +544,16 @@ void plugin_notify_end(struct command *cmd, struct json_stream *js);
 
 /* Send a notification for a custom notification topic. These are sent
  * to lightningd and distributed to subscribing plugins. */
-struct json_stream *plugin_notification_start(struct plugin *plugins,
+struct json_stream *plugin_notification_start(const tal_t *ctx,
 					      const char *method);
 void plugin_notification_end(struct plugin *plugin,
-			     struct json_stream *stream TAKES);
+			     struct json_stream *stream STEALS);
+
+/* Obsolete versions: do not use for new code! */
+struct json_stream *plugin_notification_start_obs(const tal_t *ctx,
+						  const char *method);
+void plugin_notification_end_obs(struct plugin *plugin,
+				 struct json_stream *stream TAKES);
 
 /* Convenience wrapper for notify "message" */
 void plugin_notify_message(struct command *cmd,
@@ -577,7 +593,7 @@ void *plugin_get_data_(struct plugin *plugin);
 #define plugin_get_data(plugin, type) ((type *)(plugin_get_data_(plugin)))
 
 /* Macro to define arguments */
-#define plugin_option_(name, type, description, set, jsonfmt, arg, dev_only, depr_start, depr_end, dynamic) \
+#define plugin_option_(name, type, description, set, jsonfmt, arg, dev_only, depr_start, depr_end, dynamic, multi) \
 	(name),								\
 	(type),								\
 	(description),							\
@@ -594,23 +610,27 @@ void *plugin_get_data_(struct plugin *plugin);
 	(dev_only),							\
 	(depr_start),							\
 	(depr_end),							\
-	(dynamic)
+	(dynamic),							\
+	(multi)
 
 /* jsonfmt can be NULL, but then default won't be printed */
 #define plugin_option(name, type, description, set, jsonfmt, arg)	\
-	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, false)
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, false, false)
 
 #define plugin_option_dev(name, type, description, set, jsonfmt, arg)	\
-	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, false)
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, false, false)
 
 #define plugin_option_dev_dynamic(name, type, description, set, jsonfmt, arg) \
-	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, true)
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), true, NULL, NULL, true, false)
 
 #define plugin_option_dynamic(name, type, description, set, jsonfmt, arg) \
-	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, true)
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, true, false)
 
 #define plugin_option_deprecated(name, type, description, depr_start, depr_end, set, jsonfmt, arg) \
-	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, (depr_start), (depr_end), false)
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, (depr_start), (depr_end), false, false)
+
+#define plugin_option_multi(name, type, description, set, jsonfmt, arg)	\
+	plugin_option_((name), (type), (description), (set), (jsonfmt), (arg), false, NULL, NULL, false, true)
 
 /* Standard helpers */
 char *u64_option(struct plugin *plugin, const char *arg, bool check_only, u64 *i);
@@ -693,9 +713,9 @@ void plugin_set_memleak_handler(struct plugin *plugin,
 						 struct htable *memtable));
 
 /* Synchronously call a JSON-RPC method and return its contents and
- * the parser token. */
+ * the parser token. params may be NULL for an empty object. */
 const jsmntok_t *jsonrpc_request_sync(const tal_t *ctx,
-				      struct command *init_cmd,
+				      struct command *cmd,
 				      const char *method,
 				      const struct json_out *params TAKES,
 				      const char **resp);

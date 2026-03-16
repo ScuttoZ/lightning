@@ -3,22 +3,18 @@
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
+#include <common/amount.h>
 #include <common/blinding.h>
-#include <common/configdir.h>
 #include <common/ecdh.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
+#include <common/json_parse.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
 #include <common/timeout.h>
-#include <connectd/connectd_wiregen.h>
 #include <db/exec.h>
-#include <gossipd/gossipd_wiregen.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
-#include <lightningd/pay.h>
-#include <lightningd/peer_control.h>
+#include <lightningd/notification.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
@@ -441,6 +437,7 @@ static void handle_localpay(struct htlc_in *hin,
 			    struct amount_msat amt_to_forward,
 			    u32 outgoing_cltv_value,
 			    struct amount_msat total_msat,
+			    const struct amount_msat *invoice_msat_override,
 			    const struct secret *payment_secret,
 			    const u8 *payment_metadata)
 {
@@ -531,6 +528,7 @@ static void handle_localpay(struct htlc_in *hin,
 
 	htlc_set_add(ld, hin->key.channel->log,
 		     hin->msat, total_msat,
+		     invoice_msat_override,
 		     &hin->payment_hash,
 		     payment_secret,
 		     local_fail_in_htlc,
@@ -695,13 +693,14 @@ const u8 *send_htlc_out(const tal_t *ctx,
 			struct amount_msat final_msat,
 			const struct sha256 *payment_hash,
 			const struct pubkey *path_key,
+			const struct tlv_field *extra_tlvs,
 			u64 partid,
 			u64 groupid,
 			const u8 *onion_routing_packet,
 			struct htlc_in *in,
 			struct htlc_out **houtp)
 {
-	u8 *msg;
+	u8 *msg, *raw_tlvs = NULL;
 
 	*houtp = NULL;
 
@@ -729,7 +728,8 @@ const u8 *send_htlc_out(const tal_t *ctx,
 	/* Make peer's daemon own it, catch if it dies. */
 	*houtp = new_htlc_out(out->owner, out, amount, cltv,
 			      payment_hash, onion_routing_packet,
-			      path_key, in == NULL,
+			      path_key, extra_tlvs,
+			      in == NULL,
 			      final_msat,
 			      partid, groupid, in);
 	tal_add_destructor(*houtp, destroy_hout_subd_died);
@@ -742,8 +742,16 @@ const u8 *send_htlc_out(const tal_t *ctx,
 						 *houtp);
 	}
 
+	if (extra_tlvs) {
+		raw_tlvs = tal_arr(tmpctx, u8, 0);
+		towire_tlvstream_raw(&raw_tlvs,
+				     tal_dup_talarr(tmpctx, struct tlv_field,
+						    extra_tlvs));
+	}
+
 	msg = towire_channeld_offer_htlc(out, amount, cltv, payment_hash,
-					onion_routing_packet, path_key);
+					onion_routing_packet, path_key,
+					raw_tlvs);
 	subd_req(out->peer->ld, out->owner, take(msg), -1, 0, rcvd_htlc_reply,
 		 *houtp);
 
@@ -796,7 +804,8 @@ static void forward_htlc(struct htlc_in *hin,
 			 const struct short_channel_id *forward_scid,
 			 const struct channel_id *forward_to,
 			 const u8 next_onion[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)],
-			 const struct pubkey *next_path_key)
+			 const struct pubkey *next_path_key,
+			 const struct tlv_field *extra_tlvs)
 {
 	const u8 *failmsg;
 	struct lightningd *ld = hin->key.channel->peer->ld;
@@ -839,7 +848,7 @@ static void forward_htlc(struct htlc_in *hin,
 		 * - If it creates a new `channel_update` with updated channel parameters:
 		 *    - SHOULD keep accepting the previous channel parameters for 10 minutes
 		 */
-		if (!time_before(time_now(), next->old_feerate_timeout)
+		if (!timemono_before(time_mono(), next->old_feerate_timeout)
 		    || !check_fwd_amount(hin, amt_to_forward, hin->msat,
 					 next->old_feerate_base,
 					 next->old_feerate_ppm)) {
@@ -855,7 +864,7 @@ static void forward_htlc(struct htlc_in *hin,
 	if (amount_msat_greater(amt_to_forward, next->htlc_maximum_msat)
 	    || amount_msat_less(amt_to_forward, next->htlc_minimum_msat)) {
 		/* Are we in old-range grace-period? */
-		if (!time_before(time_now(), next->old_feerate_timeout)
+		if (!timemono_before(time_mono(), next->old_feerate_timeout)
 		    || amount_msat_less(amt_to_forward, next->old_htlc_minimum_msat)
 		    || amount_msat_greater(amt_to_forward, next->old_htlc_maximum_msat)) {
 			failmsg = towire_temporary_channel_failure(tmpctx,
@@ -911,7 +920,7 @@ static void forward_htlc(struct htlc_in *hin,
 	failmsg = send_htlc_out(tmpctx, next, amt_to_forward,
 				outgoing_cltv_value, AMOUNT_MSAT(0),
 				&hin->payment_hash,
-				next_path_key, 0 /* partid */, 0 /* groupid */,
+				next_path_key, extra_tlvs, 0 /* partid */, 0 /* groupid */,
 				next_onion, hin, &hout);
 	if (!failmsg)
 		return;
@@ -941,6 +950,10 @@ struct htlc_accepted_hook_payload {
 	u64 failtlvtype;
 	size_t failtlvpos;
 	const char *failexplanation;
+	u8 *extra_tlvs_raw;
+	/* Default is NULL, if NOT NULL: used to override the amount of the
+	 * invoice this htlc belongs to in checks! */
+	struct amount_msat *invoice_msat;
 };
 
 static void
@@ -997,8 +1010,9 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 	struct htlc_in *hin = request->hin;
 	struct lightningd *ld = request->ld;
 	struct preimage payment_preimage;
-	const jsmntok_t *resulttok, *paykeytok, *payloadtok, *fwdtok;
-	u8 *failonion;
+	const jsmntok_t *resulttok, *paykeytok, *payloadtok, *fwdtok, *extra_tlvs_tok,
+		*invmsattok;
+	u8 *failonion, *raw_tlvs;
 
 	if (!toks || !buffer)
 		return true;
@@ -1010,6 +1024,60 @@ static bool htlc_accepted_hook_deserialize(struct htlc_accepted_hook_payload *re
 	if (!resulttok) {
 		fatal("Plugin return value does not contain 'result' key %s",
 		      json_strdup(tmpctx, buffer, toks));
+	}
+
+	invmsattok = json_get_member(buffer, toks, "invoice_msat");
+	if (invmsattok) {
+		tal_free(request->invoice_msat);
+		request->invoice_msat = tal(request, struct amount_msat);
+		if (!json_to_msat(buffer, invmsattok, request->invoice_msat)) {
+			fatal("Bad invoice_msat for htlc_accepted hook: %.*s",
+				invmsattok->end - invmsattok->start,
+				buffer + invmsattok->start);
+		}
+	}
+
+	extra_tlvs_tok = json_get_member(buffer, toks, "extra_tlvs");
+	if (extra_tlvs_tok) {
+		size_t max;
+		struct tlv_update_add_htlc_tlvs *check_extra_tlvs;
+
+		raw_tlvs = json_tok_bin_from_hex(tmpctx, buffer,
+						 extra_tlvs_tok);
+		if (!raw_tlvs)
+			fatal("Bad custom tlvs for htlc_accepted"
+			      " hook: %.*s",
+			      extra_tlvs_tok->end - extra_tlvs_tok->start,
+			      buffer + extra_tlvs_tok->start);
+
+		max = tal_bytelen(raw_tlvs);
+
+         	/* We check if the custom tlvs are still valid BOLT#1 tlvs.
+          	 * As these are appended to forwarded htlcs we check for valid
+            	 * update_add_htlc_tlvs (restricts to known even types).
+              	 * NOTE: We may be less strict and allow unknown evens .*/
+                const u8 *cursor = raw_tlvs;
+		check_extra_tlvs = fromwire_tlv_update_add_htlc_tlvs(tmpctx,
+								     &cursor,
+								     &max);
+		if (!check_extra_tlvs) {
+			fatal("htlc_accepted_hook returned bad extra_tlvs %s",
+				tal_hex(tmpctx, raw_tlvs));
+		}
+
+		/* If we got a blinded path key we replace the next path key
+		 * with it. */
+		if (check_extra_tlvs->blinded_path) {
+			tal_free(request->next_path_key);
+			request->next_path_key
+				= tal_steal(request,
+					    check_extra_tlvs->blinded_path);
+		}
+
+		/* We made it and got a valid extra_tlvs: Replace the current
+		 * extra_tlvs with it. */
+		tal_free(request->extra_tlvs_raw);
+		request->extra_tlvs_raw = tal_steal(request, raw_tlvs);
 	}
 
 	payloadtok = json_get_member(buffer, toks, "payload");
@@ -1125,6 +1193,9 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	    tal_fmt(hin, "Waiting for the htlc_accepted hook of plugin %s",
 		    plugin->shortname);
 
+	if (p->channel && p->channel->peer)
+		json_add_node_id(s, "peer_id", &p->channel->peer->id);
+
 	json_object_start(s, "onion");
 
 	json_add_hex_talarr(s, "payload", rs->raw_payload);
@@ -1169,6 +1240,9 @@ static void htlc_accepted_hook_serialize(struct htlc_accepted_hook_payload *p,
 	json_add_u32(s, "cltv_expiry", expiry);
 	json_add_s32(s, "cltv_expiry_relative", expiry - blockheight);
 	json_add_sha256(s, "payment_hash", &hin->payment_hash);
+	if (p->extra_tlvs_raw) {
+		json_add_hex_talarr(s, "extra_tlvs", p->extra_tlvs_raw);
+	}
 	json_object_end(s);
 }
 
@@ -1199,18 +1273,31 @@ htlc_accepted_hook_final(struct htlc_accepted_hook_payload *request STEALS)
 						NULL, request->failtlvtype,
 						request->failtlvpos)));
 	} else if (rs->nextcase == ONION_FORWARD) {
+		struct tlv_field *extra_tlvs;
+
+		if (request->extra_tlvs_raw) {
+			const u8 *cursor = request->extra_tlvs_raw;
+			size_t max = tal_bytelen(cursor);
+			extra_tlvs = tal_arr(request, struct tlv_field, 0);
+			fromwire_tlv(&cursor, &max, NULL, 0, request,
+				     &extra_tlvs, NULL, NULL, NULL);
+		} else {
+			extra_tlvs = NULL;
+		}
+
 		forward_htlc(hin, hin->cltv_expiry,
 			     request->payload->amt_to_forward,
 			     request->payload->outgoing_cltv,
 			     request->payload->forward_channel,
 			     request->fwd_channel_id,
 			     serialize_onionpacket(tmpctx, rs->next),
-			     request->next_path_key);
+			     request->next_path_key, extra_tlvs);
 	} else
 		handle_localpay(hin,
 				request->payload->amt_to_forward,
 				request->payload->outgoing_cltv,
 				*request->payload->total_msat,
+				request->invoice_msat,
 				request->payload->payment_secret,
 				request->payload->payment_metadata);
 
@@ -1482,6 +1569,19 @@ static bool peer_accepted_htlc(const tal_t *ctx,
 	 * we're in hook */
 	hook_payload->fwd_channel_id
 		= calc_forwarding_channel(ld, hook_payload);
+
+	if(hin->extra_tlvs) {
+		hook_payload->extra_tlvs_raw = tal_arr(hook_payload, u8, 0);
+		towire_tlvstream_raw(&hook_payload->extra_tlvs_raw,
+				     hin->extra_tlvs);
+	} else {
+		hook_payload->extra_tlvs_raw = NULL;
+	}
+
+	/* We don't set the invoice amount here, if it is set during a hook
+	 * response, it will be used to override the actual invoice amount on
+	 * later checks. */
+	hook_payload->invoice_msat = NULL;
 
 	plugin_hook_call_htlc_accepted(ld, NULL, hook_payload);
 
@@ -1883,7 +1983,7 @@ static void remove_htlc_in(struct channel *channel, struct htlc_in *hin)
 				   "Unable to calculate fees collected."
 				   " Not logging an inbound HTLC");
 		else
-			notify_channel_mvt(channel->peer->ld, mvt);
+			wallet_save_channel_mvt(channel->peer->ld, mvt);
 	}
 
 	tal_free(hin);
@@ -1906,8 +2006,7 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 		const struct channel_coin_mvt *mvt;
 		struct amount_msat oldamt = channel->our_msat;
 		/* We paid for this HTLC, so deduct balance. */
-		if (!amount_msat_sub(&channel->our_msat, channel->our_msat,
-				     hout->msat)) {
+		if (!amount_msat_deduct(&channel->our_msat, hout->msat)) {
 			channel_internal_error(channel,
 					       "Underflow our_msat %s - HTLC %s",
 					       fmt_amount_msat(tmpctx,
@@ -1934,7 +2033,7 @@ static void remove_htlc_out(struct channel *channel, struct htlc_out *hout)
 				   "Unable to calculate fees."
 				   " Not logging an outbound HTLC");
 		else
-			notify_channel_mvt(channel->peer->ld, mvt);
+			wallet_save_channel_mvt(channel->peer->ld, mvt);
 	}
 
 	tal_free(hout);
@@ -2209,6 +2308,7 @@ static bool channel_added_their_htlc(struct channel *channel,
 			  op ? &shared_secret : NULL,
 			  added->path_key,
 			  added->onion_routing_packet,
+			  added->extra_tlvs,
 			  added->fail_immediate);
 
 	/* Save an incoming htlc to the wallet */
@@ -2224,7 +2324,7 @@ static bool channel_added_their_htlc(struct channel *channel,
 /* The peer doesn't tell us this separately, but logically it's a separate
  * step to receiving commitsig */
 static bool peer_sending_revocation(struct channel *channel,
-				    struct added_htlc *added,
+				    struct added_htlc **added,
 				    struct fulfilled_htlc *fulfilled,
 				    struct failed_htlc **failed,
 				    struct changed_htlc *changed)
@@ -2232,7 +2332,7 @@ static bool peer_sending_revocation(struct channel *channel,
 	size_t i;
 
 	for (i = 0; i < tal_count(added); i++) {
-		if (!update_in_htlc(channel, added[i].id, SENT_ADD_REVOCATION))
+		if (!update_in_htlc(channel, added[i]->id, SENT_ADD_REVOCATION))
 			return false;
 	}
 	for (i = 0; i < tal_count(fulfilled); i++) {
@@ -2279,7 +2379,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 	struct fee_states *fee_states;
 	struct height_states *blockheight_states;
 	struct bitcoin_signature commit_sig, *htlc_sigs;
-	struct added_htlc *added;
+	struct added_htlc **added;
 	struct fulfilled_htlc *fulfilled;
 	struct failed_htlc **failed;
 	struct changed_htlc *changed;
@@ -2354,7 +2454,7 @@ void peer_got_commitsig(struct channel *channel, const u8 *msg)
 
 	/* New HTLCs */
 	for (i = 0; i < tal_count(added); i++) {
-		if (!channel_added_their_htlc(channel, &added[i]))
+		if (!channel_added_their_htlc(channel, added[i]))
 			return;
 	}
 
@@ -2640,13 +2740,15 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 		else
 			f = NULL;
 
+
 		existing = new_existing_htlc(htlcs, hin->key.id, hin->hstate,
 					     hin->msat, &hin->payment_hash,
 					     hin->cltv_expiry,
 					     hin->onion_routing_packet,
 					     hin->path_key,
 					     hin->preimage,
-					     f);
+					     f,
+					     hin->extra_tlvs);
 		tal_arr_expand(&htlcs, existing);
 	}
 
@@ -2678,7 +2780,8 @@ const struct existing_htlc **peer_htlcs(const tal_t *ctx,
 					     hout->onion_routing_packet,
 					     hout->path_key,
 					     hout->preimage,
-					     f);
+					     f,
+					     hout->extra_tlvs);
 		tal_arr_expand(&htlcs, existing);
 	}
 
@@ -2955,7 +3058,8 @@ static u64 htlcs_index_inc(struct lightningd *ld,
 			   enum htlc_state hstate,
 			   enum wait_index idx)
 {
-	return wait_index_increment(ld, WAIT_SUBSYSTEM_HTLCS, idx,
+	return wait_index_increment(ld, ld->wallet->db,
+				    WAIT_SUBSYSTEM_HTLCS, idx,
 				    "state", htlc_state_name(hstate),
 				    "short_channel_id", fmt_short_channel_id(tmpctx, channel_scid_or_local_alias(channel)),
 				    "direction", owner == LOCAL ? "out": "in",
@@ -2970,7 +3074,8 @@ void htlcs_index_deleted(struct lightningd *ld,
 			 const struct channel *channel,
 			 u64 num_deleted)
 {
-	wait_index_increase(ld, WAIT_SUBSYSTEM_HTLCS, WAIT_INDEX_DELETED,
+	wait_index_increase(ld, ld->wallet->db,
+			    WAIT_SUBSYSTEM_HTLCS, WAIT_INDEX_DELETED,
 			    num_deleted,
 			    "short_channel_id", fmt_short_channel_id(tmpctx, channel_scid_or_local_alias(channel)),
 			    NULL);

@@ -1,20 +1,20 @@
 #include "config.h"
-#include <bitcoin/preimage.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
-#include <common/gossmap.h>
+#include <common/clock_time.h>
+#include <common/features.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
-#include <errno.h>
+#include <common/randbytes.h>
+#include <inttypes.h>
+#include <plugins/channel_hint.h>
 #include <plugins/libplugin-pay.h>
-#include <sodium.h>
 
 #define PREIMAGE_TLV_TYPE 5482373484
 #define KEYSEND_FEATUREBIT 55
-static unsigned int maxdelay_default;
 static struct node_id my_id;
 static u64 *accepted_extra_tlvs;
 static struct channel_hint_set *global_hints;
@@ -49,7 +49,7 @@ static struct keysend_data *keysend_init(struct payment *p)
 		 * and populate the preimage field in the keysend_data and the
 		 * payment_hash in the payment. */
 		d = tal(p, struct keysend_data);
-		randombytes_buf(&d->preimage, sizeof(d->preimage));
+		randbytes(&d->preimage, sizeof(d->preimage));
 		ccan_sha256(&payment_hash, &d->preimage, sizeof(d->preimage));
 		p->payment_hash = tal_dup(p, struct sha256, &payment_hash);
 		d->extra_tlvs = NULL;
@@ -139,20 +139,9 @@ static const char *init(struct command *init_cmd, const char *buf UNUSED,
 	global_hints = notleak_with_children(channel_hint_set_new(init_cmd->plugin));
 
 	accepted_extra_tlvs = notleak(tal_arr(NULL, u64, 0));
-	/* BOLT #4:
-	 * ## `max_htlc_cltv` Selection
-	 *
-	 * This ... value is defined as 2016 blocks, based on historical value
-	 * deployed by Lightning implementations.
-	 */
-	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
-	maxdelay_default = 2016;
-	/* max-locktime-blocks deprecated in v24.05, but still grab it! */
 	rpc_scan(init_cmd, "listconfigs", take(json_out_obj(NULL, NULL, NULL)),
 		 "{configs:{"
-		 "max-locktime-blocks?:{value_int:%},"
 		 "accept-htlc-tlv-type:{values_int:%}}}",
-		 JSON_SCAN(json_to_u32, &maxdelay_default),
 		 JSON_SCAN(jsonarr_accumulate_u64, &accepted_extra_tlvs));
 
 	return NULL;
@@ -202,6 +191,13 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	bool *dev_use_shadow;
 	struct out_req *req;
 
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
 	if (!param_check(cmd, buf, params,
 		   p_req("destination", param_node_id, &destination),
 		   p_req("amount_msat", param_msat, &msat),
@@ -209,8 +205,7 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 		   p_opt("maxfeepercent", param_millionths,
 			 &maxfee_pct_millionths),
 		   p_opt_def("retry_for", param_number, &retryfor, 60),
-		   p_opt_def("maxdelay", param_number, &maxdelay,
-			     maxdelay_default),
+		   p_opt_def("maxdelay", param_number, &maxdelay, 2016),
 		   p_opt("exemptfee", param_msat, &exemptfee),
 		   p_opt("extratlvs", param_extra_tlvs, &extra_fields),
 		   p_opt("routehints", param_routehint_array, &hints),
@@ -221,8 +216,6 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 
 	p = payment_new(cmd, cmd, NULL /* No parent */, global_hints, pay_mods);
 	p->local_id = &my_id;
-	p->json_buffer = tal_dup_talarr(p, const char, buf);
-	p->json_toks = params;
 	p->route_destination = tal_steal(p, destination);
 	p->pay_destination = p->route_destination;
 	p->payment_secret = NULL;
@@ -241,7 +234,7 @@ static struct command_result *json_keysend(struct command *cmd, const char *buf,
 	p->invstring_used = true;
 	p->why = "Initial attempt";
 	p->constraints.cltv_budget = *maxdelay;
-	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
+	p->deadline = timemono_add(time_mono(), time_from_sec(*retryfor));
 	p->getroute->riskfactorppm = 10000000;
 
 	if (node_id_eq(&my_id, p->route_destination)) {
@@ -448,7 +441,8 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 	bigsize_t s;
 	struct keysend_in *ki;
 	struct out_req *req;
-	struct timeabs now = time_now();
+	/* Even with CLN_DEV_SET_TIME, we need this to change */
+	struct timeabs now = clock_time_progresses();
 	const char *err;
 	u64 *allowed;
 	size_t err_off;
@@ -563,7 +557,7 @@ static struct command_result *htlc_accepted_call(struct command *cmd,
 					   (const char *)desc_field->value);
 		json_add_string(req->js, "description", desc);
 		/* Don't exceed max possible desc length! */
-		if (strlen(desc) > 1023)
+		if (strlen(desc) > BOLT11_FIELD_BYTE_LIMIT)
 			json_add_bool(req->js, "deschashonly", true);
 	} else {
 		json_add_string(req->js, "description", "keysend");

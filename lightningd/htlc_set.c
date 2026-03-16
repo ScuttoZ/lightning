@@ -1,5 +1,4 @@
 #include "config.h"
-#include <common/features.h>
 #include <common/timeout.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
@@ -134,6 +133,7 @@ void htlc_set_add_(struct lightningd *ld,
 		   struct logger *log,
 		   struct amount_msat msat,
 		   struct amount_msat total_msat,
+		   const struct amount_msat *invoice_msat_override,
 		   const struct sha256 *payment_hash,
 		   const struct secret *payment_secret,
 		   void (*fail)(void *, const u8 *),
@@ -151,8 +151,9 @@ void htlc_set_add_(struct lightningd *ld,
 	 *     [Failure Messages](#failure-messages)
 	 *     - Note: "amount paid" specified there is the `total_msat` field.
 	 */
-	details = invoice_check_payment(tmpctx, ld, payment_hash,
-					total_msat, payment_secret, &err);
+	details = invoice_check_payment(tmpctx, ld, payment_hash, total_msat,
+					invoice_msat_override, payment_secret,
+					&err);
 	if (!details) {
 		log_debug(log, "payment failed: %s", err);
 		fail(arg, take(failmsg_incorrect_or_unknown(NULL, ld, msat)));

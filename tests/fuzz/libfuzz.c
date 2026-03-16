@@ -1,11 +1,20 @@
 #include "config.h"
 
 #include <assert.h>
+#include <ccan/err/err.h>
 #include <ccan/isaac/isaac64.h>
+#include <ccan/short_types/short_types.h>
+#include <ccan/tal/grab_file/grab_file.h>
+#include <ccan/tal/path/path.h>
+#include <ccan/tal/tal.h>
 #include <common/pseudorand.h>
+#include <common/setup.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 #include <tests/fuzz/libfuzz.h>
+#include <unistd.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerInitialize(int *argc, char ***argv);
@@ -13,7 +22,7 @@ int LLVMFuzzerInitialize(int *argc, char ***argv);
 /* Provide a non-random pseudo-random function to speed fuzzing. */
 static isaac64_ctx isaac64;
 
-uint64_t pseudorand(uint64_t max)
+uint64_t pseudorand_(uint64_t max, uint64_t *offset)
 {
 	assert(max);
 	return isaac64_next_uint(&isaac64, max);
@@ -118,3 +127,54 @@ size_t cross_over(const u8 *in1, size_t in1_size, const u8 *in2,
 				   max_out_size);
 	return overwrite_part(in1, in1_size, in2, in2_size, out, max_out_size);
 }
+
+/* In non-fuzzing builds, these become unit tests which just run the corpora:
+ * this is also good for attaching a debugger to! */
+#ifndef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+static size_t find_opt(char *argv[], const char *opt)
+{
+	for (size_t i = 1; argv[i]; i++) {
+		if (streq(argv[i], opt))
+			return i;
+	}
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	DIR *d;
+	struct dirent *di;
+	int verbose_flag;
+
+	common_setup(argv[0]);
+	assert(chdir("tests/fuzz/corpora") == 0);
+	assert(chdir(path_basename(tmpctx, argv[0])) == 0);
+
+	init(&argc, &argv);
+	verbose_flag = find_opt(argv, "-v");
+	d = opendir(".");
+	while ((di = readdir(d)) != NULL) {
+		u8 *contents;
+		if (streq(di->d_name, ".") || streq(di->d_name, ".."))
+			continue;
+		/* If you specify options other than -v, they're test names */
+		if (argv[verbose_flag + 1] && !find_opt(argv, di->d_name))
+			continue;
+		if (verbose_flag)
+			printf("%s\n", di->d_name);
+		contents = grab_file_raw(tmpctx, di->d_name);
+		if (!contents)
+			err(1, "Could not read %s", di->d_name);
+		run(contents, tal_bytelen(contents));
+	}
+	closedir(d);
+	common_shutdown();
+}
+
+/* We never call any functions which might call these */
+size_t LLVMFuzzerMutate(uint8_t *data, size_t size, size_t max_size);
+size_t LLVMFuzzerMutate(uint8_t *data, size_t size, size_t max_size)
+{
+	abort();
+}
+#endif /* !FUZZING */

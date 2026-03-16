@@ -6,6 +6,7 @@
 #include <common/gossmap.h>
 #include <common/route.h>
 #include <common/setup.h>
+#include <common/utils.h>
 #include <devtools/clean_topo.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -26,9 +27,6 @@ static struct route_hop *least_cost(struct gossmap *map,
 	struct amount_msat maxcost;
 	struct route_hop *path;
 	struct timemono tstart, tstop;
-
-	setup_locale();
-	setup_tmpctx();
 
 	tstart = time_mono();
 	dij = dijkstra(tmpctx, map, dst,

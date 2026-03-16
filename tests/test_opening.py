@@ -150,7 +150,7 @@ def test_v2_open_sigs_reconnect_2(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -188,7 +188,7 @@ def test_v2_open_sigs_reconnect_1(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -229,7 +229,7 @@ def test_v2_open_sigs_out_of_order(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -260,7 +260,7 @@ def test_v2_fail_second(node_factory, bitcoind):
     l1.fundwallet(amount + 10000000)
 
     # make sure we can generate PSBTs.
-    addr = l1.rpc.newaddr()['bech32']
+    addr = l1.rpc.newaddr('bech32')['bech32']
     bitcoind.rpc.sendtoaddress(addr, (amount + 1000000) / 10**8)
     bitcoind.generate_block(1)
     wait_for(lambda: len(l1.rpc.listfunds()["outputs"]) != 0)
@@ -309,7 +309,7 @@ def test_v2_open_sigs_restart_while_dead(node_factory, bitcoind):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -342,7 +342,7 @@ def test_v2_rbf_single(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -438,8 +438,8 @@ def test_v2_rbf_abort_retry(node_factory, bitcoind, chainparams):
     amount = 2**24
     chan_amount = 100000
     bitcoind.rpc.sendmany("",
-                          {l1.rpc.newaddr()['bech32']: amount / 10**8 + 0.01,
-                           l2.rpc.newaddr()['bech32']: amount / 10**8 + 0.01})
+                          {l1.rpc.newaddr()['p2tr']: amount / 10**8 + 0.01,
+                           l2.rpc.newaddr()['p2tr']: amount / 10**8 + 0.01})
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -519,8 +519,8 @@ def test_v2_rbf_abort_channel_opens(node_factory, bitcoind, chainparams):
     amount = 2**24
     chan_amount = 100000
     bitcoind.rpc.sendmany("",
-                          {l1.rpc.newaddr()['bech32']: amount / 10**8 + 0.01,
-                           l2.rpc.newaddr()['bech32']: amount / 10**8 + 0.01})
+                          {l1.rpc.newaddr()['p2tr']: amount / 10**8 + 0.01,
+                           l2.rpc.newaddr()['p2tr']: amount / 10**8 + 0.01})
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -672,7 +672,7 @@ def test_v2_rbf_multi(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -765,7 +765,7 @@ def test_rbf_reconnect_init(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -813,7 +813,7 @@ def test_rbf_reconnect_ack(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -871,7 +871,7 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -931,7 +931,7 @@ def test_rbf_reconnect_tx_construct(node_factory, bitcoind, chainparams):
     l1.daemon.wait_for_logs([r'Got dualopend reestablish',
                              r'No commitment, not sending our sigs',
                              r'dev_disconnect: -WIRE_COMMITMENT_SIGNED',
-                             'peer_disconnect_done'])
+                             'peer_disconnected'])
     assert not l1.rpc.getpeer(l2.info['id'])['connected']
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
 
@@ -998,7 +998,7 @@ def test_rbf_reconnect_tx_sigs(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1068,7 +1068,7 @@ def test_rbf_to_chain_before_commit(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1123,8 +1123,8 @@ def test_rbf_no_overlap(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1160,7 +1160,7 @@ def test_rbf_fails_to_broadcast(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1244,7 +1244,7 @@ def test_rbf_broadcast_close_inflights(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1317,7 +1317,7 @@ def test_rbf_non_last_mined(node_factory, bitcoind, chainparams):
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     amount = 2**24
     chan_amount = 100000
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], amount / 10**8 + 0.01)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['p2tr'], amount / 10**8 + 0.01)
     bitcoind.generate_block(1)
     # Wait for it to arrive.
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) > 0)
@@ -1536,36 +1536,6 @@ def test_funder_contribution_limits(node_factory, bitcoind):
     assert l3.daemon.is_in_log(r'calling `signpsbt` .* 6 inputs')
 
 
-@pytest.mark.openchannel('v2')
-def test_inflight_dbload(node_factory, bitcoind):
-    """Bad db field access breaks Postgresql on startup with opening leases"""
-    disconnects = ["@WIRE_COMMITMENT_SIGNED"]
-
-    opts = [{'experimental-dual-fund': None, 'dev-no-reconnect': None,
-             'may_reconnect': True, 'disconnect': disconnects},
-            {'experimental-dual-fund': None, 'dev-no-reconnect': None,
-             'may_reconnect': True, 'funder-policy': 'match',
-             'funder-policy-mod': 100, 'lease-fee-base-sat': '100sat',
-             'lease-fee-basis': 100}]
-
-    l1, l2 = node_factory.get_nodes(2, opts=opts)
-
-    feerate = 2000
-    amount = 500000
-    l1.fundwallet(20000000)
-    l2.fundwallet(20000000)
-
-    # l1 leases a channel from l2
-    l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
-    rates = l1.rpc.dev_queryrates(l2.info['id'], amount, amount)
-    l1.rpc.fundchannel(l2.info['id'], amount, request_amt=amount,
-                       feerate='{}perkw'.format(feerate),
-                       compact_lease=rates['compact_lease'])
-    l1.daemon.wait_for_log(r'dev_disconnect: @WIRE_COMMITMENT_SIGNED')
-
-    l1.restart()
-
-
 def test_zeroconf_mindepth(bitcoind, node_factory):
     """Check that funder/fundee can customize mindepth.
 
@@ -1580,8 +1550,8 @@ def test_zeroconf_mindepth(bitcoind, node_factory):
         {},
         {
             'plugin': str(plugin_path),
-            'zeroconf-allow': '0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518',
-            'zeroconf-mindepth': '2',
+            'zeroconf_allow': '038194b5f32bdf0aa59812c86c4ef7ad2f294104fa027d1ace9b469bb6f88cf37b',
+            'zeroconf_mindepth': '2',
         },
     ])
 
@@ -1627,7 +1597,7 @@ def test_zeroconf_open(bitcoind, node_factory):
         {},
         {
             'plugin': str(plugin_path),
-            'zeroconf-allow': '022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59'
+            'zeroconf_allow': '033845802d25b4e074ccfd7cd8b339a41dc75bf9978a034800444b51d42b07799a'
         },
     ])
 
@@ -1702,7 +1672,7 @@ def test_zeroconf_public(bitcoind, node_factory, chainparams):
         {'plugin': str(coin_mvt_plugin)},
         {
             'plugin': str(plugin_path),
-            'zeroconf-allow': '0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518'
+            'zeroconf_allow': '038194b5f32bdf0aa59812c86c4ef7ad2f294104fa027d1ace9b469bb6f88cf37b'
         },
         {}
     ])
@@ -1804,7 +1774,7 @@ def test_zeroconf_forward(node_factory, bitcoind):
         {},
         {
             'plugin': str(plugin_path),
-            'zeroconf-allow': '022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59'
+            'zeroconf_allow': '033845802d25b4e074ccfd7cd8b339a41dc75bf9978a034800444b51d42b07799a'
         }
     ]
     l1, l2, l3 = node_factory.get_nodes(3, opts=opts)
@@ -1834,6 +1804,26 @@ def test_zeroconf_forward(node_factory, bitcoind):
 
     inv = l1.rpc.invoice(42, 'back1', 'desc')['bolt11']
     l3.rpc.pay(inv)
+
+
+def test_zeroconf_refusal(bitcoind, node_factory, chainparams):
+    """If we're not going to give you zeroconf, we should tell you!"""
+    l1, l2 = node_factory.get_nodes(2)
+    l1.fundwallet(10**6)
+    l1.connect(l2)
+
+    # option_static_remotekey, option_zeroconf
+    ctype = [12, 50]
+    # No anchors for elements
+    if not chainparams['elements']:
+        ctype += [22]
+    with pytest.raises(RpcError, match="You required zeroconf, but you're not on our allowlist"):
+        l1.rpc.fundchannel(l2.info['id'], 'all', channel_type=ctype)
+
+    # OK, let's add ourselves to allow list.
+    plugin_path = str(Path(__file__).parent / "plugins" / "zeroconf-selective.py")
+    l2.rpc.plugin_start(plugin_path, zeroconf_allow=l1.info['id'])
+    l1.rpc.fundchannel(l2.info['id'], 'all', channel_type=ctype)
 
 
 @pytest.mark.openchannel('v1')
@@ -1956,6 +1946,11 @@ def test_buy_liquidity_ad_check_bookkeeping(node_factory, bitcoind):
     bitcoind.generate_block(2)
     l1.daemon.wait_for_log('to CHANNELD_NORMAL')
 
+    # Avoid bad gossip messages caused by channel announcements being
+    # processed after closing.
+    for n in (l1, l2):
+        wait_for(lambda: [c['active'] for c in n.rpc.listchannels()['channels']] == [True, True])
+
     chan_id = first_channel_id(l1, l2)
     ev_tags = [e['tag'] for e in l1.rpc.bkpr_listaccountevents(chan_id)['events']]
     assert 'lease_fee' in ev_tags
@@ -1979,7 +1974,8 @@ def test_scid_alias_private(node_factory, bitcoind):
                                                                      {'log-level': 'io'}])
 
     l2.fundwallet(5000000)
-    l2.rpc.fundchannel(l3.info['id'], 'all', announce=False)
+    fc = l2.rpc.fundchannel(l3.info['id'], 'all', announce=False)
+    assert 'scid_alias/even' in fc['channel_type']['names']
 
     bitcoind.generate_block(1, wait_for_mempool=1)
     wait_for(lambda: only_one(l2.rpc.listpeerchannels(l3.info['id'])['channels'])['state'] == 'CHANNELD_NORMAL')
@@ -2047,14 +2043,14 @@ def test_zeroconf_multichan_forward(node_factory):
     higher spendable msat, which should cause it to be chosen instead.
 
     """
-    node_id = '022d223620a359a47ff7f7ac447c85c46c923da53389221a0054c11c1e3ca31d59'
+    node_id = '033845802d25b4e074ccfd7cd8b339a41dc75bf9978a034800444b51d42b07799a'
     plugin_path = Path(__file__).parent / "plugins" / "zeroconf-selective.py"
     l1, l2, l3 = node_factory.line_graph(3, opts=[
         {},
         {},
         {
             'plugin': str(plugin_path),
-            'zeroconf-allow': node_id,
+            'zeroconf_allow': node_id,
         }
     ], fundamount=10**6, wait_for_announce=True)
 
@@ -2245,10 +2241,10 @@ def test_coinbase_unspendable(node_factory, bitcoind):
 
     [l1] = node_factory.get_nodes(1)
 
-    addr = l1.rpc.newaddr()["bech32"]
+    addr = l1.rpc.newaddr("bech32")["bech32"]
     bitcoind.rpc.generatetoaddress(1, addr)
 
-    addr2 = l1.rpc.newaddr()["bech32"]
+    addr2 = l1.rpc.newaddr("bech32")["bech32"]
 
     # Wait til money in wallet
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
@@ -2262,13 +2258,13 @@ def test_coinbase_unspendable(node_factory, bitcoind):
     assert len(bitcoind.rpc.getrawmempool()) == 0
 
     # Mine 98 blocks
-    bitcoind.rpc.generatetoaddress(98, l1.rpc.newaddr()['bech32'])
+    bitcoind.rpc.generatetoaddress(98, l1.rpc.newaddr('bech32')['bech32'])
     assert len([out for out in l1.rpc.listfunds()['outputs'] if out['status'] == 'confirmed']) == 0
     with pytest.raises(RpcError, match='Could not afford all using all 0 available UTXOs'):
         l1.rpc.withdraw(addr2, "all")
 
     # One more and the first coinbase unlocks
-    bitcoind.rpc.generatetoaddress(1, l1.rpc.newaddr()['bech32'])
+    bitcoind.rpc.generatetoaddress(1, l1.rpc.newaddr('bech32')['bech32'])
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 100)
     assert len([out for out in l1.rpc.listfunds()['outputs'] if out['status'] == 'confirmed']) == 1
     l1.rpc.withdraw(addr2, "all")
@@ -2276,7 +2272,7 @@ def test_coinbase_unspendable(node_factory, bitcoind):
     assert len(bitcoind.rpc.getrawmempool()) == 1
 
     # Mine one block, assert one more is spendable
-    bitcoind.rpc.generatetoaddress(1, l1.rpc.newaddr()['bech32'])
+    bitcoind.rpc.generatetoaddress(1, l1.rpc.newaddr('bech32')['bech32'])
     assert len([out for out in l1.rpc.listfunds()['outputs'] if out['status'] == 'confirmed']) == 1
 
 
@@ -2503,7 +2499,7 @@ def test_commitment_feerate(bitcoind, node_factory, anchors):
 def test_anchor_min_emergency(bitcoind, node_factory):
     l1, l2 = node_factory.line_graph(2, fundchannel=False)
 
-    addr = l1.rpc.newaddr()['bech32']
+    addr = l1.rpc.newaddr('bech32')['bech32']
     bitcoind.rpc.sendtoaddress(addr, 5000000 / 10**8)
     bitcoind.generate_block(1, wait_for_mempool=1)
     wait_for(lambda: l1.rpc.listfunds()['outputs'] != [])
@@ -2521,7 +2517,7 @@ def test_anchor_min_emergency(bitcoind, node_factory):
     assert only_one(l1.rpc.listfunds()['outputs'])['amount_msat'] == Millisatoshi('25000sat')
 
     # And we can't spend it, either!
-    addr2 = l2.rpc.newaddr()['bech32']
+    addr2 = l2.rpc.newaddr('bech32')['bech32']
     with pytest.raises(RpcError, match=r'We would not have enough left for min-emergency-msat 25000sat'):
         l1.rpc.withdraw(addr2, '500sat')
 
@@ -2558,7 +2554,7 @@ def test_fundchannel_utxo_too_small(bitcoind, node_factory):
     l1, l2 = node_factory.get_nodes(2)
 
     # Add 1 600 sat UTXO to a fresh node
-    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr()['bech32'], 0.00000600)
+    bitcoind.rpc.sendtoaddress(l1.rpc.newaddr('bech32')['bech32'], 0.00000600)
     bitcoind.generate_block(1, wait_for_mempool=1)
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == 1)
 
@@ -2574,7 +2570,7 @@ def test_opening_explicit_channel_type(node_factory, bitcoind):
     l1, l2, l3, l4 = node_factory.get_nodes(4,
                                             opts=[{'experimental-dual-fund': None},
                                                   {'plugin': str(plugin_path),
-                                                   'zeroconf-allow': '0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518'},
+                                                   'zeroconf_allow': '038194b5f32bdf0aa59812c86c4ef7ad2f294104fa027d1ace9b469bb6f88cf37b'},
                                                   {'experimental-dual-fund': None},
                                                   {}])
 
@@ -2593,8 +2589,9 @@ def test_opening_explicit_channel_type(node_factory, bitcoind):
                       [STATIC_REMOTEKEY, ANCHORS_ZERO_FEE_HTLC_TX]):
             ret = l1.rpc.fundchannel_start(l2.info['id'], FUNDAMOUNT,
                                            channel_type=ctype + zeroconf)
-            assert ret['channel_type']['bits'] == ctype + zeroconf
-            assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == ctype + zeroconf
+            # We get zeroconf even without asking for it.
+            assert ret['channel_type']['bits'] == ctype + [ZEROCONF]
+            assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == ctype + [ZEROCONF]
             # Note: l2 doesn't show it in listpeerchannels yet...
             l1.rpc.fundchannel_cancel(l2.info['id'])
 
@@ -2643,8 +2640,8 @@ def test_opening_explicit_channel_type(node_factory, bitcoind):
     l1.connect(l2)
 
     ret = l1.rpc.fundchannel_start(l2.info['id'], FUNDAMOUNT, channel_type=[STATIC_REMOTEKEY, ANCHORS_OLD])
-    assert ret['channel_type']['bits'] == [STATIC_REMOTEKEY, ANCHORS_OLD]
-    assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == [STATIC_REMOTEKEY, ANCHORS_OLD]
+    assert ret['channel_type']['bits'] == [STATIC_REMOTEKEY, ANCHORS_OLD, ZEROCONF]
+    assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == [STATIC_REMOTEKEY, ANCHORS_OLD, ZEROCONF]
     # Note: l3 doesn't show it in listpeerchannels yet...
     l1.rpc.fundchannel_cancel(l2.info['id'])
 
@@ -2652,8 +2649,8 @@ def test_opening_explicit_channel_type(node_factory, bitcoind):
 
     # Works with fundchannel / multifundchannel
     ret = l1.rpc.fundchannel(l2.info['id'], FUNDAMOUNT // 3, channel_type=[STATIC_REMOTEKEY])
-    assert ret['channel_type']['bits'] == [STATIC_REMOTEKEY]
-    assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == [STATIC_REMOTEKEY]
+    assert ret['channel_type']['bits'] == [STATIC_REMOTEKEY, ZEROCONF]
+    assert only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == [STATIC_REMOTEKEY, ZEROCONF]
     assert only_one(l2.rpc.listpeerchannels()['channels'])['channel_type']['bits'] == [STATIC_REMOTEKEY]
     # FIXME: Check type is actually correct!
 
@@ -2707,8 +2704,8 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
             {},
             {
                 "plugin": str(plugin_path),
-                "zeroconf-allow": "0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518",
-                "zeroconf-mindepth": "0",
+                "zeroconf_allow": "038194b5f32bdf0aa59812c86c4ef7ad2f294104fa027d1ace9b469bb6f88cf37b",
+                "zeroconf_mindepth": "0",
                 "dev-max-funding-unconfirmed-blocks": blocks,
             },
             {},
@@ -2774,3 +2771,154 @@ def test_zeroconf_forget(node_factory, bitcoind, dopay: bool):
         # It will forget the older one.
         l2.daemon.wait_for_log(r"UNUSUAL {}-chan#1: Forgetting channel: It has been {} blocks without the funding transaction ".format(l1.info['id'], blocks + 1))
         assert [c['peer_id'] for c in l2.rpc.listpeerchannels()["channels"]] == [l3.info['id']]
+
+
+@unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd gives different numbers')
+@pytest.mark.openchannel('v1')
+def test_opening_below_min_capacity_sat(bitcoind, node_factory):
+    """OK, here's what happens:
+
+    The user configures min-capacity-sat=2,000,000.
+    They try to open a channel with 591,000 sat
+    We let them (for some reason), which kinda makes sense: it's their own rules
+    We then get upset when you accept!
+
+    The "capacity" here is the effective capacity of the channel, which is capped at funding - (reserves and 2 anchors), and at max_htlc_value_in_flight.
+    """
+    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts=[{'min-capacity-sat': 2_000_000}, {}])
+
+    l1.fundwallet(3_000_000)
+
+    with pytest.raises(RpcError, match=r'which is below 2000000sat'):
+        l1.rpc.fundchannel(l2.info['id'], "591000sat")
+
+    l1.connect(l2)
+
+    # Even with the exact amount, the *capacity* is different.
+    with pytest.raises(RpcError, match=r'channel capacity is 1955125sat, which is below 2000000sat'):
+        l1.rpc.fundchannel(l2.info['id'], "2000000sat")
+
+    # But we shouldn't have bothered l2
+    assert not l2.daemon.is_in_log('peer_in WIRE_ERROR')
+
+
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
+def test_opening_crash(bitcoind, node_factory):
+    """Stop transmission of initial funding tx, check it eventually opens"""
+    l1, l2 = node_factory.get_nodes(2)
+
+    def censoring_sendrawtx(r):
+        return {'id': r['id'], 'result': {}}
+
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+    l2.daemon.rpcproxy.mock_rpc('sendrawtransaction', censoring_sendrawtx)
+    l1.fundwallet(3_000_000)
+    l1.connect(l2)
+    txid = l1.rpc.fundchannel(l2.info['id'], "2000000sat")['txid']
+
+    l1.stop()
+    l1.daemon.rpcproxy.mock_rpc('sendrawtransaction', None)
+    l1.start()
+
+    bitcoind.generate_block(1, wait_for_mempool=txid)
+
+
+@pytest.mark.openchannel('v1')
+def test_sendpsbt_crash(bitcoind, node_factory):
+    """Stop sendpsbt, check it eventually opens"""
+    plugin_path = Path(__file__).parent / "plugins" / "stop_sendpsbt.py"
+    l1, l2 = node_factory.get_nodes(2, opts=[{"plugin": plugin_path, 'may_fail': True, 'start': False}, {}])
+    # Saving IO can cause JSON errors when we check it, due to partial writes if we
+    # get lucky when we kill it.
+    del l1.daemon.opts['dev-save-plugin-io']
+    l1.start()
+
+    l1.fundwallet(3_000_000)
+    l1.connect(l2)
+
+    # signpsbt kills l1.
+    with pytest.raises(RpcError, match=r'Connection to RPC server lost.'):
+        l1.rpc.fundchannel(l2.info['id'], "2000000sat")
+
+    del l1.daemon.opts['plugin']
+    l1.start()
+    bitcoind.generate_block(1, wait_for_mempool=1)
+
+    assert l1.daemon.is_in_log('Signed and sent psbt for waiting channel')
+
+
+@pytest.mark.parametrize("stay_withheld", [True, False])
+@pytest.mark.parametrize("mutual_close", [True, False])
+def test_zeroconf_withhold(node_factory, bitcoind, stay_withheld, mutual_close):
+    plugin_path = Path(__file__).parent / "plugins" / "zeroconf-selective.py"
+
+    l1, l2 = node_factory.get_nodes(2, opts=[{'may_reconnect': True,
+                                              'dev-no-reconnect': None,
+                                              },
+                                             {'plugin': str(plugin_path),
+                                              'zeroconf_allow': '038194b5f32bdf0aa59812c86c4ef7ad2f294104fa027d1ace9b469bb6f88cf37b',
+                                              'may_reconnect': True,
+                                              'dev-no-reconnect': None,
+                                              }])
+    # Try to open a mindepth=0 channel
+    l1.fundwallet(10**7)
+
+    l1.connect(l2)
+    amount = 1000000
+    funding_addr = l1.rpc.fundchannel_start(l2.info['id'], f"{amount}sat", mindepth=0)['funding_address']
+
+    # Create the funding transaction
+    psbt = l1.rpc.fundpsbt(amount, "1000perkw", 1000, excess_as_change=True)['psbt']
+    psbt = l1.rpc.addpsbtoutput(1000000, psbt, destination=funding_addr)['psbt']
+
+    # Be sure fundchannel_complete is successful
+    assert l1.rpc.fundchannel_complete(l2.info['id'], psbt, withhold=True)['commitments_secured']
+
+    # It's withheld.
+    assert only_one(l1.rpc.listpeerchannels()['channels'])['funding']['withheld'] is True
+
+    # We can use the channel (once they send an update)
+    wait_for(lambda: 'remote' in only_one(l1.rpc.listpeerchannels()['channels'])['updates'])
+    l1.rpc.xpay(l2.rpc.invoice(100, "test_zeroconf_withhold", "test_zeroconf_withhold")['bolt11'])
+
+    # But mempool is empty!  No funding tx!
+    assert bitcoind.rpc.getrawmempool() == []
+
+    # Restarting doesn't make it transmit!
+    l1.restart()
+    assert bitcoind.rpc.getrawmempool() == []
+
+    if mutual_close:
+        l1.connect(l2)
+
+    if not stay_withheld:
+        # sendpsbt marks it as no longer withheld.
+        l1.rpc.sendpsbt(l1.rpc.signpsbt(psbt)['signed_psbt'])
+        assert only_one(l1.rpc.listpeerchannels()['channels'])['funding']['withheld'] is False
+        assert l1.daemon.is_in_log(r'Funding PSBT sent, and stored for rexmit \(was withheld\)')
+        wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 1)
+
+    if mutual_close:
+        ret = l1.rpc.close(l2.info['id'])
+    else:
+        ret = l1.rpc.close(l2.info['id'], unilateraltimeout=1)
+
+    if stay_withheld:
+        assert ret['txs'] == []
+        assert ret['txids'] == []
+        assert bitcoind.rpc.getrawmempool() == []
+    else:
+        assert len(ret['txs']) == 1
+        assert len(ret['txids']) == 1
+        wait_for(lambda: len(bitcoind.rpc.getrawmempool()) == 2)
+
+    # If withheld, it's moved to closed immediately.
+    if stay_withheld:
+        assert l1.rpc.listpeerchannels()['channels'] == []
+        assert only_one(l1.rpc.listclosedchannels()['closedchannels'])['funding_withheld'] is True
+    else:
+        if mutual_close:
+            wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['state'] == 'CLOSINGD_COMPLETE')
+        else:
+            wait_for(lambda: only_one(l1.rpc.listpeerchannels()['channels'])['state'] == 'AWAITING_UNILATERAL')

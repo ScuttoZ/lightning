@@ -1,7 +1,5 @@
 /* Simple tool to route gossip from a peer. */
 #include "config.h"
-#include <bitcoin/block.h>
-#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
 #include <ccan/io/io.h>
@@ -9,16 +7,13 @@
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
+#include <ccan/time/time.h>
+#include <common/clock_time.h>
 #include <common/cryptomsg.h>
 #include <common/features.h>
-#include <common/peer_failed.h>
-#include <common/per_peer_state.h>
 #include <common/ping.h>
-#include <common/status.h>
 #include <inttypes.h>
 #include <netdb.h>
-#include <poll.h>
-#include <secp256k1_ecdh.h>
 #include <stdio.h>
 #include <wire/peer_wire.h>
 
@@ -30,6 +25,7 @@ static bool no_init = false;
 static bool handle_pings = false;
 static bool hex = false;
 static bool explicit_network = false;
+static bool no_early_close = false;
 static int timeout_after = -1;
 static u8 *features;
 
@@ -154,6 +150,8 @@ static u8 *sync_crypto_read(const tal_t *ctx, int peer_fd, struct crypto_state *
 
 	if (!read_all(peer_fd, hdr, sizeof(hdr))) {
 		status_debug("Failed reading header: %s", strerror(errno));
+		if (no_early_close)
+			exit(1);
 		exit(0);
 	}
 
@@ -185,6 +183,7 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 					 struct crypto_state *cs,
 					 struct oneshot *timer,
 					 enum is_websocket is_websocket,
+					 struct timemono starttime,
 					 char **args)
 {
 	int peer_fd = io_conn_fd(conn);
@@ -211,7 +210,7 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		msg = towire_gossip_timestamp_filter(NULL,
 						     &chainparams->genesis_blockhash,
 						     all_gossip ? 0
-						     : no_gossip ? 0xFFFFFFFF : time_now().ts.tv_sec,
+						     : no_gossip ? 0xFFFFFFFF : clock_time().ts.tv_sec,
 						     0xFFFFFFFF);
 		sync_crypto_write(peer_fd, cs, take(msg));
 	}
@@ -237,8 +236,12 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		u8 *msg;
 
 		if (poll(pollfd, ARRAY_SIZE(pollfd),
-			 timeout_after < 0 ? -1 : timeout_after * 1000) == 0)
-			return 0;
+			 timeout_after < 0 ? -1 : timeout_after * 1000) == 0) {
+			/* Timeout */
+			if (no_early_close)
+				exit(1);
+			exit(0);
+		}
 
 		/* We always to stdin first if we can */
 		if (pollfd[0].revents & POLLIN) {
@@ -253,16 +256,22 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 			}
 		} else if (pollfd[1].revents & POLLIN) {
 			u8 *pong;
+			bool is_padding;
 
 			msg = sync_crypto_read(NULL, peer_fd, cs);
 			if (!msg)
 				err(1, "Reading msg");
-			if (handle_pings
-			    && fromwire_peektype(msg) == WIRE_PING
-			    && check_ping_make_pong(tmpctx, msg, &pong)
-			    && pong) {
-				sync_crypto_write(peer_fd, cs, take(pong));
-			}
+			if (check_ping_make_pong(tmpctx, msg, &pong)) {
+				if (!pong)
+					is_padding = true;
+				else {
+					is_padding = false;
+					if (handle_pings)
+						sync_crypto_write(peer_fd, cs, take(pong));
+				}
+			} else
+				is_padding = false;
+
 			if (!accept_message(msg)) {
 				tal_free(msg);
 				continue;
@@ -275,7 +284,9 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 				    || !write_all(STDOUT_FILENO, msg, tal_bytelen(msg)))
 					err(1, "Writing out msg");
 			}
-			--max_messages;
+			/* Don't count "padding" pings as real messages */
+			if (!is_padding)
+				--max_messages;
 			tal_free(msg);
 		}
 	}
@@ -288,6 +299,8 @@ static struct io_plan *handshake_success(struct io_conn *conn,
 		err(1, "failed to shutdown write to peer: %s", strerror(errno));
 
 	while (sync_crypto_read(NULL, peer_fd, cs));
+	if (max_messages != 0 && no_early_close)
+		exit(1);
 	exit(0);
 }
 
@@ -366,8 +379,9 @@ int main(int argc, char *argv[])
 	opt_register_arg("--network", opt_set_network, opt_show_network,
 	                 NULL,
 	                 "Select the network parameters (bitcoin, testnet, signet,"
-	                 " regtest, liquid, liquid-regtest, litecoin or"
-	                 " litecoin-testnet)");
+	                 " regtest, liquid, or liquid-regtest)");
+	opt_register_noarg("--must-get-max-messages", opt_set_bool, &no_early_close,
+			   "Fail with exit code 1 unless we reach maximum messages");
 	opt_register_noarg("--help|-h", opt_usage_and_exit,
 			   "id@addr[:port] [hex-msg-tosend...]\n"
 			   "Connect to a lightning peer and relay gossip messages from it",
@@ -436,5 +450,6 @@ int main(int argc, char *argv[])
 
 	initiator_handshake(conn, &us, &them, &addr, NULL, NORMAL_SOCKET,
 			    handshake_success, argv+2);
-	exit(0);
+	/* Unreachable */
+	abort();
 }

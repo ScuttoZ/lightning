@@ -15,6 +15,7 @@
 #include <ccan/crypto/hkdf_sha256/hkdf_sha256.h>
 #include <ccan/htable/htable_type.h>
 #include <ccan/mem/mem.h>
+#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <channeld/full_channel.h>
@@ -27,6 +28,7 @@
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -130,7 +132,8 @@ static u64 channel_range(const struct info *info,
 			 const struct short_channel_id_dir *scidd,
 			 u64 min, u64 max)
 {
-	return min + (siphash24(&info->seed, scidd, sizeof(scidd)) % max);
+	assert(max != min);
+	return min + (siphash24(&info->seed, scidd, sizeof(scidd)) % (max - min));
 }
 
 void ecdh(const struct pubkey *point, struct secret *ss)
@@ -256,19 +259,13 @@ static u8 *get_next_onion(const tal_t *ctx, const struct route_step *rs)
 static struct node *make_peer_node(const tal_t *ctx)
 {
 	struct node *n = tal(ctx, struct node);
-	u32 salt = 0;
-	struct secret hsm_secret;
 	struct pubkey pubkey;
 
-	memset(&hsm_secret, 0, sizeof(hsm_secret));
-	snprintf((char *)&hsm_secret, sizeof(hsm_secret),
-		 "lightning-2");
-
-	/* This maps hsm_secret -> node privkey */
-	hkdf_sha256(&n->p, sizeof(n->p),
-		    &salt, sizeof(salt),
-		    &hsm_secret, sizeof(hsm_secret),
-		    "nodeid", 6);
+	/* l2's secret key */
+	if (!hex_decode("0c633a7c17c701a0980158f5483035e01fa8bd091b47fadf2e86e589a9f93fca",
+			strlen("0c633a7c17c701a0980158f5483035e01fa8bd091b47fadf2e86e589a9f93fca"),
+			&n->p, sizeof(n->p)))
+		abort();
 	pubkey_from_privkey(&n->p, &pubkey);
 	node_id_from_pubkey(&n->id, &pubkey);
 	n->name = tal_fmt(n, "lightningd-2");
@@ -656,9 +653,8 @@ static struct amount_msat calc_capacity(struct info *info,
 		if (!short_channel_id_dir_eq(&info->reservations[i]->scidd, scidd))
 			continue;
 		/* We should never use more that we have! */
-		if (!amount_msat_sub(&dynamic_capacity,
-				     dynamic_capacity,
-				     info->reservations[i]->amount))
+		if (!amount_msat_deduct(&dynamic_capacity,
+					info->reservations[i]->amount))
 			abort();
 		status_debug("... minus reservation %s",
 			     fmt_amount_msat(tmpctx, info->reservations[i]->amount));
@@ -844,9 +840,9 @@ found_next:
 	dfwd->path_key = tal_steal(dfwd, next_path_key);
 	dfwd->expected = next;
 
-	/* Delay 0.1 - 1 seconds, but skewed lower */
-	msec_delay = channel_range(info, &scidd, 0, 900);
-	msec_delay = 100 + channel_range(info, &scidd, 0, msec_delay);
+	/* Delay 1 - 100 milliseconds, but skewed lower */
+	msec_delay = channel_range(info, &scidd, 1, 90);
+	msec_delay = 10 + channel_range(info, &scidd, 0, msec_delay);
 
 	status_debug("Delaying %u msec for %s",
 		     msec_delay, fmt_short_channel_id_dir(tmpctx, &scidd));
@@ -871,7 +867,7 @@ static void delayed_forward(struct delayed_forward *dfwd)
 
 static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 {
-	u8 *msg;
+	u8 *msg, *extratlvs;
 	u32 cltv_expiry;
 	struct amount_msat amount;
 	u8 onion_routing_packet[TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE)];
@@ -887,13 +883,13 @@ static void handle_offer_htlc(struct info *info, const u8 *inmsg)
 	htlc->htlc_id = htlc_id;
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &htlc->payment_hash,
-					 onion_routing_packet, &blinding))
+					 onion_routing_packet, &blinding, &extratlvs))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
 	e = channel_add_htlc(info->channel, LOCAL, htlc->htlc_id,
 			     amount, cltv_expiry, &htlc->payment_hash,
 			     onion_routing_packet, take(blinding), NULL,
-			     &htlc_fee, true);
+			     &htlc_fee, NULL, true);
 	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
 		     htlc->htlc_id, fmt_amount_msat(tmpctx, amount),
 		     cltv_expiry,
@@ -1076,7 +1072,6 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 	u8 *final_scriptpubkey;
 	u8 *their_features;
 	u8 *remote_upfront_shutdown_script;
-	bool experimental_upgrade;
 	u32 *dev_disable_commit;
 	struct inflight **inflights;
 	struct short_channel_id local_alias;
@@ -1136,7 +1131,6 @@ static struct channel *handle_init(struct info *info, const u8 *init_msg)
 				    &channel_type,
 				    &dev_disable_commit,
 				    &pbases,
-				    &experimental_upgrade,
 				    &inflights,
 				    &local_alias))
 		abort();

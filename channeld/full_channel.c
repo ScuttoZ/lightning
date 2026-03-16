@@ -13,15 +13,10 @@
 #include <common/keyset.h>
 #include <common/memleak.h>
 #include <common/status.h>
+#include <inttypes.h>
 #include <stdio.h>
   /* Needs to be at end, since it doesn't include its own hdrs */
   #include "full_channel_error_names_gen.h"
-
-static void memleak_help_htlcmap(struct htable *memtable,
-				 struct htlc_map *htlcs)
-{
-	memleak_scan_htable(memtable, &htlcs->raw);
-}
 
 /* This is a dangerous thing!  Because we apply HTLCs in many places
  * in bulk, we can temporarily go negative.  You must check balance_ok()
@@ -113,11 +108,9 @@ struct channel *new_full_channel(const tal_t *ctx,
 						      option_wumbo,
 						      opener);
 
-	if (channel) {
-		channel->htlcs = tal(channel, struct htlc_map);
-		htlc_map_init(channel->htlcs);
-		memleak_add_helper(channel->htlcs, memleak_help_htlcmap);
-	}
+	if (channel)
+		channel->htlcs = new_htable(channel, htlc_map);
+
 	return channel;
 }
 
@@ -423,7 +416,7 @@ static bool get_room_above_reserve(const struct channel *channel,
 		return false;
 	}
 
-	if (!amount_msat_sub_sat(remainder, *remainder, reserve)) {
+	if (!amount_msat_deduct_sat(remainder, reserve)) {
 		status_debug("%s cannot afford htlc: would make balance %s"
 			     " below reserve %s",
 			     side_to_str(side),
@@ -511,7 +504,7 @@ static bool htlc_dust(const struct channel *channel,
 				      side, &trim_rmvd))
 		return false;
 
-	return amount_msat_sub(trim_total, *trim_total, trim_rmvd);
+	return amount_msat_deduct(trim_total, trim_rmvd);
 }
 
 /*
@@ -588,6 +581,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 				     struct htlc **htlcp,
 				     bool enforce_aggregate_limits,
 				     struct amount_sat *htlc_fee,
+				     struct tlv_field *extra_tlvs,
 				     bool err_immediate_failures)
 {
 	struct htlc *htlc, *old;
@@ -613,6 +607,15 @@ static enum channel_add_err add_htlc(struct channel *channel,
 	htlc->failed = NULL;
 	htlc->r = NULL;
 	htlc->routing = tal_dup_arr(htlc, u8, routing, TOTAL_PACKET_SIZE(ROUTING_INFO_SIZE), 0);
+	if (extra_tlvs && tal_count(extra_tlvs) > 0) {
+		htlc->extra_tlvs = tal_dup_talarr(htlc, struct tlv_field, extra_tlvs);
+		for (size_t i = 0; i < tal_count(extra_tlvs); i++) {
+			/* We need to attach the value to the correct parent */
+			htlc->extra_tlvs[i].value = tal_dup_talarr(htlc, u8, htlc->extra_tlvs[i].value);
+		}
+	} else {
+		htlc->extra_tlvs = NULL;
+	}
 
 	/* FIXME: Change expiry to simple u32 */
 
@@ -770,7 +773,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 		 */
 		if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
 		    && channel->opener == sender
-		    && !amount_msat_sub_sat(&remainder, remainder, AMOUNT_SAT(660)))
+		    && !amount_msat_deduct_sat(&remainder, AMOUNT_SAT(660)))
 			return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 
 		if (channel->opener== sender) {
@@ -802,7 +805,7 @@ static enum channel_add_err add_htlc(struct channel *channel,
 
 			if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
 			    && channel->opener != sender
-			    && !amount_msat_sub_sat(&remainder, remainder, AMOUNT_SAT(660)))
+			    && !amount_msat_deduct_sat(&remainder, AMOUNT_SAT(660)))
 				return CHANNEL_ERR_CHANNEL_CAPACITY_EXCEEDED;
 
 			/* Should be able to afford both their own commit tx
@@ -905,6 +908,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 				      const struct pubkey *path_key TAKES,
 				      struct htlc **htlcp,
 				      struct amount_sat *htlc_fee,
+				      struct tlv_field *extra_tlvs,
 				      bool err_immediate_failures)
 {
 	enum htlc_state state;
@@ -923,7 +927,7 @@ enum channel_add_err channel_add_htlc(struct channel *channel,
 
 	return add_htlc(channel, state, id, amount, cltv_expiry,
 			payment_hash, routing, path_key,
-			htlcp, true, htlc_fee, err_immediate_failures);
+			htlcp, true, htlc_fee, extra_tlvs, err_immediate_failures);
 }
 
 struct htlc *channel_get_htlc(struct channel *channel, enum side sender, u64 id)
@@ -1253,12 +1257,12 @@ u32 approx_max_feerate(const struct channel *channel)
 	 * `to_remote`).
 	 */
 	if ((option_anchor_outputs || option_anchors_zero_fee_htlc_tx)
-	    && !amount_msat_sub_sat(&avail, avail, AMOUNT_SAT(660))) {
+	    && !amount_msat_deduct_sat(&avail, AMOUNT_SAT(660))) {
 		avail = AMOUNT_MSAT(0);
 	} else {
 		/* We should never go below reserve. */
-		if (!amount_msat_sub_sat(&avail, avail,
-					 channel->config[!channel->opener].channel_reserve))
+		if (!amount_msat_deduct_sat(&avail,
+					    channel->config[!channel->opener].channel_reserve))
 		avail = AMOUNT_MSAT(0);
 	}
 
@@ -1621,7 +1625,8 @@ bool channel_force_htlcs(struct channel *channel,
 			     &htlcs[i]->payment_hash,
 			     htlcs[i]->onion_routing_packet,
 			     htlcs[i]->path_key,
-			     &htlc, false, NULL, false);
+			     &htlc, false, NULL,
+			     htlcs[i]->extra_tlvs, false);
 		if (e != CHANNEL_ERR_ADD_OK) {
 			status_broken("%s HTLC %"PRIu64" failed error %u",
 				     htlc_state_owner(htlcs[i]->state) == LOCAL

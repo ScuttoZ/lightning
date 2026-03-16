@@ -3,6 +3,7 @@
 
 #include "config.h"
 #include <bitcoin/pubkey.h>
+#include <bitcoin/signature.h>
 #include <bitcoin/tx.h>
 #include <common/amount.h>
 
@@ -20,6 +21,7 @@ struct inflight {
 	bool i_am_initiator;
 	bool force_sign_first;
 	struct short_channel_id *locked_scid;
+	bool i_sent_sigs;
 };
 
 struct inflight *fromwire_inflight(const tal_t *ctx, const u8 **cursor, size_t *max);

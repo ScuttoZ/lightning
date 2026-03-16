@@ -43,6 +43,7 @@
             "total_htlcs_sent",
             "funding_txid",
             "funding_outnum",
+            "funding_withheld",
             "leased",
             "final_to_us_msat",
             "min_to_us_msat",
@@ -188,6 +189,20 @@
                 "The 0-based output number of the funding transaction which opens the channel."
               ]
             },
+            "funding_psbt": {
+              "type": "string",
+              "added": "v25.12",
+              "description": [
+                "The PSBT (may be non-final or unsigned) we should use to open the channel, if any"
+              ]
+            },
+            "funding_withheld": {
+              "type": "boolean",
+              "added": "v25.12",
+              "description": [
+                "True if we have not broadcast the funding transaction (see fundchannel_complete)."
+              ]
+            },
             "leased": {
               "type": "boolean",
               "description": [
@@ -280,13 +295,13 @@
     "- -32602: If the given parameters are wrong."
   ],
   "author": [
-    "Rusty Russell <<rusty@blockstream.com>>."
+    "Rusty Russell [rusty@blockstream.com](mailto:rusty@blockstream.com)."
   ],
   "see_also": [
     "lightning-listpeerchannels(7)"
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {

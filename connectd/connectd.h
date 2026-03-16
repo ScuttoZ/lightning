@@ -1,16 +1,13 @@
 #ifndef LIGHTNING_CONNECTD_CONNECTD_H
 #define LIGHTNING_CONNECTD_CONNECTD_H
 #include "config.h"
-#include <bitcoin/pubkey.h>
 #include <bitcoin/short_channel_id.h>
-#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable_type.h>
+#include <ccan/membuf/membuf.h>
 #include <ccan/timer/timer.h>
 #include <common/bigsize.h>
-#include <common/channel_id.h>
 #include <common/crypto_state.h>
 #include <common/node_id.h>
-#include <common/pseudorand.h>
 #include <common/wireaddr.h>
 #include <connectd/handshake.h>
 
@@ -46,6 +43,15 @@ enum pong_expect_type {
 	PONG_EXPECTED_PROBING = 2,
 };
 
+enum draining_state {
+	/* Normal state */
+	NOT_DRAINING,
+	/* First, reading remaining messages from subds */
+	READING_FROM_SUBDS,
+	/* Finally, writing any queued messages to peer */
+	WRITING_TO_PEER,
+};
+
 /*~ We keep a hash table (ccan/htable) of peers, which tells us what peers are
  * already connected (by peer->id). */
 struct peer {
@@ -59,21 +65,20 @@ struct peer {
 	struct node_id id;
 	/* Counters and keys for symmetric crypto */
 	struct crypto_state cs;
+	/* Time when we first connected */
+	struct timemono connect_starttime;
 
-	/* Connection to the peer */
+	/* Connection to the peer (NULL if it's disconnected and we're flushing) */
 	struct io_conn *to_peer;
+
+	/* Non-zero if shutting down. */
+	enum draining_state draining_state;
 
 	/* Counter to distinguish this connection from the next re-connection */
 	u64 counter;
 
-	/* Is this draining?  If so, just keep writing until queue empty */
-	bool draining;
-
 	/* Connections to the subdaemons */
 	struct subd **subds;
-
-	/* When socket has Nagle overridden */
-	bool urgent;
 
 	/* Input buffer. */
 	u8 *peer_in;
@@ -81,20 +86,32 @@ struct peer {
 	/* Output buffer. */
 	struct msg_queue *peer_outq;
 
-	/* Peer sent buffer (for freeing after sending) */
-	const u8 *sent_to_peer;
+	/* Encrypted peer sending buffer */
+	MEMBUF(u8) encrypted_peer_out;
+	size_t encrypted_peer_out_sent;
+	size_t peer_out_urgent;
+	bool flushing_nonurgent;
+	struct oneshot *nonurgent_flush_timer;
 
 	/* We stream from the gossip_store for them, when idle */
 	struct gossip_state gs;
 
 	/* Are we expecting a pong? */
 	enum pong_expect_type expecting_pong;
+	u64 ping_reqid;
+
+	/* Timestamp when we initially sent probe ping */
+	struct timemono ping_start;
 
 	/* Random ping timer, to detect dead connections. */
 	struct oneshot *ping_timer;
 
 	/* Last time we received traffic */
-	struct timeabs last_recv_time;
+	struct timemono last_recv_time;
+
+	/* How long have we been ignoring peer input? */
+	struct timemono peer_in_lasttime;
+	int peer_in_lastmsg;
 
 	/* Ratelimits for onion messages.  One token per msec. */
 	size_t onionmsg_incoming_tokens;
@@ -193,6 +210,15 @@ struct connecting {
 	/* How far did we get? */
 	const char *connstate;
 
+	/* Why are we connecting? */
+	const char *reason;
+
+	/* When did we start? */
+	struct timemono start;
+
+	/* Did we find an address we could attempt to connect to? */
+	bool connect_attempted;
+
 	/* Accumulated errors */
 	char *errors;
 };
@@ -236,7 +262,7 @@ static bool scid_to_node_id_eq_scid(const struct scid_to_node_id *scid_to_node_i
  * we use this to forward onion messages which specify the next hop by scid/dir. */
 HTABLE_DEFINE_NODUPS_TYPE(struct scid_to_node_id,
 			  scid_to_node_id_keyof,
-			  short_channel_id_hash,
+			  hash_scid,
 			  scid_to_node_id_eq_scid,
 			  scid_htable);
 
@@ -314,9 +340,6 @@ struct daemon {
 	u32 gossip_recent_time;
 	struct gossmap_iter *gossmap_iter_recent;
 
-	/* We only announce websocket addresses if !deprecated_apis */
-	bool announce_websocket;
-
 	/* Shutting down, don't send new stuff */
 	bool shutting_down;
 
@@ -346,6 +369,10 @@ struct daemon {
 	bool dev_no_reconnect;
 	/* --dev-fast-reconnect */
 	bool dev_fast_reconnect;
+	/* Don't complain about lightningd being unresponsive. */
+	bool dev_lightningd_is_slow;
+	/* Don't set TCP_NODELAY */
+	bool dev_keep_nagle;
  };
 
 /* Called by io_tor_connect once it has a connection out. */
@@ -369,10 +396,17 @@ struct io_plan *peer_connected(struct io_conn *conn,
 			       struct crypto_state *cs,
 			       const u8 *their_features TAKES,
 			       enum is_websocket is_websocket,
+			       struct timemono starttime,
 			       bool incoming);
 
-/* Removes peer from hash table, tells gossipd and lightningd. */
-void destroy_peer(struct peer *peer);
+/* Tell gossipd and lightningd that this peer is gone. */
+void send_disconnected(struct daemon *daemon,
+		       const struct node_id *id,
+		       u64 connectd_counter,
+		       struct timemono starttime);
+
+/* Free peer immediately (don't wait for draining). */
+void destroy_peer_immediately(struct peer *peer);
 
 /* Remove a random connection, when under stress. */
 void close_random_connection(struct daemon *daemon);

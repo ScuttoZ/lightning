@@ -1,27 +1,20 @@
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
-#include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
-#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
-#include <common/billboard.h>
-#include <common/blockheight_states.h>
-#include <common/gossip_store.h>
-#include <common/initial_channel.h>
 #include <common/interactivetx.h>
 #include <common/lease_rates.h>
-#include <common/memleak.h>
-#include <common/peer_billboard.h>
-#include <common/peer_failed.h>
 #include <common/peer_io.h>
-#include <common/psbt_internal.h>
 #include <common/psbt_open.h>
-#include <common/setup.h>
 #include <common/status.h>
-#include <common/subdaemon.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
+#include <inttypes.h>
+
+#ifndef SUPERVERBOSE
+#define SUPERVERBOSE(...)
+#endif
 
 /*
  * BOLT #2:
@@ -163,6 +156,8 @@ static u8 *read_next_msg(const tal_t *ctx,
 		case WIRE_UPDATE_FULFILL_HTLC:
 		case WIRE_UPDATE_FAIL_HTLC:
 		case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+		case WIRE_PROTOCOL_BATCH_ELEMENT:
+		case WIRE_START_BATCH:
 		case WIRE_COMMITMENT_SIGNED:
 		case WIRE_REVOKE_AND_ACK:
 		case WIRE_UPDATE_FEE:
@@ -196,6 +191,18 @@ static u8 *read_next_msg(const tal_t *ctx,
 		}
 	}
 }
+
+#define SHA_FMT					   \
+	"%02x%02x%02x%02x%02x%02x%02x%02x"	   \
+	"%02x%02x%02x%02x%02x%02x%02x%02x"	   \
+	"%02x%02x%02x%02x%02x%02x%02x%02x"	   \
+	"%02x%02x%02x%02x%02x%02x%02x%02x"
+
+#define SHA_VALS(e)							\
+	e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7],			\
+		e[8], e[9], e[10], e[11], e[12], e[13], e[14], e[15],	\
+		e[16], e[17], e[18], e[19], e[20], e[21], e[22], e[23], \
+		e[24], e[25], e[25], e[26], e[28], e[29], e[30], e[31]
 
 static char *send_next(const tal_t *ctx,
 		       struct interactivetx_context *ictx,
@@ -267,6 +274,10 @@ static char *send_next(const tal_t *ctx,
 					&serial_id))
 			return "interactivetx RM_INPUT PSBT has invalid"
 			       " serial_id.";
+
+		SUPERVERBOSE("Removing input "SHA_FMT" with serial_id %s",
+			     SHA_VALS(set->rm_ins[0].input.txhash),
+			     tal_hexstr(ctx, &serial_id, sizeof(serial_id)));
 
 		msg = towire_tx_remove_input(NULL, cid, serial_id);
 
@@ -403,6 +414,36 @@ char *process_interactivetx_updates(const tal_t *ctx,
 	 * with no changes -- both indicate no changes */
 	if (!next_psbt)
 		next_psbt = ictx->current_psbt;
+
+	SUPERVERBOSE("itx get_changes %zu inputs -> %zu inputs",
+		     ictx->current_psbt->num_inputs,
+		     next_psbt->num_inputs);
+
+	SUPERVERBOSE("current_psbt inputs:");
+	for(size_t i = 0; i < ictx->current_psbt->num_inputs; i++) {
+		u64 serial_id;
+		if (!psbt_get_serial_id(&ictx->current_psbt->inputs[i].unknowns,
+					&serial_id))
+			return "interactivetx ADD_INPUT PSBT has invalid"
+			       " serial_id.";
+		SUPERVERBOSE("txhash: "SHA_FMT", index: %"PRIu32", serial_id: %s",
+			     SHA_VALS(ictx->current_psbt->inputs[i].txhash),
+			     ictx->current_psbt->inputs[i].index,
+			     tal_hexstr(ctx, &serial_id, sizeof(serial_id)));
+	}
+
+	SUPERVERBOSE("next_psbt inputs:");
+	for(size_t i = 0; i < next_psbt->num_inputs; i++) {
+		u64 serial_id;
+		if (!psbt_get_serial_id(&next_psbt->inputs[i].unknowns,
+					&serial_id))
+			return "interactivetx ADD_INPUT PSBT has invalid"
+			       " serial_id.";
+		SUPERVERBOSE("txhash: "SHA_FMT", index: %"PRIu32", serial_id: %s",
+			     SHA_VALS(next_psbt->inputs[i].txhash),
+			     next_psbt->inputs[i].index,
+			     tal_hexstr(ctx, &serial_id, sizeof(serial_id)));
+	}
 
 	ictx->change_set = get_changes(ctx, ictx, next_psbt);
 
@@ -771,6 +812,8 @@ char *process_interactivetx_updates(const tal_t *ctx,
 		case WIRE_UPDATE_FULFILL_HTLC:
 		case WIRE_UPDATE_FAIL_HTLC:
 		case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+		case WIRE_PROTOCOL_BATCH_ELEMENT:
+		case WIRE_START_BATCH:
 		case WIRE_COMMITMENT_SIGNED:
 		case WIRE_REVOKE_AND_ACK:
 		case WIRE_UPDATE_FEE:

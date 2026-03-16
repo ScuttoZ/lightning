@@ -3,11 +3,8 @@
 #include "config.h"
 
 #include <ccan/io/io.h>
-#include <common/bolt11.h>
-#include <common/route.h>
-#include <plugins/channel_hint.h>
 #include <plugins/libplugin.h>
-#include <wire/onion_wire.h>
+#include <wire/onion_wiregen.h>
 
 struct legacy_payload {
 	struct short_channel_id scid;
@@ -151,9 +148,6 @@ struct payment {
 	struct plugin *plugin;
 	struct node_id *local_id;
 
-	const char *json_buffer;
-	const jsmntok_t *json_toks;
-
 	/* The current phase we are in. */
 	enum payment_step step;
 
@@ -206,7 +200,7 @@ struct payment {
 	u32 start_block;
 
 	struct timeabs start_time, end_time;
-	struct timeabs deadline;
+	struct timemono deadline;
 
 	/* Constraints the state machine and modifiers needs to maintain. */
 	struct payment_constraints constraints;

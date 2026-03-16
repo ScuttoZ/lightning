@@ -3,19 +3,15 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/cast/cast.h>
-#include <ccan/mem/mem.h>
-#include <common/configdir.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/key_derive.h>
 #include <common/psbt_open.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
+#include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <wallet/txfilter.h>
-#include <wally_psbt.h>
 
 /* 12 hours is usually enough reservation time */
 #define RESERVATION_DEFAULT (6 * 12)
@@ -363,7 +359,6 @@ static struct command_result *finish_psbt(struct command *cmd,
 	/* Should we add a change output?  (Iff it can pay for itself!) */
 	change = change_amount(change, feerate_per_kw, weight);
 	if (amount_sat_greater(change, AMOUNT_SAT(0))) {
-		struct pubkey pubkey;
 		s64 keyidx;
 		u8 *b32script;
 		enum addrtype type;
@@ -382,8 +377,7 @@ static struct command_result *finish_psbt(struct command *cmd,
 					    " Keys exhausted.");
 
 		if (chainparams->is_elements) {
-			bip32_pubkey(cmd->ld, &pubkey, keyidx);
-			b32script = scriptpubkey_p2wpkh(tmpctx, &pubkey);
+			b32script = p2wpkh_for_keyidx(tmpctx, cmd->ld, keyidx);
 		} else {
 			b32script = p2tr_for_keyidx(tmpctx, cmd->ld, keyidx);
 		}
@@ -662,7 +656,6 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 	u32 *locktime;
 	ssize_t outnum;
 	u32 weight;
-	struct pubkey pubkey;
 	s64 keyidx;
 	const u8 *b32script;
 	bool *add_initiator_serial_ids;
@@ -722,8 +715,7 @@ static struct command_result *json_addpsbtoutput(struct command *cmd,
 					    " Keys exhausted.");
 
 		if (chainparams->is_elements) {
-			bip32_pubkey(cmd->ld, &pubkey, keyidx);
-			b32script = scriptpubkey_p2wpkh(tmpctx, &pubkey);
+			b32script = p2wpkh_for_keyidx(tmpctx, cmd->ld, keyidx);
 		} else {
 			b32script = p2tr_for_keyidx(tmpctx, cmd->ld, keyidx);
 		}

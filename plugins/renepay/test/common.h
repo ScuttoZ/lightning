@@ -3,7 +3,7 @@
 #include "config.h"
 #include <ccan/crc32c/crc32c.h>
 #include <common/gossip_store.h>
-#include <gossipd/gossip_store_wiregen.h>
+#include <common/gossip_store_wiregen.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <wire/peer_wiregen.h>
@@ -33,7 +33,7 @@ static void write_to_store(int store_fd, const u8 *msg)
 {
 	struct gossip_hdr hdr;
 
-	hdr.flags = cpu_to_be16(0);
+	hdr.flags = cpu_to_be16(GOSSIP_STORE_COMPLETED_BIT);
 	hdr.len = cpu_to_be16(tal_count(msg));
 	hdr.timestamp = 0;
 	hdr.crc = cpu_to_be32(crc32c(be32_to_cpu(hdr.timestamp), msg, tal_count(msg)));

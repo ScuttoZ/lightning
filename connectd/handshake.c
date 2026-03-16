@@ -5,8 +5,10 @@
 #include <ccan/endian/endian.h>
 #include <ccan/io/io.h>
 #include <ccan/mem/mem.h>
+#include <ccan/time/time.h>
 #include <common/crypto_state.h>
 #include <common/ecdh.h>
+#include <common/randbytes.h>
 #include <common/status.h>
 #include <common/utils.h>
 #include <common/wireaddr.h>
@@ -14,7 +16,6 @@
 #include <errno.h>
 #include <secp256k1_ecdh.h>
 #include <sodium/crypto_aead_chacha20poly1305.h>
-#include <sodium/randombytes.h>
 
 #ifndef SUPERVERBOSE
 #define SUPERVERBOSE(...)
@@ -178,6 +179,9 @@ struct handshake {
 	/* Are we connected via a websocket? */
 	enum is_websocket is_websocket;
 
+	/* Time they first connected */
+	struct timemono starttime;
+
 	/* Function to call once handshake complete. */
 	struct io_plan *(*cb)(struct io_conn *conn,
 			      const struct pubkey *their_id,
@@ -185,6 +189,7 @@ struct handshake {
 			      struct crypto_state *cs,
 			      struct oneshot *timeout,
 			      enum is_websocket is_websocket,
+			      struct timemono starttime,
 			      void *cbarg);
 	void *cbarg;
 };
@@ -194,7 +199,7 @@ static struct keypair generate_key(void)
 	struct keypair k;
 
 	do {
-		randombytes_buf(k.priv.secret.data, sizeof(k.priv.secret.data));
+		randbytes(k.priv.secret.data, sizeof(k.priv.secret.data));
 	} while (!secp256k1_ec_pubkey_create(secp256k1_ctx,
 					     &k.pub.pubkey, k.priv.secret.data));
 	return k;
@@ -357,12 +362,14 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 			      struct crypto_state *cs,
 			      struct oneshot *timeout,
 			      enum is_websocket is_websocket,
+			      struct timemono starttime,
 			      void *cbarg);
 	void *cbarg;
 	struct pubkey their_id;
 	struct wireaddr_internal addr;
 	struct oneshot *timeout;
 	enum is_websocket is_websocket;
+	struct timemono starttime;
 
 	/* BOLT #8:
 	 *
@@ -396,9 +403,10 @@ static struct io_plan *handshake_succeeded(struct io_conn *conn,
 	addr = h->addr;
 	timeout = h->timeout;
 	is_websocket = h->is_websocket;
+	starttime = h->starttime;
 
 	tal_free(h);
-	return cb(conn, &their_id, &addr, &cs, timeout, is_websocket, cbarg);
+	return cb(conn, &their_id, &addr, &cs, timeout, is_websocket, starttime, cbarg);
 }
 
 static struct handshake *new_handshake(const tal_t *ctx,
@@ -983,12 +991,14 @@ struct io_plan *responder_handshake_(struct io_conn *conn,
 							   struct crypto_state *,
 							   struct oneshot *,
 							   enum is_websocket,
+							   struct timemono,
 							   void *cbarg),
 				     void *cbarg)
 {
 	struct handshake *h = new_handshake(conn, my_id);
 
 	h->side = RESPONDER;
+	h->starttime = time_mono();
 	h->my_id = *my_id;
 	h->addr = *addr;
 	h->cbarg = cbarg;
@@ -1011,12 +1021,14 @@ struct io_plan *initiator_handshake_(struct io_conn *conn,
 							   struct crypto_state *,
 							   struct oneshot *timeout,
 							   enum is_websocket is_websocket,
+							   struct timemono,
 							   void *cbarg),
 				     void *cbarg)
 {
 	struct handshake *h = new_handshake(conn, their_id);
 
 	h->side = INITIATOR;
+	h->starttime = time_mono();
 	h->my_id = *my_id;
 	h->their_id = *their_id;
 	h->addr = *addr;

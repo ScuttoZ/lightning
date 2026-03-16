@@ -1,10 +1,10 @@
 > [!IMPORTANT]
 >
-> 25.05 FREEZE MAY 05TH: Non-bugfix PRs not ready by this date will wait for 25.08.
+> 26.04 FREEZE March 11th: Non-bugfix PRs not ready by this date will wait for 26.06.
 >
-> RC1 is scheduled on _May 12th_, RC2 on _May 16th_, ...
+> RC1 is scheduled on _March 23rd_
 >
-> The final release is on MAY 20TH.
+> The final release is scheduled for April 15th.
 
 
 ## Checklist
@@ -14,3 +14,4 @@ Before submitting the PR, ensure the following tasks are completed. If an item i
 - [ ] Tests have been added or modified to reflect the changes.
 - [ ] Documentation has been reviewed and updated as needed.
 - [ ] Related issues have been listed and linked, including any that this PR closes.
+- [ ] *Important* All PRs must consider how to reverse any persistent changes for `tools/lightning-downgrade`

@@ -1,8 +1,6 @@
 #include "config.h"
 #include <ccan/tal/str/str.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/json_stream.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 
@@ -222,10 +220,6 @@ static struct command_result *json_listdatastore(struct command *cmd,
 		   NULL))
 		return command_param_failed();
 
-	if (key)
-		log_debug(cmd->ld->log, "Looking for %s",
-			  datastore_key_fmt(tmpctx, key));
-
 	response = json_stream_success(cmd);
 	json_array_start(response, "datastore");
 
@@ -235,12 +229,9 @@ static struct command_result *json_listdatastore(struct command *cmd,
 	     stmt = wallet_datastore_next(cmd, key,
 					  stmt, &k, &data,
 					  &generation)) {
-		log_debug(cmd->ld->log, "Got %s",
-			  datastore_key_fmt(tmpctx, k));
 
 		/* Don't list sub-children, except as summary to show it exists. */
 		if (tal_count(k) > tal_count(key) + 1) {
-			log_debug(cmd->ld->log, "Too long");
 			if (!prev_k || !datastore_key_startswith(k, prev_k)) {
 				prev_k = tal_dup_arr(cmd, const char *, k,
 						     tal_count(key) + 1, 0);
@@ -249,7 +240,6 @@ static struct command_result *json_listdatastore(struct command *cmd,
 				json_object_end(response);
 			}
 		} else {
-			log_debug(cmd->ld->log, "Printing");
 			json_object_start(response, NULL);
 			json_add_datastore(response, k, data, generation);
 			json_object_end(response);

@@ -1,7 +1,6 @@
 #ifndef LIGHTNING_COMMON_UTILS_H
 #define LIGHTNING_COMMON_UTILS_H
 #include "config.h"
-#include <ccan/build_assert/build_assert.h>
 #include <ccan/crypto/ripemd160/ripemd160.h>
 #include <ccan/crypto/sha256/sha256.h>
 #include <ccan/short_types/short_types.h>
@@ -9,8 +8,8 @@
 #include <ccan/tal/tal.h>
 #include <secp256k1.h>
 
+struct membuf;
 extern secp256k1_context *secp256k1_ctx;
-
 extern const struct chainparams *chainparams;
 
 /* Unsigned min/max macros: BUILD_ASSERT make sure types are unsigned */
@@ -53,6 +52,16 @@ char *tal_hex(const tal_t *ctx, const tal_t *data);
 
 /* Allocate and fill a buffer with the data of this hex string. */
 u8 *tal_hexdata(const tal_t *ctx, const void *str, size_t len);
+
+/**
+ * mlock_tal_memory - lock a tal-allocated memory with sodium_mlock.
+ * @ptr - the tal-allocated memory to lock
+ *
+ * This is a generic function to replace the pattern of sodium_mlock + tal_add_destructor.
+ *
+ * Aborts on failure (memory locking is mandatory for security).
+ */
+void mlock_tal_memory(const tal_t *ptr);
 
 /* Note: p is never a complex expression, otherwise this multi-evaluates! */
 #define tal_arr_expand(p, s)						\
@@ -146,6 +155,9 @@ void tal_wally_end_onto_(const tal_t *parent,
 			 tal_t *from_wally,
 			 const char *from_wally_name);
 
+/* ... or this if libwally only used temporary allocations. */
+void tal_wally_discard(void);
+
 /* Define sha256_eq. */
 STRUCTEQ_DEF(sha256, 0, u);
 
@@ -164,6 +176,9 @@ extern const tal_t *wally_tal_ctx;
  * Returns created temporary path name at *created if successful. */
 int tmpdir_mkstemp(const tal_t *ctx, const char *template TAKES, char **created);
 
+/* For use with membuf_init */
+void *membuf_tal_resize(struct membuf *mb, void *rawelems, size_t newsize);
+
 /**
  * tal_strlowering - return the same string by in lower case.
  * @ctx: the context to tal from (often NULL)
@@ -172,6 +187,15 @@ int tmpdir_mkstemp(const tal_t *ctx, const char *template TAKES, char **created)
  * FIXME: move this in ccan
  */
 char *str_lowering(const void *ctx, const char *string TAKES);
+
+/**
+ * tal_struppering - return the same string by in upper case.
+ * @ctx: the context to tal from (often NULL)
+ * @string: the string that is going to be UPPERED (can be take())
+ *
+ * FIXME: move this in ccan
+ */
+char *str_uppering(const void *ctx, const char *string TAKES);
 
 /**
  * Assign two different structs which are the same size.

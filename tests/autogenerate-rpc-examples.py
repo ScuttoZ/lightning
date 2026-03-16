@@ -33,9 +33,7 @@ ALL_RPC_EXAMPLES = {}
 EXAMPLES_JSON = {}
 LOG_FILE = './tests/autogenerate-examples-status.log'
 TEMP_EXAMPLES_FILE = './tests/autogenerate-examples.json'
-IGNORE_RPCS_LIST = ['dev-splice', 'reckless', 'sql-template',
-                    # Deprecated, pending complete removal
-                    'commando-rune', 'commando-listrunes', 'commando-blacklist']
+IGNORE_RPCS_LIST = ['dev-splice', 'reckless', 'sql-template']
 
 # Constants for replacing values in examples
 NEW_VALUES_LIST = {
@@ -284,6 +282,7 @@ NEW_VALUES_LIST = {
     'psbt_26': 'cHNidP8BAgQCAAAAAQMEbwAAAAEEAQpsbt' + ('022200' * 40),
     'signed_psbt_1': 'cHNidP8BAgQCAAAAAQMEbwAAAAEEAQpsbt' + ('718000' * 120),
     'htlc_max_msat': 18446744073709552000,
+    'proof_1': '0473656e64' + ('proof00001' * 10),
 }
 
 # Used for collecting values from responses and replace them with NEW_VALUES_LIST before updating examples in schema files
@@ -366,7 +365,6 @@ def update_examples_in_schema_files():
         updated_examples = {}
         for method, method_examples in EXAMPLES_JSON.items():
             try:
-                global CWD
                 file_path = os.path.join(CWD, 'doc', 'schemas', f'{method}.json') if method != 'sql' else os.path.join(CWD, 'doc', 'schemas', f'{method}-template.json')
                 logger.info(f'Updating examples for {method} in file {file_path}')
                 with open(file_path, 'r+', encoding='utf-8') as file:
@@ -441,7 +439,6 @@ def setup_test_nodes(node_factory, bitcoind):
         l6.info['id']: 0265b6ab5ec860cd257865d61ef0bbf5b3339c36cbda8b26b74e7f1dca490b6518
     """
     try:
-        global FUND_WALLET_AMOUNT_SAT, FUND_CHANNEL_AMOUNT_SAT
         options = [
             {
                 'experimental-dual-fund': None,
@@ -537,7 +534,6 @@ def generate_transactions_examples(l1, l2, l3, l4, l5, c25, bitcoind):
     """Generate examples for various transactions and forwards"""
     try:
         logger.info('Simple Transactions Start...')
-        global FUND_CHANNEL_AMOUNT_SAT
         # Simple Transactions by creating invoices, paying invoices, keysends
         inv_l31 = update_example(node=l3, method='invoice', params={'amount_msat': 10**4, 'label': 'lbl_l31', 'description': 'Invoice description l31'})
         route_l1_l3 = update_example(node=l1, method='getroute', params={'id': l3.info['id'], 'amount_msat': 10**4, 'riskfactor': 1})['route']
@@ -575,7 +571,8 @@ def generate_transactions_examples(l1, l2, l3, l4, l5, c25, bitcoind):
         xpay_res1 = update_example(node=l1, method='xpay', params=[inv_l41['bolt11']])
         offer_l11 = l1.rpc.offer('any')
         inv_l14 = l1.rpc.fetchinvoice(offer_l11['bolt12'], '1000msat')
-        xpay_res2 = update_example(node=l1, method='xpay', params={'invstring': inv_l14['invoice']})
+        xpay_res2 = update_example(node=l1, method='xpay', params={'invstring': inv_l14['invoice'],
+                                                                   'payer_note': "Coffee payment"})
 
         update_example(node=l1, method='injectonionmessage', params={'message': '0002cb7cd2001e3c670d64135542dcefdf4a3f590eb142cee9277b317848471906caeabe4afeae7f4e31f6ca9c119b643d5369c5e55f892f205469a185f750697124a2bb7ccea1245ec12d76340bcf7371ba6d1c9ddfe09b4153fce524417c14a594fdbb5e7c698a5daffe77db946727a38711be2ecdebdd347d2a9f990810f2795b3c39b871d7c72a11534bd388ca2517630263d96d8cc72d146bae800638066175c85a8e8665160ea332ed7d27efc31c960604d61c3f83801c25cbb69ae3962c2ef13b1fa9adc8dcbe3dc8d9a5e27ff5669e076b02cafef8f2c88fc548e03642180d57606386ad6ce27640339747d40f26eb5b9e93881fc8c16d5896122032b64bb5f1e4be6f41f5fa4dbd7851989aeccd80b2d5f6f25427f171964146185a8eaa57891d91e49a4d378743231e19edd5994c3118c9a415958a5d9524a6ecc78c0205f5c0059a7fbcf1abad706a189b712476d112521c9a4650d0ff09890536acae755a2b07d00811044df28b288d3dc2d5ae3f8bf3cf7a2950e2167105dfad0fb8398ef08f36abcdb1bfd6aca3241c33810f0750f35bdfb7c60b1759275b7704ab1bc8f3ea375b3588eab10e4f948f12fe0a3c77b67bebeedbcced1de0f0715f9959e5497cda5f8f6ab76c15b3dcc99956465de1bf2855338930650f8e8e8c391d9bb8950125dd60d8289dade0556d9dc443761983e26adcc223412b756e2fd9ad64022859b6cab20e8ffc3cf39ae6045b2c3338b1145ee3719a098e58c425db764d7f9a5034dbb730c20202f79bc3c53fab78ecd530aa0e8f7698c9ea53cb96dc9c639282c362d31177c5b81979f46f2db6090b8e171db47287523f28c462e35ef489b51426387f2709c342083968153b5f8a51cd5716b38106bb0f21c5ccfc28dd7c74b71c8367ae8ca348f66a7996bbc535076a1f65d9109658ec042257ca7523488fb1807dc8bec42739ccae066739cf58083b4e2c65e52e1747a6ec2aa26338bb6f2c3195a2b160e26dec70a2cfde269fa7c10c45d346a8bcc313bb618324edadc0291d15f4dc00ca3a7ad7131045fdf6978ba52178f4699525efcb8d96561630e2f28eaa97c66c38c66301b6c6f0124b550db620b09f35b9d45d1441cab7d93be5e3c39b9becfab7f8d05dd3a7a6e27a1d3f23f1dd01e967f5206600619f75439181848f7f4148216c11314b4eaf64c28c268ad4b33ea821d57728e9a9e9e1b6c4bcf35d14958295fc5f92bd6846f33c46f5fa20f569b25bc916b94e554f27a37448f873497e13baef8c740a7587828cc4136dd21b8584e6983e376e91663f8f91559637738b400fb49940fc2df299dfd448604b63c2f5d1f1ec023636f3baf2be5730364afd38191726a7c0d9477b1f231da4d707aabc6ad8036488181dbdb16b48500f2333036629004504d3524f87ece6afb04c4ba03ea6fce069e98b1ab7bf51f237d7c0f40756744dd703c6023b6461b90730f701404e8dddfaff40a9a60e670be7729556241fc9cc8727a586e38b71616bff8772c873b37d920d51a6ad31219a24b12f268545e2cfeb9e662236ab639fd4ecf865612678471ff7b320c934a13ca1f2587fc6a90f839c3c81c0ff84b51330820431418918e8501844893b53c1e0de46d51a64cb769974a996c58ff06683ebdc46fd4bb8e857cecebab785a351c64fd486fb648d25936cb09327b70d22c243035d4343fa3d2d148e2df5cd928010e34ae42b0333e698142050d9405b39f3aa69cecf8a388afbc7f199077b911cb829480f0952966956fe57d815f0d2467f7b28af11f8820645b601c0e1ad72a4684ebc60287d23ec3502f4c65ca44f5a4a0d79e3a5718cd23e7538cb35c57673fb9a1173e5526e767768117c7fefc2e3718f44f790b27e61995fecc6aef05107e75355be301ebe1500c147bb655a159f',
                                                                      'path_key': '03ccf3faa19e8d124f27d495e3359f4002a6622b9a02df9a51b609826d354cda52'})
@@ -647,6 +644,7 @@ def generate_transactions_examples(l1, l2, l3, l4, l5, c25, bitcoind):
             'cltv_expiry': blockheight + 18 + 6,
             'partid': 1,
             'groupid': 0})
+        bip353_result = update_example(node=l1, method='fetchbip353', params={'address': 'send.some@satsto.me'}, description=['Example of fetching BIP-353 payment details.'])
         REPLACE_RESPONSE_VALUES.extend([
             {'data_keys': ['destination'], 'original_value': address_l41['bech32'], 'new_value': NEW_VALUES_LIST['destination_6']},
             {'data_keys': ['tx'], 'original_value': close_res1['tx'], 'new_value': NEW_VALUES_LIST['close1_tx']},
@@ -740,6 +738,7 @@ def generate_transactions_examples(l1, l2, l3, l4, l5, c25, bitcoind):
             {'data_keys': ['completed_at'], 'original_value': waitsendpay_res1['completed_at'], 'new_value': NEW_VALUES_LIST['time_at_900']},
             {'data_keys': ['payment_preimage'], 'original_value': xpay_res1['payment_preimage'], 'new_value': NEW_VALUES_LIST['payment_preimage_xp_1']},
             {'data_keys': ['payment_preimage'], 'original_value': xpay_res2['payment_preimage'], 'new_value': NEW_VALUES_LIST['payment_preimage_xp_2']},
+            {'data_keys': ['proof'], 'original_value': bip353_result['proof'], 'new_value': NEW_VALUES_LIST['proof_1']},
         ])
         logger.info('Simple Transactions Done!')
         return c23_2, c23res2, c34_2, inv_l11, inv_l21, inv_l22, inv_l31, inv_l32, inv_l34
@@ -974,6 +973,19 @@ def generate_bookkeeper_examples(l2, l3, c23_2_chan_id):
         raise
 
 
+def generate_coinmvt_examples(l2):
+    """Generates listchannelmoves and listchainmoves rpc examples"""
+    try:
+        logger.info('listcoinmoves Start...')
+        update_example(node=l2, method='listchainmoves', params={})
+        update_example(node=l2, method='listchainmoves', params={'index': 'created', 'start': 10})
+        update_example(node=l2, method='listchannelmoves', params={})
+        update_example(node=l2, method='listchannelmoves', params={'index': 'created', 'start': 10, 'limit': 2})
+    except Exception as e:
+        logger.error(f'Error in generating coinmoves examples: {e}')
+        raise
+
+
 def generate_offers_renepay_examples(l1, l2, inv_l21, inv_l34):
     """Covers all offers and renepay related examples"""
     try:
@@ -982,7 +994,7 @@ def generate_offers_renepay_examples(l1, l2, inv_l21, inv_l34):
         # Offers & Offers Lists
         offer_l21 = update_example(node=l2, method='offer', params={'amount': '10000msat', 'description': 'Fish sale!'})
         offer_l22 = update_example(node=l2, method='offer', params={'amount': '1000sat', 'description': 'Coffee', 'quantity_max': 10})
-        offer_l23 = l2.rpc.offer('2000sat', 'Offer to Disable')
+        offer_l23 = l2.rpc.offer('2000sat', 'Movie ticket')
         fetchinv_res1 = update_example(node=l1, method='fetchinvoice', params={'offer': offer_l21['bolt12'], 'payer_note': 'Thanks for the fish!'})
         fetchinv_res2 = update_example(node=l1, method='fetchinvoice', params={'offer': offer_l22['bolt12'], 'amount_msat': 2000000, 'quantity': 2})
         update_example(node=l2, method='disableoffer', params={'offer_id': offer_l23['offer_id']})
@@ -1041,6 +1053,8 @@ def generate_askrene_examples(l1, l2, l3, c12, c23_2):
         askrene_inform_channel_res1 = update_example(node=l2, method='askrene-inform-channel', params={'layer': 'test_layers', 'short_channel_id_dir': '0x0x1/1', 'amount_msat': 100000, 'inform': 'unconstrained'})
         update_example(node=l2, method='askrene-bias-channel', params={'layer': 'test_layers', 'short_channel_id_dir': scid12dir, 'bias': 1})
         update_example(node=l2, method='askrene-bias-channel', params=['test_layers', scid12dir, -5, 'bigger bias'])
+        update_example(node=l2, method='askrene-bias-node', params={'layer': 'test_layers', 'node': l3.info["id"], "direction": "out", 'bias': 1})
+        update_example(node=l2, method='askrene-bias-node', params=['test_layers', l3.info["id"], "out", -5, 'this node is unreliable'])
         askrene_listlayers_res1 = update_example(node=l2, method='askrene-listlayers', params=['test_layers'])
         update_example(node=l2, method='askrene-listlayers', params={})
         ts1 = only_one(only_one(askrene_listlayers_res1['layers'])['constraints'])['timestamp']
@@ -1157,7 +1171,6 @@ def generate_utils_examples(l1, l2, l3, l4, l5, l6, c23_2, c34_2, inv_l11, inv_l
     """Generates other utilities examples"""
     try:
         logger.info('General Utils Start...')
-        global CWD, FUND_CHANNEL_AMOUNT_SAT
         update_example(node=l2, method='batching', params={'enable': True})
         update_example(node=l2, method='ping', params={'id': l1.info['id'], 'len': 128, 'pongbytes': 128})
         update_example(node=l2, method='ping', params={'id': l3.info['id'], 'len': 1000, 'pongbytes': 65535})
@@ -1195,8 +1208,8 @@ def generate_utils_examples(l1, l2, l3, l4, l5, l6, c23_2, c34_2, inv_l11, inv_l
         example_utxos = ['utxo' + ('02' * 30) + ':1']
         withdraw_l22 = update_example(node=l2, method='withdraw', params={'destination': address_l22['p2tr'], 'satoshi': 'all', 'feerate': '20000perkb', 'minconf': 0, 'utxos': utxos})
         bitcoind.generate_block(4, wait_for_mempool=[withdraw_l22['txid']])
-        multiwithdraw_res1 = update_example(node=l2, method='multiwithdraw', params={'outputs': [{l1.rpc.newaddr()['bech32']: '2222000msat'}, {l1.rpc.newaddr()['bech32']: '3333000msat'}]})
-        multiwithdraw_res2 = update_example(node=l2, method='multiwithdraw', params={'outputs': [{l1.rpc.newaddr('p2tr')['p2tr']: 1000}, {l1.rpc.newaddr()['bech32']: 1000}, {l2.rpc.newaddr()['bech32']: 1000}, {l3.rpc.newaddr()['bech32']: 1000}, {l3.rpc.newaddr()['bech32']: 1000}, {l4.rpc.newaddr('p2tr')['p2tr']: 1000}, {l1.rpc.newaddr()['bech32']: 1000}]})
+        multiwithdraw_res1 = update_example(node=l2, method='multiwithdraw', params={'outputs': [{l1.rpc.newaddr('bech32')['bech32']: '2222000msat'}, {l1.rpc.newaddr('bech32')['bech32']: '3333000msat'}]})
+        multiwithdraw_res2 = update_example(node=l2, method='multiwithdraw', params={'outputs': [{l1.rpc.newaddr('p2tr')['p2tr']: 1000}, {l1.rpc.newaddr('bech32')['bech32']: 1000}, {l2.rpc.newaddr()['bech32']: 1000}, {l3.rpc.newaddr()['bech32']: 1000}, {l3.rpc.newaddr()['bech32']: 1000}, {l4.rpc.newaddr('p2tr')['p2tr']: 1000}, {l1.rpc.newaddr('bech32')['bech32']: 1000}]})
         l2.rpc.connect(l4.info['id'], 'localhost', l4.port)
         l2.rpc.connect(l5.info['id'], 'localhost', l5.port)
         update_example(node=l2, method='disconnect', params={'id': l4.info['id'], 'force': False})
@@ -1213,7 +1226,6 @@ def generate_utils_examples(l1, l2, l3, l4, l5, l6, c23_2, c34_2, inv_l11, inv_l
         update_example(node=l2, method='checkmessage', params={'message': 'this is a test!', 'zbase': 'd6tqaeuonjhi98mmont9m4wag7gg4krg1f4txonug3h31e9h6p6k6nbwjondnj46dkyausobstnk7fhyy998bhgc1yr98dfmhb4k54d7'})
         addr = l2.rpc.newaddr('bech32')['bech32']
         update_example(node=l2, method='signmessagewithkey', params={'message': 'a test message', 'address': addr})
-        decodepay_res1 = update_example(node=l2, method='decodepay', params={'bolt11': inv_l11['bolt11']})
         update_example(node=l2, method='decode', params=[rune_l21['rune']])
         decode_res2 = update_example(node=l2, method='decode', params=[inv_l22['bolt11']])
 
@@ -1271,8 +1283,6 @@ def generate_utils_examples(l1, l2, l3, l4, l5, l6, c23_2, c34_2, inv_l11, inv_l
             {'data_keys': ['created_at'], 'original_value': decode_res2['created_at'], 'new_value': NEW_VALUES_LIST['time_at_800']},
             {'data_keys': ['signature'], 'original_value': decode_res2['signature'], 'new_value': NEW_VALUES_LIST['signature_1']},
             {'data_keys': ['short_channel_id'], 'original_value': decode_res2['routes'][0][0]['short_channel_id'], 'new_value': NEW_VALUES_LIST['c23']},
-            {'data_keys': ['created_at'], 'original_value': decodepay_res1['created_at'], 'new_value': NEW_VALUES_LIST['time_at_800']},
-            {'data_keys': ['signature'], 'original_value': decodepay_res1['signature'], 'new_value': NEW_VALUES_LIST['signature_2']},
             {'data_keys': ['tx'], 'original_value': multiwithdraw_res1['tx'], 'new_value': NEW_VALUES_LIST['tx_55']},
             {'data_keys': ['txid'], 'original_value': multiwithdraw_res1['txid'], 'new_value': NEW_VALUES_LIST['txid_55']},
             {'data_keys': ['tx'], 'original_value': multiwithdraw_res2['tx'], 'new_value': NEW_VALUES_LIST['tx_56']},
@@ -1305,7 +1315,6 @@ def generate_splice_examples(node_factory, bitcoind):
     """Generates splice related examples"""
     try:
         logger.info('Splice Start...')
-        global FUND_WALLET_AMOUNT_SAT, FUND_CHANNEL_AMOUNT_SAT
         # Basic setup for l7->l8
         options = [
             {
@@ -1367,6 +1376,7 @@ def generate_splice_examples(node_factory, bitcoind):
             {'data_keys': ['psbt'], 'original_value': signpsbt_res1['signed_psbt'], 'new_value': NEW_VALUES_LIST['signed_psbt_1']},
             {'data_keys': ['psbt'], 'original_value': spupdate1_res1['psbt'], 'new_value': NEW_VALUES_LIST['psbt_1']},
             {'data_keys': ['any', 'psbt'], 'original_value': spupdate1_res2['psbt'], 'new_value': NEW_VALUES_LIST['psbt_2']},
+            {'data_keys': ['psbt'], 'original_value': spupdate2_res2['psbt'], 'new_value': NEW_VALUES_LIST['psbt_2']},
         ])
         logger.info('Splice Done!')
     except Exception as e:
@@ -1378,7 +1388,6 @@ def generate_channels_examples(node_factory, bitcoind, l1, l3, l4, l5):
     """Generates fundchannel and openchannel related examples"""
     try:
         logger.info('Channels Start...')
-        global FUND_WALLET_AMOUNT_SAT, FUND_CHANNEL_AMOUNT_SAT
         # Basic setup for l9->l10 for fundchannel examples
         options = [
             {
@@ -1686,7 +1695,6 @@ def generate_autoclean_delete_examples(l1, l2, l3, l4, l5, c12, c23):
     """Records autoclean and delete examples"""
     try:
         logger.info('Auto-clean and Delete Start...')
-        global FUND_CHANNEL_AMOUNT_SAT
         l2.rpc.close(l5.info['id'])
         dfc_res1 = update_example(node=l2, method='dev-forget-channel', params={'id': l5.info['id']}, description=[f'Forget a channel by peer pubkey when only one channel exists with the peer:'])
 
@@ -1814,13 +1822,13 @@ def generate_backup_recovery_examples(node_factory, l4, l5, l6):
 
         # Recover
         def get_hsm_secret(n):
-            """Returns codex32 and hex"""
+            """Returns recoverstring and hex"""
             try:
                 hsmfile = os.path.join(n.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
-                codex32 = subprocess.check_output(["tools/hsmtool", "getcodexsecret", hsmfile, "leet"]).decode('utf-8').strip()
+                recover = subprocess.check_output(["tools/lightning-hsmtool", "getsecret", hsmfile, "leet"]).decode('utf-8').strip()
                 with open(hsmfile, "rb") as f:
                     hexhsm = f.read().hex()
-                return codex32, hexhsm
+                return recover, hexhsm
             except Exception as e:
                 logger.error(f'Error in getting hsm secret: {e}')
                 raise
@@ -2036,7 +2044,6 @@ def generate_list_examples(l1, l2, l3, c12, c23_2, inv_l31, inv_l32, offer_l23, 
 
 @pytest.fixture(autouse=True)
 def setup_logging():
-    global logger
     logger.setLevel(logging.DEBUG)
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s", "%H:%M:%S")
     stream_handler = logging.StreamHandler()
@@ -2056,7 +2063,6 @@ def test_generate_examples(node_factory, bitcoind, executor):
         def list_all_examples():
             """list all methods used in 'update_example' calls to ensure that all methods are covered"""
             try:
-                global REGENERATING_RPCS
                 methods = []
                 file_path = os.path.abspath(__file__)
 
@@ -2078,7 +2084,6 @@ def test_generate_examples(node_factory, bitcoind, executor):
         def list_missing_examples():
             """Checks for missing example & log an error if missing."""
             try:
-                global ALL_RPC_EXAMPLES
                 missing_examples = ''
                 for file_name in os.listdir('doc/schemas'):
                     if not file_name.endswith('.json'):
@@ -2104,6 +2109,7 @@ def test_generate_examples(node_factory, bitcoind, executor):
         c23_2, c23res2, c34_2, inv_l11, inv_l21, inv_l22, inv_l31, inv_l32, inv_l34 = generate_transactions_examples(l1, l2, l3, l4, l5, c25, bitcoind)
         rune_l21 = generate_runes_examples(l1, l2, l3)
         generate_datastore_examples(l2)
+        generate_coinmvt_examples(l2)
         generate_bookkeeper_examples(l2, l3, c23res2['channel_id'])
         offer_l23, inv_req_l1_l22 = generate_offers_renepay_examples(l1, l2, inv_l21, inv_l34)
         generate_askrene_examples(l1, l2, l3, c12, c23_2)

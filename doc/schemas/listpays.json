@@ -192,7 +192,7 @@
                   "amount_msat": {
                     "type": "msat",
                     "description": [
-                      "The amount of millisatoshi we intended to send to the destination."
+                      "The amount of millisatoshi we intended to send to the destination. This can only be missing in the case of someone manually calling sendonion without the `amount_msat` parameter (which no plugin currently does)."
                     ]
                   },
                   "amount_sent_msat": {
@@ -263,7 +263,7 @@
     ]
   },
   "author": [
-    "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
+    "Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) is mainly responsible."
   ],
   "see_also": [
     "lightning-pay(7)",
@@ -271,7 +271,7 @@
     "lightning-listsendpays(7)"
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {

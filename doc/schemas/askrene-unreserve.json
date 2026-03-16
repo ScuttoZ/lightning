@@ -36,6 +36,13 @@
               "description": [
                 "The amount to send into this hop."
               ]
+            },
+            "layer": {
+              "added": "v25.12",
+              "type": "string",
+              "description": [
+                "The layer to restrict this reservation to (useful for fake channels)."
+              ]
             }
           }
         }
@@ -53,10 +60,10 @@
     "lightning-askrene-listreservations(7)"
   ],
   "author": [
-    "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
+    "Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) is mainly responsible."
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {

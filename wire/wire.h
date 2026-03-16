@@ -1,12 +1,9 @@
 #ifndef LIGHTNING_WIRE_WIRE_H
 #define LIGHTNING_WIRE_WIRE_H
 #include "config.h"
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
 #include <common/jsonrpc_errors.h>
 #include <common/wireaddr.h>
 #include <secp256k1_recovery.h>
-#include <stdlib.h>
 
 struct ripemd160;
 struct sha256;
@@ -18,6 +15,8 @@ typedef char utf8;
 
 /* Read the type; returns -1 if not long enough.  cursor is a tal ptr. */
 int fromwire_peektype(const u8 *cursor);
+/* Same, but doesn't need to be a tal ptr */
+int fromwire_peektypen(const u8 *cursor, size_t len);
 void *fromwire_fail(const u8 **cursor, size_t *max);
 
 void towire(u8 **pptr, const void *data, size_t len);

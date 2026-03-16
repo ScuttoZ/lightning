@@ -3,22 +3,25 @@
 #include <backtrace.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <connectd/connectd_wiregen.h>
-#include <errno.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <lightningd/chaintopology.h>
+#include <lightningd/channel.h>
 #include <lightningd/closed_channel.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/memdump.h>
-#include <lightningd/opening_common.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
+
+struct leak_detect {
+	struct command *cmd;
+	struct lightningd *ld;
+	size_t num_outstanding_requests;
+	const char **leakers;
+};
 
 static void json_add_ptr(struct json_stream *response, const char *name,
 			 const void *ptr)
@@ -87,6 +90,7 @@ static const struct json_command dev_memdump_command = {
 };
 AUTODATA(json_command, &dev_memdump_command);
 
+
 static void memleak_log(struct logger *log, const char *fmt, ...)
 {
 	va_list ap;
@@ -95,15 +99,47 @@ static void memleak_log(struct logger *log, const char *fmt, ...)
 	va_end(ap);
 }
 
-static void finish_report(const struct leak_detect *leaks)
+static bool lightningd_check_leaks(struct command *cmd)
 {
+	struct lightningd *ld = cmd->ld;
+	struct htable *memtable;
+
+	/* Enter everything, except this cmd and its jcon */
+	memtable = memleak_start(cmd);
+
+	/* This command is not a leak! */
+	memleak_ptr(memtable, cmd);
+	memleak_ignore_children(memtable, cmd);
+
+	/* Now delete ld and those which it has pointers to. */
+	memleak_scan_obj(memtable, ld);
+
+	return dump_memleak(memtable, memleak_log, ld->log);
+}
+
+static void finish_report(struct leak_detect *leaks)
+{
+	bool found_leak;
 	struct json_stream *response;
+	const u8 *msg;
 
 	/* If it timed out, we free ourselved and exit! */
 	if (!leaks->cmd) {
 		tal_free(leaks);
 		return;
 	}
+
+	/* Check for our own leaks. */
+	if (lightningd_check_leaks(leaks->cmd))
+		tal_arr_expand(&leaks->leakers, "lightningd");
+
+	/* Check hsmd for leaks. */
+	msg = hsm_sync_req(tmpctx, leaks->cmd->ld, take(towire_hsmd_dev_memleak(NULL)));
+	if (!fromwire_hsmd_dev_memleak_reply(msg, &found_leak))
+		fatal("Bad HSMD_DEV_MEMLEAK_REPLY: %s", tal_hex(tmpctx, msg));
+
+	if (found_leak)
+		report_subd_memleak(leaks, leaks->cmd->ld->hsm);
 
 	response = json_stream_success(leaks->cmd);
 	json_array_start(response, "leaks");
@@ -133,8 +169,13 @@ static void leak_detect_req_done(const struct subd_req *req,
 				 struct leak_detect *leak_detect)
 {
 	leak_detect->num_outstanding_requests--;
-	if (leak_detect->num_outstanding_requests == 0)
-		finish_report(leak_detect);
+	if (leak_detect->num_outstanding_requests == 0) {
+		/* We do this off a timer: doing it off a subd reply makes us think that the
+		 * subd->conn (temporarily set to NULL during the cb) is a leak! */
+		new_reltimer(leak_detect->ld->timers, leak_detect,
+			     time_from_sec(0),
+			     finish_report, leak_detect);
+	}
 }
 
 /* Start a leak request: decrements num_outstanding_requests when freed. */
@@ -181,44 +222,12 @@ static void connect_dev_memleak_done(struct subd *connectd,
 		report_subd_memleak(leaks, connectd);
 }
 
-static bool lightningd_check_leaks(struct command *cmd)
-{
-	struct lightningd *ld = cmd->ld;
-	struct htable *memtable;
-
-	/* Enter everything, except this cmd and its jcon */
-	memtable = memleak_start(cmd);
-
-	/* This command is not a leak! */
-	memleak_ptr(memtable, cmd);
-	memleak_ignore_children(memtable, cmd);
-
-	/* First delete known false positives. */
-	memleak_scan_htable(memtable, &ld->topology->txwatches->raw);
-	memleak_scan_htable(memtable, &ld->topology->txowatches->raw);
-	memleak_scan_htable(memtable, &ld->topology->outgoing_txs->raw);
-	memleak_scan_htable(memtable, &ld->htlcs_in->raw);
-	memleak_scan_htable(memtable, &ld->htlcs_out->raw);
-	memleak_scan_htable(memtable, &ld->htlc_sets->raw);
-	memleak_scan_htable(memtable, &ld->peers->raw);
-	memleak_scan_htable(memtable, &ld->peers_by_dbid->raw);
-	memleak_scan_htable(memtable, &ld->closed_channels->raw);
-	wallet_memleak_scan(memtable, ld->wallet);
-
-	/* Now delete ld and those which it has pointers to. */
-	memleak_scan_obj(memtable, ld);
-
-	return dump_memleak(memtable, memleak_log, ld->log);
-}
-
 static struct command_result *json_memleak(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *obj UNNEEDED,
 					   const jsmntok_t *params)
 {
 	struct lightningd *ld = cmd->ld;
-	const u8 *msg;
-	bool found_leak;
 	struct leak_detect *leaks;
 
 	if (!param_check(cmd, buffer, params, NULL))
@@ -233,23 +242,14 @@ static struct command_result *json_memleak(struct command *cmd,
 		return command_check_done(cmd);
 
 	leaks = tal(cmd, struct leak_detect);
+	leaks->ld = cmd->ld;
 	leaks->cmd = cmd;
 	leaks->num_outstanding_requests = 0;
 	leaks->leakers = tal_arr(leaks, const char *, 0);
 
-	/* Check for our own leaks. */
-	if (lightningd_check_leaks(cmd))
-		tal_arr_expand(&leaks->leakers, "lightningd");
-
-	/* hsmd is sync, so do that first. */
-	msg = hsm_sync_req(tmpctx, cmd->ld, take(towire_hsmd_dev_memleak(NULL)));
-	if (!fromwire_hsmd_dev_memleak_reply(msg, &found_leak))
-		fatal("Bad HSMD_DEV_MEMLEAK_REPLY: %s", tal_hex(tmpctx, msg));
-
-	if (found_leak)
-		report_subd_memleak(leaks, ld->hsm);
-
-	/* Now do all the async ones. */
+	/* Now do all the async ones.  By doing connectd first, it
+	 * has the side-effect of suppressing the complaint it makes
+	 * about us being unresponsive. */
 	start_leak_request(subd_req(ld->connectd, ld->connectd,
 				    take(towire_connectd_dev_memleak(NULL)),
 				    -1, 0, connect_dev_memleak_done, leaks),

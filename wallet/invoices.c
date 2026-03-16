@@ -1,5 +1,6 @@
 #include "config.h"
 #include <ccan/tal/str/str.h>
+#include <common/clock_time.h>
 #include <common/timeout.h>
 #include <db/bindings.h>
 #include <db/common.h>
@@ -7,7 +8,6 @@
 #include <db/utils.h>
 #include <lightningd/invoice.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/wait.h>
 #include <wallet/invoices.h>
 
 struct invoice_waiter {
@@ -179,7 +179,7 @@ static u64 *expired_ids(const tal_t *ctx,
 static void trigger_expiration(struct invoices *invoices)
 {
 	u64 *inv_dbids;
-	u64 now = time_now().ts.tv_sec;
+	u64 now = clock_time().ts.tv_sec;
 	struct db_stmt *stmt;
 
 	/* Free current expiration timer */
@@ -214,7 +214,7 @@ static void install_expiration_timer(struct invoices *invoices)
 	struct db_stmt *stmt;
 	struct timerel rel;
 	struct timeabs expiry;
-	struct timeabs now = time_now();
+	struct timeabs now = clock_time();
 
 	assert(!invoices->expiration_timer);
 
@@ -275,7 +275,7 @@ bool invoices_create(struct invoices *invoices,
 {
 	struct db_stmt *stmt;
 	u64 expiry_time;
-	u64 now = time_now().ts.tv_sec;
+	u64 now = clock_time().ts.tv_sec;
 
 	if (invoices_find_by_label(invoices, inv_dbid, label)) {
 		if (taken(msat))
@@ -308,7 +308,7 @@ bool invoices_create(struct invoices *invoices,
 	db_bind_preimage(stmt, r);
 	db_bind_int(stmt, UNPAID);
 	if (msat)
-		db_bind_amount_msat(stmt, msat);
+		db_bind_amount_msat(stmt, *msat);
 	else
 		db_bind_null(stmt);
 	db_bind_json_escape(stmt, label);
@@ -609,7 +609,7 @@ bool invoices_resolve(struct invoices *invoices,
 
 	/* Assign a pay-index. */
 	pay_index = get_next_pay_index(invoices->wallet->db);
-	paid_timestamp = time_now().ts.tv_sec;
+	paid_timestamp = clock_time().ts.tv_sec;
 
 	/* Update database. */
 	stmt = db_prepare_v2(invoices->wallet->db, SQL("UPDATE invoices"
@@ -623,7 +623,7 @@ bool invoices_resolve(struct invoices *invoices,
 					       " WHERE id=?;"));
 	db_bind_int(stmt, PAID);
 	db_bind_u64(stmt, pay_index);
-	db_bind_amount_msat(stmt, &received);
+	db_bind_amount_msat(stmt, received);
 	db_bind_u64(stmt, paid_timestamp);
 	if (outpoint) {
 		db_bind_txid(stmt, &outpoint->txid);
@@ -777,13 +777,14 @@ static u64 invoice_index_inc(struct lightningd *ld,
 		invstrname = "bolt11";
 
 
-	return wait_index_increment(ld, WAIT_SUBSYSTEM_INVOICE, idx,
-				 "status", state ? invoice_status_str(*state) : NULL,
-				 /* We don't want to add more JSON escapes here! */
-				 "=label", label ? tal_fmt(tmpctx, "\"%s\"", label->s) : NULL,
-				 invstrname, invstring,
-				 "description", description,
-				 NULL);
+	return wait_index_increment(ld, ld->wallet->db,
+				    WAIT_SUBSYSTEM_INVOICE, idx,
+				    "status", state ? invoice_status_str(*state) : NULL,
+				    /* We don't want to add more JSON escapes here! */
+				    "=label", label ? tal_fmt(tmpctx, "\"%s\"", label->s) : NULL,
+				    invstrname, invstring,
+				    "description", description,
+				    NULL);
 }
 
 void invoice_index_deleted(struct lightningd *ld,

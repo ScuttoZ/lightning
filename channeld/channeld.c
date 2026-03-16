@@ -19,14 +19,10 @@
 #include <channeld/channeld.h>
 #include <channeld/channeld_wiregen.h>
 #include <channeld/full_channel.h>
-#include <channeld/inflight.h>
 #include <channeld/splice.h>
 #include <channeld/watchtower.h>
 #include <common/billboard.h>
 #include <common/ecdh_hsmd.h>
-#include <common/gossip_store.h>
-#include <common/hsm_capable.h>
-#include <common/hsm_version.h>
 #include <common/interactivetx.h>
 #include <common/key_derive.h>
 #include <common/memleak.h>
@@ -42,16 +38,13 @@
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <hsmd/hsmd_wiregen.h>
-#include <stdio.h>
-#include <wally_bip32.h>
-#include <wire/peer_wire.h>
+#include <inttypes.h>
 #include <wire/wire_sync.h>
-
-#define EXPERIMENTAL_UPGRADE_ENABLED 0
 
 /* stdin == requests, 3 == peer, 4 = HSM */
 #define MASTER_FD STDIN_FILENO
@@ -191,9 +184,6 @@ struct peer {
 
 	/* We allow a 'tx-sigs' message between reconnect + channel_ready */
 	bool tx_sigs_allowed;
-
-	/* --experimental-upgrade-protocol */
-	bool experimental_upgrade;
 };
 
 static void start_commit_timer(struct peer *peer);
@@ -360,38 +350,6 @@ static bool handle_master_request_later(struct peer *peer, const u8 *msg)
 	return false;
 }
 
-#if EXPERIMENTAL_UPGRADE_ENABLED
-/* Compare, with false if either is NULL */
-static bool match_type(const u8 *t1, const u8 *t2)
-{
-	/* Missing fields are possible. */
-	if (!t1 || !t2)
-		return false;
-
-	return featurebits_eq(t1, t2);
-}
-
-static void set_channel_type(struct channel *channel, const u8 *type)
-{
-	const struct channel_type *cur = channel->type;
-
-	if (featurebits_eq(cur->features, type))
-		return;
-
-	/* We only allow one upgrade at the moment, so that's it. */
-	assert(!channel_has(channel, OPT_STATIC_REMOTEKEY));
-	assert(feature_offered(type, OPT_STATIC_REMOTEKEY));
-
-	/* Do upgrade, tell master. */
-	tal_free(channel->type);
-	channel->type = channel_type_from(channel, type);
-	status_unusual("Upgraded channel to [%s]",
-		       fmt_featurebits(tmpctx, type));
-	wire_sync_write(MASTER_FD,
-			take(towire_channeld_upgraded(NULL, channel->type)));
-}
-#endif
-
 static void lock_signer_outpoint(const struct bitcoin_outpoint *outpoint)
 {
 	const u8 *msg;
@@ -467,8 +425,6 @@ static void check_mutual_splice_locked(struct peer *peer)
 				fmt_bitcoin_txid(tmpctx,
 						 &peer->splice_state->locked_txid));
 
-	peer->splice_state->await_commitment_succcess = true;
-
 	/* This splice_locked event is used, so reset the flags to false */
 	peer->splice_state->locked_ready[LOCAL] = false;
 	peer->splice_state->locked_ready[REMOTE] = false;
@@ -531,6 +487,32 @@ static void check_mutual_splice_locked(struct peer *peer)
 	peer->splice_state->remote_locked_txid = tal_free(peer->splice_state->remote_locked_txid);
 }
 
+static void implied_peer_splice_locked(struct peer *peer,
+				       struct bitcoin_txid splice_txid)
+{
+	/* If we've `mutual_splice_locked` but our peer hasn't, we can ignore
+	 * this message harmlessly */
+	if (!tal_count(peer->splice_state->inflights)) {
+		status_info("Peer implied redundant splice_locked, ignoring");
+		return;
+	}
+
+	/* If we've `mutual_splice_locked` but our peer hasn't, we can ignore
+	 * this message harmlessly */
+	if (!tal_count(peer->splice_state->inflights)) {
+		status_info("Peer implied redundant splice_locked, ignoring");
+		return;
+	}
+
+	peer->splice_state->remote_locked_txid = tal(peer->splice_state,
+						     struct bitcoin_txid);
+
+	*peer->splice_state->remote_locked_txid = splice_txid;
+
+	peer->splice_state->locked_ready[REMOTE] = true;
+	check_mutual_splice_locked(peer);
+}
+
 /* Our peer told us they saw our splice confirm on chain with `splice_locked`.
  * If we see it to we jump into transitioning to post-splice, otherwise we mark
  * a flag and wait until we see it on chain too. */
@@ -548,11 +530,6 @@ static void handle_peer_splice_locked(struct peer *peer, const u8 *msg)
 				"Peer sent duplicate splice_locked message %s",
 				tal_hex(tmpctx, msg));
 
-	peer->splice_state->remote_locked_txid = tal(peer->splice_state,
-						     struct bitcoin_txid);
-
-	*peer->splice_state->remote_locked_txid = splice_txid;
-
 	if (!channel_id_eq(&chanid, &peer->channel_id))
 		peer_failed_err(peer->pps, &chanid,
 				"Wrong splice lock channel id in %s "
@@ -567,8 +544,7 @@ static void handle_peer_splice_locked(struct peer *peer, const u8 *msg)
 		return;
 	}
 
-	peer->splice_state->locked_ready[REMOTE] = true;
-	check_mutual_splice_locked(peer);
+	implied_peer_splice_locked(peer, splice_txid);
 }
 
 static void handle_peer_channel_ready(struct peer *peer, const u8 *msg)
@@ -658,9 +634,14 @@ static void handle_peer_add_htlc(struct peer *peer, const u8 *msg)
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad peer_add_htlc %s", tal_hex(msg, msg));
 	}
+
 	add_err = channel_add_htlc(peer->channel, REMOTE, id, amount,
 				   cltv_expiry, &payment_hash,
-				   onion_routing_packet, tlvs->blinded_path, &htlc, NULL,
+				   onion_routing_packet,
+				   take(tlvs->blinded_path), &htlc, NULL,
+				   /* NOTE: It might be better to remove the
+				    * blinded_path from the extra_tlvs */
+				   tlvs->fields,
 				   /* We don't immediately fail incoming htlcs,
 				    * instead we wait and fail them after
 				    * they've been committed */
@@ -1197,12 +1178,7 @@ static u8 *send_commit_part(const tal_t *ctx,
 			     (int)splice_amnt, (int)remote_splice_amnt,
 			     remote_index);
 
-		if (batch_size > 1) {
-			cs_tlv->splice_info = tal(cs_tlv, struct tlv_commitment_signed_tlvs_splice_info);
-
-			cs_tlv->splice_info->batch_size = batch_size;
-			cs_tlv->splice_info->funding_txid = funding->txid;
-		}
+		cs_tlv->splice_info = tal_dup(cs_tlv, struct bitcoin_txid, &funding->txid);
 	}
 
 	txs = channel_txs(tmpctx, funding, funding_sats, &htlc_map,
@@ -1272,6 +1248,78 @@ static u8 *send_commit_part(const tal_t *ctx,
 static s64 sats_diff(struct amount_sat a, struct amount_sat b)
 {
         return (s64)a.satoshis - (s64)b.satoshis; /* Raw: splicing numbers can wrap! */
+}
+
+static void send_message_batch(struct peer *peer, u8 **msgs)
+{
+	size_t size;
+	size_t hdr_size = tal_bytelen(towire_protocol_batch_element(tmpctx,
+								    &peer->channel_id,
+								    0));
+	u8 *batch_msg, *final_msg, *final_msg_ptr;
+	struct tlv_start_batch_tlvs *tlvs;
+
+	assert(tal_count(msgs) > 0);
+
+	/* When sending one message, no batching is required */
+	if (tal_count(msgs) == 1) {
+		peer_write(peer->pps, msgs[0]);
+		return;
+	}
+
+	/* We prefix each message with an interal wire type,
+	 * protocol_batch_element. connectd will eat each message so they don't
+	 * actually go out to the peer. It's just so connectd can chop up the
+	 * message batch back out into individual messages. */
+
+	/* We start by calculating the total size */
+	size = 0;
+
+	/* Build the `start_batch` msg now so know it's size */
+	tlvs = tlv_start_batch_tlvs_new(tmpctx);
+	tlvs->batch_info = tal(tlvs, u16);
+	*tlvs->batch_info = WIRE_COMMITMENT_SIGNED;
+	batch_msg = towire_start_batch(tmpctx, &peer->channel_id,
+				       tal_count(msgs), tlvs);
+	size += tal_bytelen(batch_msg) + hdr_size;
+
+	/* Count the size of all the messages in the batch */
+	for(u32 i = 0; i < tal_count(msgs); i++)
+		size += tal_bytelen(msgs[i]) + hdr_size;
+
+	/* Now we know the size of our `final_msg` so we allocate */
+	final_msg = tal_arr(tmpctx, u8, size);
+	final_msg_ptr = final_msg;
+
+	status_debug("proto_batch Building batch with %zu bytes, msgs: %zu",
+		     size, tal_count(msgs));
+
+	/* Copy the bytes for `start_batch` prefix */
+	memcpy(final_msg_ptr,
+	       towire_protocol_batch_element(tmpctx,
+	       				     &peer->channel_id,
+	       				     tal_bytelen(batch_msg)),
+	       				     hdr_size);
+	final_msg_ptr += hdr_size;
+
+	memcpy(final_msg_ptr, batch_msg, tal_bytelen(batch_msg));
+	final_msg_ptr += tal_bytelen(batch_msg);
+
+	/* Now copy the bytes from all messages in `msgs` */
+	for(u32 i = 0; i < tal_count(msgs); i++) {
+		memcpy(final_msg_ptr,
+		       towire_protocol_batch_element(tmpctx,
+	       					     &peer->channel_id,
+		       				     tal_bytelen(msgs[i])),
+		       				     hdr_size);
+		final_msg_ptr += hdr_size;
+
+		memcpy(final_msg_ptr, msgs[i], tal_bytelen(msgs[i]));
+		final_msg_ptr += tal_bytelen(msgs[i]);
+	}
+
+	assert(final_msg + size == final_msg_ptr);
+	peer_write(peer->pps, take(final_msg));
 }
 
 static void send_commit(struct peer *peer)
@@ -1440,8 +1488,7 @@ static void send_commit(struct peer *peer)
 
 	peer->next_index[REMOTE]++;
 
-	for(u32 i = 0; i < tal_count(msgs); i++)
-		peer_write(peer->pps, take(msgs[i]));
+	send_message_batch(peer, msgs);
 
 	maybe_send_shutdown(peer);
 
@@ -1536,27 +1583,30 @@ static void marshall_htlc_info(const tal_t *ctx,
 			       struct changed_htlc **changed,
 			       struct fulfilled_htlc **fulfilled,
 			       const struct failed_htlc ***failed,
-			       struct added_htlc **added)
+			       const struct added_htlc ***added)
 {
 	*changed = tal_arr(ctx, struct changed_htlc, 0);
-	*added = tal_arr(ctx, struct added_htlc, 0);
+	*added = tal_arr(ctx, const struct added_htlc *, 0);
 	*failed = tal_arr(ctx, const struct failed_htlc *, 0);
 	*fulfilled = tal_arr(ctx, struct fulfilled_htlc, 0);
 
 	for (size_t i = 0; i < tal_count(changed_htlcs); i++) {
 		const struct htlc *htlc = changed_htlcs[i];
 		if (htlc->state == RCVD_ADD_COMMIT) {
-			struct added_htlc a;
+			struct added_htlc *a = tal(*added, struct added_htlc);
 
-			a.id = htlc->id;
-			a.amount = htlc->amount;
-			a.payment_hash = htlc->rhash;
-			a.cltv_expiry = abs_locktime_to_blocks(&htlc->expiry);
-			memcpy(a.onion_routing_packet,
+			a->id = htlc->id;
+			a->amount = htlc->amount;
+			a->payment_hash = htlc->rhash;
+			a->cltv_expiry = abs_locktime_to_blocks(&htlc->expiry);
+			memcpy(a->onion_routing_packet,
 			       htlc->routing,
-			       sizeof(a.onion_routing_packet));
-			a.path_key = htlc->path_key;
-			a.fail_immediate = htlc->fail_immediate;
+			       sizeof(a->onion_routing_packet));
+			/* Note: we assume htlc's lifetime is greater than ours,
+			 * so we just share pointers and don't bother copying */
+			a->path_key = htlc->path_key;
+			a->extra_tlvs = htlc->extra_tlvs;
+			a->fail_immediate = htlc->fail_immediate;
 			tal_arr_expand(added, a);
 		} else if (htlc->state == RCVD_REMOVE_COMMIT) {
 			if (htlc->r) {
@@ -1593,7 +1643,7 @@ static void send_revocation(struct peer *peer,
 	struct changed_htlc *changed;
 	struct fulfilled_htlc *fulfilled;
 	const struct failed_htlc **failed;
-	struct added_htlc *added;
+	const struct added_htlc **added;
 	const u8 *msg;
 	const u8 *msg_for_master;
 
@@ -1633,8 +1683,6 @@ static void send_revocation(struct peer *peer,
 					       splice_commitsigs);
 	master_wait_sync_reply(tmpctx, peer, take(msg_for_master),
 			       WIRE_CHANNELD_GOT_COMMITSIG_REPLY);
-
-	peer->splice_state->await_commitment_succcess = false;
 
 	/* Now that the master has persisted the new commitment advance the HSMD
 	 * and fetch the revocation secret for the old one. */
@@ -1851,7 +1899,7 @@ static void splice_abort(struct peer *peer, const char *fmt, ...)
 	reason = tal_vfmt(NULL, fmt, ap);
 	va_end(ap);
 
-	if (have_i_signed_inflight(peer, inflight))
+	if (inflight && inflight->i_sent_sigs)
 		peer_failed_err(peer->pps, &peer->channel_id,
 			      "I needed to abort a splice where I have already"
 			      " sent my signatures");
@@ -1954,30 +2002,44 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad commit_sig %s", tal_hex(msg, msg));
 
-	/* BOLT-0d8b701614b09c6ee4172b04da2203e73deec7e2 #2:
-	 * Once a node has received and sent `splice_locked`:
-	 *   - Until sending OR receiving of `revoke_and_ack`
-	 * ...
-	 *     - MUST ignore `commitment_signed` messages where `splice_channel_id`
-	 *       does not match the `channel_id` of the confirmed splice. */
-	if (peer->splice_state->await_commitment_succcess
-	    && !tal_count(peer->splice_state->inflights) && cs_tlv && cs_tlv->splice_info) {
-	    	if (!bitcoin_txid_eq(&peer->channel->funding.txid,
-	    			     &cs_tlv->splice_info->funding_txid)) {
-			status_info("Ignoring stale commit_sig for channel_id"
-				    " %s, as %s is locked in now.",
-				    fmt_bitcoin_txid(tmpctx,
-				    		     &cs_tlv->splice_info->funding_txid),
-				    fmt_bitcoin_txid(tmpctx,
-				    		     &peer->channel->funding.txid));
-			return NULL;
-		}
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	 *  - If the sending node sent `start_batch` and we are processing a batch of
+	 *    `commitment_signed` messages:
+	 */
+	if (msg_batch && tal_count(msg_batch) > 1) {
+
+		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+		 *    - If `funding_txid` is missing in one of the `commitment_signed` messages:
+		 *      - MUST send an `error` and fail the channel.
+		 */
+		if (!cs_tlv->splice_info)
+			peer_failed_err(peer->pps, &peer->channel_id,
+					"Must send funding_txid when sending"
+					" a commitment batch.");
+
+		/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+		 *    - Otherwise (no pending splice transactions):
+		 *...
+		 *      - If `commitment_signed` is missing for the current funding transaction:
+		 *        - MUST send an `error` and fail the channel.
+		 */
+		if (!tal_count(peer->splice_state->inflights)
+			&& !bitcoin_txid_eq(cs_tlv->splice_info,
+					    &peer->channel->funding.txid))
+			peer_failed_err(peer->pps, &peer->channel_id,
+					"Commitment batch is is missing our"
+					" current funding transaction %s",
+					fmt_bitcoin_txid(tmpctx, &peer->channel->funding.txid));
 	}
 
-	/* In a race we can get here with a commitsig with too many splices
-	 * attached. In that case we ignore the main commit msg for the old
-	 * funding tx, and for the splice candidates that didnt win. But we must
-	 * listen to the one that is for the winning splice candidate */
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	 *    - If `funding_txid` is missing in one of the `commitment_signed` messages:
+	 *      - MUST send an `error` and fail the channel.
+	 */
+	if (commit_index && !cs_tlv->splice_info)
+		peer_failed_err(peer->pps, &peer->channel_id,
+				"Must send funding_txid when sending"
+				" a commitment batch");
 
 	if (!changed_htlcs) {
 		changed_htlcs = tal_arr(msg, const struct htlc *, 0);
@@ -2017,22 +2079,17 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 		outpoint = peer->splice_state->inflights[commit_index - 1]->outpoint;
 		funding_sats = peer->splice_state->inflights[commit_index - 1]->amnt;
 
-		if (cs_tlv && cs_tlv->splice_info
-		    && cs_tlv->splice_info->batch_size == 1)
-			peer_failed_err(peer->pps, &peer->channel_id,
-					"batch_size can never be 1");
-
 		status_debug("handle_peer_commit_sig for inflight outpoint %s",
 			     fmt_bitcoin_txid(tmpctx, &outpoint.txid));
 
 		if (cs_tlv->splice_info
 		    && !bitcoin_txid_eq(&outpoint.txid,
-					&cs_tlv->splice_info->funding_txid))
+					cs_tlv->splice_info))
 			peer_failed_err(peer->pps, &peer->channel_id,
 					"Expected commit sig message for %s but"
 					" got %s",
 					fmt_bitcoin_txid(tmpctx, &outpoint.txid),
-					fmt_bitcoin_txid(tmpctx, &cs_tlv->splice_info->funding_txid));
+					fmt_bitcoin_txid(tmpctx, cs_tlv->splice_info));
 	}
 	else {
 		outpoint = peer->channel->funding;
@@ -2077,7 +2134,6 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				 "Bad commit_sig signature %"PRIu64" %s for tx"
 				 " %s wscript %s key %s feerate %u. Outpoint"
 				 " %s, funding_sats: %s, splice_info: %s,"
-				 " race_await_commit: %s,"
 				 " inflight splice count: %zu",
 				 local_index,
 				 fmt_bitcoin_signature(msg, &commit_sig),
@@ -2089,10 +2145,8 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				 fmt_amount_sat(tmpctx, funding_sats),
 				 cs_tlv && cs_tlv->splice_info
 				 	? fmt_bitcoin_txid(tmpctx,
-							   &cs_tlv->splice_info->funding_txid)
+							   cs_tlv->splice_info)
 				 	: "N/A",
-				 peer->splice_state->await_commitment_succcess ? "yes"
-				 					: "no",
 				 tal_count(peer->splice_state->inflights));
 	}
 
@@ -2193,9 +2247,14 @@ static struct commitsig_info *handle_peer_commit_sig(struct peer *peer,
 				tal_count(peer->splice_state->inflights));
 
 	commitsigs = tal_arr(NULL, const struct commitsig*, 0);
-	/* We expect multiple consequtive commit_sig messages if we have
-	 * inflight splices. Since consequtive is requred, we recurse for
-	 * each expected message, blocking until all are received. */
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	 *    - If there are pending splice transactions:
+	 *      - MUST validate each `commitment_signed` based on `funding_txid`.
+	 *      - If `commitment_signed` is missing for a funding transaction:
+	 *        - MUST send an `error` and fail the channel.
+	 *      - Otherwise:
+	 *        - MUST respond with a `revoke_and_ack` message.
+	 */
 	for (i = 0; i < tal_count(peer->splice_state->inflights); i++) {
 		s64 funding_diff = sats_diff(peer->splice_state->inflights[i]->amnt,
 					     peer->channel->funding_sats);
@@ -2253,7 +2312,7 @@ static int commit_index_from_msg(const u8 *msg, struct peer *peer)
 	if (!cs_tlv || !cs_tlv->splice_info)
 		return -1;
 
-	funding_txid = cs_tlv->splice_info->funding_txid;
+	funding_txid = *cs_tlv->splice_info;
 
 	if (bitcoin_txid_eq(&funding_txid, &peer->channel->funding.txid))
 		return 0;
@@ -2271,66 +2330,62 @@ static int commit_cmp(const void *a, const void *n, void *peer)
 	int commit_index_a = commit_index_from_msg(*(u8**)a, peer);
 	int commit_index_n = commit_index_from_msg(*(u8**)n, peer);
 
-	status_debug("commit_cmp a: %p, n: %p result: %d & %d",
-		    *(u8**)a, *(u8**)n, commit_index_a, commit_index_n);
-
-	if (commit_index_a == commit_index_n) {
-		status_debug("commit_cmp: return 0");
+	if (commit_index_a == commit_index_n)
 		return 0;
-	}
-
 	/* Unrecognized commits go on the end */
-	if (commit_index_a == -1) {
-		status_debug("commit_cmp: return 1");
+	if (commit_index_a == -1)
 		return 1;
-	}
 
-	if (commit_index_n == -1) {
-		status_debug("commit_cmp: return -1");
+	if (commit_index_n == -1)
 		return -1;
-	}
 
-	status_debug("commit_cmp: return %d - %d = %d",
-		    commit_index_a, commit_index_n,
-		    commit_index_a - commit_index_n);
 	/* Otherwise we sort by commit_index */
 	return commit_index_a - commit_index_n;
 }
 
 static struct commitsig_info *handle_peer_commit_sig_batch(struct peer *peer,
 							   const u8 *msg,
-							   u32 commit_index,
 							   struct pubkey remote_funding,
 							   const struct htlc **changed_htlcs,
 							   s64 splice_amnt,
 							   s64 remote_splice_amnt,
 							   u64 local_index,
 							   const struct pubkey *local_per_commit,
-							   bool allow_empty_commit)
+							   bool allow_empty_commit,
+							   u16 batch_size)
 {
 	struct channel_id channel_id;
 	struct bitcoin_signature commit_sig;
 	secp256k1_ecdsa_signature *raw_sigs;
-	u16 batch_size;
 	const u8 **msg_batch;
 	enum peer_wire type;
 	struct tlv_commitment_signed_tlvs *cs_tlv
 		= tlv_commitment_signed_tlvs_new(tmpctx);
 	status_debug("fromwire_commitment_signed(%p) primary", msg);
+	check_tx_abort(peer, msg, NULL);
+	type = fromwire_peektype(msg);
+	if (type != WIRE_COMMITMENT_SIGNED)
+		peer_failed_err(peer->pps, &peer->channel_id,
+				"Expected WIRE_COMMITMENT_SIGNED but got %s.",
+				peer_wire_name(type));
 	if (!fromwire_commitment_signed(tmpctx, msg,
 					&channel_id, &commit_sig.s, &raw_sigs,
 					&cs_tlv))
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Bad commit_sig %s", tal_hex(msg, msg));
 
-	/* Default batch_size is 1 */
-	batch_size = 1;
-	if (cs_tlv->splice_info && cs_tlv->splice_info->batch_size)
-		batch_size = cs_tlv->splice_info->batch_size;
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	 *  - If there are pending splice transactions and the sending node did not
+	 *    send `start_batch` followed by a batch of `commitment_signed` messages:
+	 *    - MUST send an `error` and fail the channel.
+	 */
+	if (batch_size < 2 && last_inflight(peer))
+		peer_failed_err(peer->pps, &peer->channel_id, "Must send a"
+				" commitment batch (ie. start_batch) when I"
+				" have pending splices inflight.");
 
 	msg_batch = tal_arr(tmpctx, const u8*, batch_size);
 	msg_batch[0] = msg;
-	status_debug("msg_batch[0]: %p", msg_batch[0]);
 
 	/* Already received commitment signed once, so start at i = 1 */
 	for (u16 i = 1; i < batch_size; i++) {
@@ -2346,7 +2401,6 @@ static struct commitsig_info *handle_peer_commit_sig_batch(struct peer *peer,
 					"Expected splice related "
 					"WIRE_COMMITMENT_SIGNED but got %s",
 					peer_wire_name(type));
-		status_debug("fromwire_commitment_signed(%p) splice index %d", sub_msg, (int)i);
 		if (!fromwire_commitment_signed(tmpctx, sub_msg,
 						&channel_id, &commit_sig.s,
 						&raw_sigs, &sub_cs_tlv))
@@ -2363,27 +2417,53 @@ static struct commitsig_info *handle_peer_commit_sig_batch(struct peer *peer,
 					 " splice_info",
 					 tal_hex(sub_msg, sub_msg), i, batch_size);
 
-		if (!sub_cs_tlv->splice_info
-			|| sub_cs_tlv->splice_info->batch_size != batch_size)
-			peer_failed_err(peer->pps, &peer->channel_id,
-					"batch_size value mismatch in"
-					" commit_sig bundle, item [%"PRIu16
-					"/%"PRIu16"] %s", i, batch_size,
-					tal_hex(sub_msg, sub_msg));
-
 		msg_batch[i] = sub_msg;
-		status_debug("msg_batch[%d]: %p", (int)i, msg_batch[i]);
 	}
 
-	status_debug("Sorting the msg_batch of tal_count %d, batch_size: %d", (int)tal_count(msg_batch), (int)batch_size);
+	/* BOLT-f9fd539db6cc6f3e532fdc8cc1ebe8eb1a8fd717
+	 *    - Otherwise (no pending splice transactions):
+	 *      - MUST ignore `commitment_signed` where `funding_txid` does not match
+	 *        the current funding transaction.
+	 */
+	/* Sort puts all unrecognized `commitment_signed` messages onto the back
+	 * of `msg_batch`, where they will be ignored */
 	asort(msg_batch, tal_count(msg_batch), commit_cmp, peer);
 
-	return handle_peer_commit_sig(peer, msg_batch[0], commit_index,
+	return handle_peer_commit_sig(peer, msg_batch[0], 0,
 				      remote_funding, changed_htlcs,
 				      splice_amnt, remote_splice_amnt,
 				      local_index, local_per_commit,
 				      allow_empty_commit, msg_batch);
 }
+
+static void handle_peer_start_batch(struct peer *peer, const u8 *msg)
+{
+	u16 batch_size;
+	struct channel_id channel_id;
+	struct tlv_start_batch_tlvs *tlvs;
+	if (!fromwire_start_batch(tmpctx, msg, &channel_id, &batch_size, &tlvs))
+		peer_failed_warn(peer->pps, &peer->channel_id,
+				 "Bad start_batch %s", tal_hex(msg, msg));
+
+	if (!tlvs || !tlvs->batch_info
+            || *tlvs->batch_info != WIRE_COMMITMENT_SIGNED) {
+		status_unusual("Ignoring Unrecognized start_batch message type"
+			       " %s, expected WIRE_COMMITMENT_SIGNED.",
+			       tlvs && tlvs->batch_info
+			           ? peer_wire_name(*tlvs->batch_info)
+			           : "N/A");
+		return;
+	}
+
+	handle_peer_commit_sig_batch(peer, peer_read(tmpctx, peer->pps),
+				     peer->channel->funding_pubkey[REMOTE],
+				     NULL, 0, 0,
+				     peer->next_index[LOCAL],
+				     &peer->next_local_per_commit,
+				     false,
+				     batch_size);
+}
+
 
 /* Pops the penalty base for the given commitnum from our internal list. There
  * may not be one, in which case we return NULL and leave the list
@@ -2523,8 +2603,6 @@ static void handle_peer_revoke_and_ack(struct peer *peer, const u8 *msg)
 		     side_to_str(peer->channel->opener),
 		     fmt_pubkey(tmpctx, &peer->remote_per_commit),
 		     fmt_pubkey(tmpctx, &peer->old_remote_per_commit));
-
-	peer->splice_state->await_commitment_succcess = false;
 
 	/* STFU can't be activated during pending updates.
 	 * With updates finish let's handle a potentially queued stfu request.
@@ -3320,7 +3398,10 @@ static struct amount_sat check_balances(struct peer *peer,
 	if (!amount_msat_add_sat_s64(&funding_amount, funding_amount,
 				     peer->splicing->opener_relative))
 		splice_abort(peer, "Splice initiator did not provide enough"
-			     " funding");
+			     " funding, funding_amount: %s, opener_relative:"
+			     " %"PRIu64,
+			     fmt_amount_msat(tmpctx, funding_amount),
+			     peer->splicing->opener_relative);
 	if (!amount_msat_add_sat_s64(&out[TX_INITIATOR], out[TX_INITIATOR],
 				     peer->splicing->opener_relative))
 		peer_failed_warn(peer->pps, &peer->channel_id,
@@ -3346,11 +3427,16 @@ static struct amount_sat check_balances(struct peer *peer,
 				 " amount. Initiator contributing %s but they"
 				 " committed to %s. Pending offered HTLC"
 				 " balance of %s is not available for this"
-				 " operation.",
+				 " operation. We are%s the opener. We began the"
+				 " operation being owed/owing %s and expect"
+				 " that amount to change %"PRIu64"000",
 				 fmt_amount_msat(tmpctx, in[TX_INITIATOR]),
 				 fmt_amount_msat(tmpctx, out[TX_INITIATOR]),
 				 fmt_amount_msat(tmpctx,
-				 		 pending_htlcs[TX_INITIATOR]));
+				 		 pending_htlcs[TX_INITIATOR]),
+				 opener ? "" : " not",
+				 fmt_amount_msat(tmpctx, peer->channel->view->owed[opener ? LOCAL : REMOTE]),
+				 peer->splicing->opener_relative);
 	}
 
 	if (!amount_msat_sub(&initiator_fee, in[TX_INITIATOR], out[TX_INITIATOR]))
@@ -3519,6 +3605,29 @@ static void update_view_from_inflights(struct peer *peer)
 	}
 }
 
+static size_t count_inputs_with_exclusions(struct wally_psbt *psbt,
+					   enum tx_role role_to_ignore,
+					   u32 input_index_to_ignore)
+{
+	size_t result = 0;
+	for (size_t i = 0; i < psbt->num_inputs; i++) {
+		struct wally_psbt_input *in = &psbt->inputs[i];
+		u64 in_serial;
+
+		if (!psbt_get_serial_id(&in->unknowns, &in_serial))
+			status_broken("PSBT input %zu missing serial_id"
+				      " %s", i, fmt_wally_psbt(tmpctx, psbt));
+		if (in_serial % 2 == role_to_ignore)
+			continue;
+
+		if (i == input_index_to_ignore)
+			continue;
+
+		result++;
+	}
+	return result;
+}
+
 /* Called to finish an ongoing splice OR on restart from channel_reestablish. */
 static void resume_splice_negotiation(struct peer *peer,
 				      bool send_commitments,
@@ -3596,7 +3705,8 @@ static void resume_splice_negotiation(struct peer *peer,
 		msg = towire_channeld_update_inflight(NULL, current_psbt,
 						      their_commit->tx,
 						      &their_commit->commit_signature,
-						      inflight->locked_scid);
+						      inflight->locked_scid,
+						      inflight->i_sent_sigs);
 		wire_sync_write(MASTER_FD, take(msg));
 	}
 
@@ -3662,12 +3772,14 @@ static void resume_splice_negotiation(struct peer *peer,
 
 	psbt_txid(tmpctx, current_psbt, &final_txid, NULL);
 
+	inflight->i_sent_sigs = send_signature;
 	if (do_i_sign_first(peer, current_psbt, our_role,
 			    inflight->force_sign_first)
 		&& send_signature) {
 		msg = towire_channeld_update_inflight(NULL, current_psbt,
 						      NULL, NULL,
-						      inflight->locked_scid);
+						      inflight->locked_scid,
+						      inflight->i_sent_sigs);
 		wire_sync_write(MASTER_FD, take(msg));
 
 		msg = towire_channeld_splice_sending_sigs(tmpctx, &final_txid);
@@ -3811,12 +3923,20 @@ static void resume_splice_negotiation(struct peer *peer,
 			if (i == splice_funding_index)
 				continue;
 
-			if (j == tal_count(inws))
+			if (j == tal_count(inws)) {
 				peer_failed_warn(peer->pps,
 						 &peer->channel_id,
 						 "Mismatch witness stack count."
 						 " Most likely you are missing"
-						 " signatures.");
+						 " signatures. We have %zu"
+						 " remote inputs needing sigs"
+						 " and you sent %zu witness"
+						 " bundles.",
+						 count_inputs_with_exclusions(current_psbt,
+						 			      our_role,
+						 			      splice_funding_index),
+						 tal_count(inws));
+			}
 
 			psbt_finalize_input(current_psbt, in,
 					    inws[j++]);
@@ -3833,11 +3953,12 @@ static void resume_splice_negotiation(struct peer *peer,
 					     wit_stack);
 	}
 
-	if (recv_signature) {
+	if (recv_signature || send_signature) {
 		/* We let core validate our peer's signatures are correct. */
 		msg = towire_channeld_update_inflight(NULL, current_psbt, NULL,
 						      NULL,
-						      inflight->locked_scid);
+						      inflight->locked_scid,
+						      inflight->i_sent_sigs);
 		wire_sync_write(MASTER_FD, take(msg));
 	}
 
@@ -3999,8 +4120,6 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 		peer->splicing->remote_funding_pubkey = last_inflight(peer)->remote_funding;
 	}
 
-	peer->splice_state->await_commitment_succcess = false;
-
 	if (!is_stfu_active(peer))
 		peer_failed_warn(peer->pps, &peer->channel_id,
 				 "Must be in STFU mode before intiating splice");
@@ -4102,7 +4221,8 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 					   peer->splicing->accepter_relative,
 					   ictx->current_psbt,
 					   false,
-					   peer->splicing->force_sign_first);
+					   peer->splicing->force_sign_first,
+					   false);
 
 	master_wait_sync_reply(tmpctx, peer, take(msg),
 			       WIRE_CHANNELD_GOT_INFLIGHT);
@@ -4120,6 +4240,7 @@ static void splice_accepter(struct peer *peer, const u8 *inmsg)
 	new_inflight->i_am_initiator = false;
 	new_inflight->force_sign_first = peer->splicing->force_sign_first;
 	new_inflight->locked_scid = NULL;
+	new_inflight->i_sent_sigs = false;
 
 	current_push_val = relative_splice_balance_fundee(peer, our_role,ictx->current_psbt,
 					  outpoint.n, splice_funding_index);
@@ -4279,6 +4400,8 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	u8 *outmsg;
 	struct interactivetx_context *ictx;
 	struct bitcoin_tx *prev_tx;
+	struct bitcoin_tx *bitcoin_tx;
+	struct bitcoin_signature splice_sig;
 	bool sign_first;
 	char *error;
 	u32 chan_output_index, splice_funding_index;
@@ -4290,6 +4413,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	struct amount_msat current_push_val;
 	const enum tx_role our_role = TX_INITIATOR;
 	u8 *abort_msg;
+	const u8* msg;
 
 	/* We must loading the funding tx as our previous utxo */
 	prev_tx = bitcoin_tx_from_txid(peer, peer->channel->funding.txid);
@@ -4338,6 +4462,44 @@ static void splice_initiator_user_finalized(struct peer *peer)
 
 	psbt_elements_normalize_fees(ictx->current_psbt);
 
+	/* We have to sign the shared output early (here) for cases where we are
+	 * splicing between multiple channels simultaneously. This is so the
+	 * we can build a complete `tx_signatures` message when there are two
+	 * or more shared outputs between mulitple peers */
+
+	splice_sig.sighash_type = SIGHASH_ALL;
+
+	bitcoin_tx = bitcoin_tx_with_psbt(tmpctx, ictx->current_psbt);
+
+	status_info("Splice pre-signing tx: %s",
+		    tal_hex(tmpctx, linearize_tx(tmpctx, bitcoin_tx)));
+
+	msg = towire_hsmd_sign_splice_tx(tmpctx, bitcoin_tx,
+					 &peer->channel->funding_pubkey[REMOTE],
+					 splice_funding_index);
+
+	msg = hsm_req(tmpctx, take(msg));
+	if (!fromwire_hsmd_sign_tx_reply(msg, &splice_sig))
+		status_failed(STATUS_FAIL_HSM_IO,
+			      "Reading sign_splice_tx reply: %s",
+			      tal_hex(tmpctx, msg));
+
+	/* Set the splice_sig on the splice funding tx psbt */
+	if (!psbt_input_set_signature(ictx->current_psbt, splice_funding_index,
+				      &peer->channel->funding_pubkey[LOCAL],
+				      &splice_sig))
+		status_failed(STATUS_FAIL_INTERNAL_ERROR,
+			      "Unable to pre-set signature internally "
+			      "funding_index: %d "
+			      "my pubkey: %s "
+			      "my signature: %s "
+			      "psbt: %s",
+			      splice_funding_index,
+			      fmt_pubkey(tmpctx,
+					 &peer->channel->funding_pubkey[LOCAL]),
+			      fmt_bitcoin_signature(tmpctx, &splice_sig),
+			      fmt_wally_psbt(tmpctx, ictx->current_psbt));
+
 	status_debug("Splice adding inflight: %s",
 		     fmt_wally_psbt(tmpctx, ictx->current_psbt));
 
@@ -4352,7 +4514,8 @@ static void splice_initiator_user_finalized(struct peer *peer)
 					      peer->splicing->opener_relative,
 					      ictx->current_psbt,
 					      true,
-					      peer->splicing->force_sign_first);
+					      peer->splicing->force_sign_first,
+					      false);
 
 	master_wait_sync_reply(tmpctx, peer, take(outmsg),
 			       WIRE_CHANNELD_GOT_INFLIGHT);
@@ -4369,6 +4532,7 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	new_inflight->i_am_initiator = true;
 	new_inflight->force_sign_first = peer->splicing->force_sign_first;
 	new_inflight->locked_scid = NULL;
+	new_inflight->i_sent_sigs = false;
 
 	audit_psbt(ictx->current_psbt, ictx->current_psbt);
 
@@ -4400,7 +4564,8 @@ static void splice_initiator_user_finalized(struct peer *peer)
 	outmsg = towire_channeld_update_inflight(NULL, new_inflight->psbt,
 						 their_commit->tx,
 						 &their_commit->commit_signature,
-						 new_inflight->locked_scid);
+						 new_inflight->locked_scid,
+						 new_inflight->i_sent_sigs);
 	wire_sync_write(MASTER_FD, take(outmsg));
 
 	sign_first = do_i_sign_first(peer, new_inflight->psbt, our_role,
@@ -4471,6 +4636,9 @@ static void splice_initiator_user_update(struct peer *peer, const u8 *inmsg)
 
 	/* If there no are no changes, we consider the splice user finalized */
 	if (!interactivetx_has_changes(ictx, ictx->desired_psbt)) {
+		peer->splicing->current_psbt = tal_free(peer->splicing->current_psbt);
+		peer->splicing->current_psbt = clone_psbt(peer->splicing,
+							  ictx->desired_psbt);
 		splice_initiator_user_finalized(peer);
 		tal_steal(last_inflight(peer), last_inflight(peer)->psbt);
 		return;
@@ -4594,7 +4762,8 @@ static void splice_initiator_user_signed(struct peer *peer, const u8 *inmsg)
 	outmsg = towire_channeld_update_inflight(NULL, inflight->psbt,
 						 inflight->last_tx,
 						 &inflight->last_sig,
-						 inflight->locked_scid);
+						 inflight->locked_scid,
+						 inflight->i_sent_sigs);
 
 	wire_sync_write(MASTER_FD, take(outmsg));
 
@@ -4636,7 +4805,6 @@ static void handle_splice_stfu_success(struct peer *peer)
 					 init_rbf_tlvs);
 	}
 
-	peer->splice_state->await_commitment_succcess = false;
 	peer_write(peer->pps, take(msg));
 }
 
@@ -4850,13 +5018,17 @@ static void peer_in(struct peer *peer, const u8 *msg)
 	case WIRE_UPDATE_ADD_HTLC:
 		handle_peer_add_htlc(peer, msg);
 		return;
+	case WIRE_START_BATCH:
+		handle_peer_start_batch(peer, msg);
+		return;
 	case WIRE_COMMITMENT_SIGNED:
-		handle_peer_commit_sig_batch(peer, msg, 0,
+		handle_peer_commit_sig_batch(peer, msg,
 					     peer->channel->funding_pubkey[REMOTE],
 					     NULL, 0, 0,
 					     peer->next_index[LOCAL],
 					     &peer->next_local_per_commit,
-					     false);
+					     false,
+					     1); /* Batch size default is 1 */
 		return;
 	case WIRE_UPDATE_FEE:
 		handle_peer_feechange(peer, msg);
@@ -4920,6 +5092,7 @@ static void peer_in(struct peer *peer, const u8 *msg)
 		return;
 
 	/* These are all swallowed by connectd */
+	case WIRE_PROTOCOL_BATCH_ELEMENT:
 	case WIRE_CHANNEL_ANNOUNCEMENT:
 	case WIRE_CHANNEL_UPDATE:
 	case WIRE_NODE_ANNOUNCEMENT:
@@ -5057,13 +5230,24 @@ static void resend_commitment(struct peer *peer, struct changed_htlc *last)
 					 last[i].id);
 
 		if (h->state == SENT_ADD_COMMIT) {
-			struct tlv_update_add_htlc_tlvs *tlvs;
-			if (h->path_key) {
+			struct tlv_update_add_htlc_tlvs *tlvs = NULL;
+			if (h->extra_tlvs || h->path_key) {
 				tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
-				tlvs->blinded_path = tal_dup(tlvs, struct pubkey,
+			}
+			if (h->extra_tlvs) {
+				tlvs->fields = tal_dup_talarr(tmpctx,
+							      struct tlv_field,
+							      h->extra_tlvs);
+			}
+			if (h->path_key) {
+				/* It is fine to just set the binded_path
+				 * independent of what is in tlv->fields as the
+				 * towire logic will serialize unknown fields
+				 * and known types seperately. */
+				tlvs->blinded_path = tal_dup(tlvs,
+							     struct pubkey,
 							     h->path_key);
-			} else
-				tlvs = NULL;
+			}
 			msg = towire_update_add_htlc(NULL, &peer->channel_id,
 						     h->id, h->amount,
 						     &h->rhash,
@@ -5122,8 +5306,7 @@ static void resend_commitment(struct peer *peer, struct changed_htlc *last)
 						peer->splice_state->inflights[i]->remote_funding));
 	}
 
-	for(i = 0; i < tal_count(msgs); i++)
-		peer_write(peer->pps, take(msgs[i]));
+	send_message_batch(peer, msgs);
 
 	/* If we have already received the revocation for the previous, the
 	 * other side shouldn't be asking for a retransmit! */
@@ -5312,27 +5495,6 @@ static bool capture_premature_msg(const u8 ***shit_lnd_says, const u8 *msg)
 	return true;
 }
 
-#if EXPERIMENTAL_UPGRADE_ENABLED
-/* Unwrap a channel_type into a raw byte array for the wire: can be NULL */
-static u8 *to_bytearr(const tal_t *ctx,
-		      const struct channel_type *channel_type TAKES)
-{
-	u8 *ret;
-	bool steal;
-
-	steal = taken(channel_type);
-	if (!channel_type)
-		return NULL;
-
-	if (steal) {
-		ret = tal_steal(ctx, channel_type->features);
-		tal_free(channel_type);
-	} else
-		ret = tal_dup_talarr(ctx, u8, channel_type->features);
-	return ret;
-}
-#endif
-
 static void peer_reconnect(struct peer *peer,
 			   const struct secret *last_remote_per_commit_secret)
 {
@@ -5349,8 +5511,8 @@ static void peer_reconnect(struct peer *peer,
 	bool dataloss_protect, check_extra_fields;
 	const u8 **premature_msgs = tal_arr(peer, const u8 *, 0);
 	struct inflight *inflight;
-	struct bitcoin_txid *local_next_funding, *remote_next_funding,
-			    *remote_your_last_funding;
+	struct tlv_channel_reestablish_tlvs_next_funding *local_next_funding,
+							 *remote_next_funding;
 	u64 send_next_commitment_number;
 
 	struct tlv_channel_reestablish_tlvs *send_tlvs, *recv_tlvs;
@@ -5369,47 +5531,6 @@ static void peer_reconnect(struct peer *peer,
 				 &my_current_per_commitment_point);
 
 	send_tlvs = NULL;
-
-#if EXPERIMENTAL_UPGRADE_ENABLED
-	if (peer->experimental_upgrade) {
-		/* Subtle: we free tmpctx below as we loop, so tal off peer */
-		send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
-
-		/* BOLT-upgrade_protocol #2:
-		 * A node sending `channel_reestablish`, if it supports upgrading channels:
-		 *   - MUST set `next_to_send` the commitment number of the next
-		 *     `commitment_signed` it expects to send.
-		 */
-		send_tlvs->next_to_send = tal_dup(send_tlvs, u64, &peer->next_index[REMOTE]);
-
-		/* BOLT-upgrade_protocol #2:
-		 * - if it initiated the channel:
-		 *   - MUST set `desired_type` to the channel_type it wants for the
-		 *     channel.
-		 */
-		if (peer->channel->opener == LOCAL) {
-			send_tlvs->desired_channel_type =
-				to_bytearr(send_tlvs,
-					   take(channel_desired_type(NULL,
-								     peer->channel)));
-		} else {
-			/* BOLT-upgrade_protocol #2:
-			 * - otherwise:
-			 *  - MUST set `current_type` to the current channel_type of the
-			 *    channel.
-			 *  - MUST set `upgradable` to the channel types it could change
-			 *    to.
-			 *  - MAY not set `upgradable` if it would be empty.
-			 */
-			send_tlvs->current_channel_type
-				= to_bytearr(send_tlvs, peer->channel->type);
-			send_tlvs->upgradable_channel_type
-				= to_bytearr(send_tlvs,
-					     take(channel_upgradable_type(NULL,
-									  peer->channel)));
-		}
-	}
-#endif
 
 	inflight = last_inflight(peer);
 
@@ -5434,17 +5555,25 @@ static void peer_reconnect(struct peer *peer,
 				 * tal off peer */
 				send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
 			}
-			send_tlvs->next_funding = &inflight->outpoint.txid;
+			send_tlvs->next_funding = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
+			send_tlvs->next_funding->next_funding_txid = inflight->outpoint.txid;
 
-			/* Eclair wants us to decrement commitment number to
-			 * indicate that we would like them to re-send
-			 * commitment signatures */
-			/* DTODO: Add bolt reference */
+			/* BOLT-??? #2:
+			 * The `next_funding.retransmit_flags` bitfield is used to let the
+			 * receiving peer know which messages they must retransmit for the
+			 * corresponding `next_funding_txid` after the reconnection:
+			 * | Bit Position  | Name                |
+			 * | ------------- | --------------------|
+			 * | 0             | `commitment_signed` |
+			 */
 			if (!inflight->last_tx)
-				send_next_commitment_number--;
+				send_tlvs->next_funding->retransmit_flags |= 1; /* commitment_signed */
 		}
 	}
 
+	/* BOLT-??? #2:
+	 *  - if `option_splice` was negotiated:
+	 */
 	if (feature_negotiated(peer->our_features, peer->their_features,
 			       OPT_SPLICE)) {
 		if (!send_tlvs) {
@@ -5453,46 +5582,67 @@ static void peer_reconnect(struct peer *peer,
 			send_tlvs = tlv_channel_reestablish_tlvs_new(peer);
 		}
 
-		if (peer->channel_ready[REMOTE])
-			send_tlvs->your_last_funding_locked_txid = &peer->channel->funding.txid;
-
-		send_tlvs->my_current_funding_locked_txid = &peer->channel->funding.txid;
-		status_debug("Setting send_tlvs->my_current_funding_locked_txid"
-			     " to %s",
-			     fmt_bitcoin_txid(tmpctx,
-			     		      &peer->channel->funding.txid));
-
 		for (size_t i = 0; i < tal_count(peer->splice_state->inflights); i++) {
 			struct inflight *itr = peer->splice_state->inflights[i];
 			if (itr->locked_scid) {
-				send_tlvs->my_current_funding_locked_txid = &itr->outpoint.txid;
-				status_debug("Overriding send_tlvs->my_current_"
-					     "funding_locked_txid to %s because"
-					     " inflight is locked to scid %s",
-					     fmt_bitcoin_txid(tmpctx,
-					     		      &itr->outpoint.txid),
-					     fmt_short_channel_id(tmpctx,
-					     			  *itr->locked_scid));
+				peer->splice_state->short_channel_id = *itr->locked_scid;
+				peer->splice_state->locked_txid = itr->outpoint.txid;
+				peer->splice_state->locked_ready[LOCAL] = true;
 			}
+		}
+
+		/* BOLT-??? #2:
+		 *    - if a splice transaction reached acceptable depth while disconnected:
+		 *      - MUST include `my_current_funding_locked` with the txid of the latest such transaction.
+		 *    - otherwise, if it has already sent `splice_locked` for any transaction:
+		 *      - MUST include `my_current_funding_locked` with the txid of the last `splice_locked` it sent.
+		 */
+		if (peer->splice_state->locked_ready[LOCAL]) {
+
+			send_tlvs->my_current_funding_locked = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_my_current_funding_locked);
+			send_tlvs->my_current_funding_locked->my_current_funding_locked_txid = peer->splice_state->locked_txid;
+			status_debug("Setting send_tlvs->my_current_funding"
+				     "_locked_txid to splice txid %s",
+				     fmt_bitcoin_txid(tmpctx,
+				     		      &peer->splice_state->locked_txid));
+		}
+		/* BOLT-??? #2:
+		 *    - otherwise, if it has already sent `channel_ready`:
+		 *      - MUST include `my_current_funding_locked` with the txid of the channel funding transaction.
+		 */
+		else if (peer->channel_ready[LOCAL]) {
+
+			send_tlvs->my_current_funding_locked = talz(send_tlvs, struct tlv_channel_reestablish_tlvs_my_current_funding_locked);
+			send_tlvs->my_current_funding_locked->my_current_funding_locked_txid = peer->channel->funding.txid;
+			status_debug("Setting send_tlvs->my_current_funding"
+				     "_locked_txid to channel txid %s",
+				     fmt_bitcoin_txid(tmpctx,
+				     		      &peer->channel->funding.txid));
+		}
+		/* BOLT-??? #2:
+		 *    - otherwise (it has never sent `channel_ready` or `splice_locked`):
+		 *      - MUST NOT include `my_current_funding_locked`.
+		*/
+		else {
+			status_debug("Not setting send_tlvs->my_current_funding"
+				     "_locked_txid (funding txid %s)",
+				     fmt_bitcoin_txid(tmpctx,
+				     		      &peer->channel->funding.txid));
+			assert(!send_tlvs->my_current_funding_locked);
 		}
 	}
 
 	status_debug("Sending channel_reestablish with"
 		     " next_funding_tx_id: %s,"
-		     " your_last_funding_locked: %s,"
 		     " my_current_funding_locked: %s,"
 		     " next_local_commit_number: %"PRIu64",",
 		     send_tlvs && send_tlvs->next_funding
 		     	? fmt_bitcoin_txid(tmpctx,
-		     			   send_tlvs->next_funding)
+		     			   &send_tlvs->next_funding->next_funding_txid)
 		     	: "NULL",
-		     send_tlvs && send_tlvs->your_last_funding_locked_txid
+		     send_tlvs && send_tlvs->my_current_funding_locked
 		     	? fmt_bitcoin_txid(tmpctx,
-		     			   send_tlvs->your_last_funding_locked_txid)
-		     	: "NULL",
-		     send_tlvs && send_tlvs->my_current_funding_locked_txid
-		     	? fmt_bitcoin_txid(tmpctx,
-		     			   send_tlvs->my_current_funding_locked_txid)
+		     			   &send_tlvs->my_current_funding_locked->my_current_funding_locked_txid)
 		     	: "NULL",
 		     send_next_commitment_number);
 
@@ -5608,7 +5758,7 @@ static void peer_reconnect(struct peer *peer,
 						  !inflight->last_tx,
 						  false,
 						  true);
-		} else if (bitcoin_txid_eq(remote_next_funding,
+		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
 					   &inflight->outpoint.txid)) {
 			/* Don't send sigs unless we have theirs */
 			assert(local_next_funding || inflight->remote_tx_sigs);
@@ -5618,11 +5768,13 @@ static void peer_reconnect(struct peer *peer,
 			if (local_next_funding)
 				assume_stfu_mode(peer);
 			resume_splice_negotiation(peer,
-						  next_commitment_number == peer->next_index[REMOTE] - 1,
+						  remote_next_funding
+						  	? remote_next_funding->retransmit_flags & 1
+						  	: false,
 						  local_next_funding && !inflight->last_tx,
 						  true,
 						  local_next_funding);
-		} else if (bitcoin_txid_eq(remote_next_funding,
+		} else if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
 					   &peer->channel->funding.txid)) {
 			peer_failed_err(peer->pps,
 					&peer->channel_id,
@@ -5631,7 +5783,7 @@ static void peer_reconnect(struct peer *peer,
 					" active funding txid %s. Should be %s"
 					" or NULL",
 					fmt_bitcoin_txid(tmpctx,
-							 remote_next_funding),
+							 &remote_next_funding->next_funding_txid),
 					fmt_bitcoin_txid(tmpctx,
 							 &peer->channel->funding.txid),
 					fmt_bitcoin_txid(tmpctx,
@@ -5642,71 +5794,21 @@ static void peer_reconnect(struct peer *peer,
 					"Invalid reestablish with unrecognized"
 					" next_funding txid %s, should be %s",
 					fmt_bitcoin_txid(tmpctx,
-							 remote_next_funding),
+							 &remote_next_funding->next_funding_txid),
 					fmt_bitcoin_txid(tmpctx,
 							 &inflight->outpoint.txid));
 		}
 	} else if (remote_next_funding) { /* No current inflight */
 		/* If our peer is trying to negotiate details about a splice
 		 * that is already onchain, jump ahead to sending splice_lock */
-		if (bitcoin_txid_eq(remote_next_funding,
-				    &peer->channel->funding.txid)) {
+		if (bitcoin_txid_eq(&remote_next_funding->next_funding_txid,
+				    &peer->channel->funding.txid))
 			status_info("We have no pending splice but peer"
-				    " is negotiating one; resending"
-				    " splice_lock %s",
+				    " is negotiating one that matches current"
+				    " channel, ignoring it: %s",
 				    fmt_bitcoin_outpoint(tmpctx, &peer->channel->funding));
-			peer_write(peer->pps,
-				   take(towire_splice_locked(NULL,
-				   			     &peer->channel_id,
-				   			     &peer->channel->funding.txid)));
-		}
-		else {
-			splice_abort(peer, "next_funding_txid not recognized."
-					     " Sending tx_abort.");
-		}
-	}
-
-	/* Re-send `splice_locked` if an inflight is locked */
-	for (size_t i = 0; i < tal_count(peer->splice_state->inflights); i++) {
-		struct inflight *itr = peer->splice_state->inflights[i];
-		if (!itr->locked_scid)
-			continue;
-
-		status_info("Resending splice_locked because an inflight %s is"
-			    " locked",
-			    fmt_bitcoin_outpoint(tmpctx, &itr->outpoint));
-		peer_write(peer->pps,
-			   take(towire_splice_locked(NULL,
-						     &peer->channel_id,
-						     &itr->outpoint.txid)));
-		peer->splice_state->locked_ready[LOCAL] = true;
-	}
-
-	/* If no inflight, no splice negotiation, but
-	   `your_last_funding_locked_txid is stale, re-send `splice_locked`. */
-	if (!inflight && !remote_next_funding
-	    && feature_negotiated(peer->our_features, peer->their_features,
-				  OPT_SPLICE)) {
-		remote_your_last_funding = recv_tlvs
-			? recv_tlvs->your_last_funding_locked_txid : NULL;
-		if (remote_your_last_funding
-			&& !bitcoin_txid_eq(&peer->channel->funding.txid,
-					    remote_your_last_funding)) {
-			status_info("Resending splice_locked with no inflight,"
-				    " no splice negotation, but we did recv"
-				    " remote_your_last_funding value of %s"
-				    " instead of %s. Our sent splice_locked"
-				    " value is %s.",
-				    remote_your_last_funding
-				    	? fmt_bitcoin_txid(tmpctx, remote_your_last_funding)
-				    	: "NULL",
-				    fmt_bitcoin_outpoint(tmpctx, &peer->channel->funding),
-				    fmt_bitcoin_txid(tmpctx, &peer->channel->funding.txid));
-			peer_write(peer->pps,
-				   take(towire_splice_locked(NULL,
-							     &peer->channel_id,
-							     &peer->channel->funding.txid)));
-		}
+		else
+			splice_abort(peer, "next_funding_txid not recognized.");
 	}
 
 	/* BOLT #2:
@@ -5732,6 +5834,26 @@ static void peer_reconnect(struct peer *peer,
 					    &peer->channel_id,
 					    &peer->next_local_per_commit, tlvs);
 		peer_write(peer->pps, take(msg));
+	}
+
+	/* BOLT-??? #2
+	 * A receiving node:
+	 *   - if splice transactions are pending and `my_current_funding_locked` matches one of
+	 *     those splice transactions, for which it hasn't received `splice_locked` yet:
+  	 */
+	if (inflight && recv_tlvs && recv_tlvs->my_current_funding_locked) {
+		for (size_t i = 0; i < tal_count(peer->splice_state->inflights); i++) {
+			struct inflight *itr = peer->splice_state->inflights[i];
+			if (!bitcoin_txid_eq(&itr->outpoint.txid,
+					     &recv_tlvs->my_current_funding_locked->my_current_funding_locked_txid))
+				continue;
+			/* BOLT-??? #2
+			 *     - MUST process `my_current_funding_locked` as if it was receiving `splice_locked`
+			 *       for this `txid`.
+			 */
+			implied_peer_splice_locked(peer, itr->outpoint.txid);
+			break;
+		}
 	}
 
 	/* Note: next_index is the index of the current commit we're working
@@ -5876,86 +5998,6 @@ static void peer_reconnect(struct peer *peer,
 	/* (If we had sent `closing_signed`, we'd be in closingd). */
 	maybe_send_shutdown(peer);
 
-#if EXPERIMENTAL_UPGRADE_ENABLED
-	if (recv_tlvs->desired_channel_type)
-		status_debug("They sent desired_channel_type [%s]",
-			     fmt_featurebits(tmpctx,
-					     recv_tlvs->desired_channel_type));
-	if (recv_tlvs->current_channel_type)
-		status_debug("They sent current_channel_type [%s]",
-			     fmt_featurebits(tmpctx,
-					     recv_tlvs->current_channel_type));
-
-	if (recv_tlvs->upgradable_channel_type)
-		status_debug("They offered upgrade to [%s]",
-			     fmt_featurebits(tmpctx,
-					     recv_tlvs->upgradable_channel_type));
-
-	/* BOLT-upgrade_protocol #2:
-	 *
-	 * A node receiving `channel_reestablish`:
-	 *  - if it has to retransmit `commitment_signed` or `revoke_and_ack`:
-	 *    - MUST consider the channel feature change failed.
-	 */
-	if (retransmit_commitment_signed || retransmit_revoke_and_ack) {
-		status_debug("No upgrade: we retransmitted");
-	/* BOLT-upgrade_protocol #2:
-	 *
-	 *  - if `next_to_send` is missing, or not equal to the
-	 *    `next_commitment_number` it sent:
-	 *    - MUST consider the channel feature change failed.
-	 */
-	} else if (!recv_tlvs->next_to_send) {
-		status_debug("No upgrade: no next_to_send received");
-	} else if (*recv_tlvs->next_to_send != peer->next_index[LOCAL]) {
-		status_debug("No upgrade: they're retransmitting");
-	/* BOLT-upgrade_protocol #2:
-	 *
-	 *  - if updates are pending on either sides' commitment transaction:
-	 *    - MUST consider the channel feature change failed.
-	 */
-		/* Note that we can have HTLCs we *want* to add or remove
-		 * but haven't yet: thats OK! */
-	} else if (pending_updates(peer->channel, LOCAL, true)
-		   || pending_updates(peer->channel, REMOTE, true)) {
-		status_debug("No upgrade: pending changes");
-	} else if (send_tlvs && recv_tlvs) {
-		const struct tlv_channel_reestablish_tlvs *initr, *ninitr;
-		const u8 *type;
-
-		if (peer->channel->opener == LOCAL) {
-			initr = send_tlvs;
-			ninitr = recv_tlvs;
-		} else {
-			initr = recv_tlvs;
-			ninitr = send_tlvs;
-		}
-
-		/* BOLT-upgrade_protocol #2:
-		 *
-		 * - if `desired_channel_type` matches `current_channel_type` or any
-		 *   `upgradable_channel_type`:
-		 *   - MUST consider the channel type to be `desired_channel_type`.
-		 * - otherwise:
-		 *   - MUST consider the channel type change failed.
-		 *   - if there is a `current_channel_type` field:
-		 *     - MUST consider the channel type to be `current_channel_type`.
-		 */
-		if (match_type(initr->desired_channel_type,
-			       ninitr->current_channel_type)
-		    || match_type(initr->desired_channel_type,
-				  ninitr->upgradable_channel_type))
-			type = initr->desired_channel_type;
-		else if (ninitr->current_channel_type)
-			type = ninitr->current_channel_type;
-		else
-			type = NULL;
-
-		if (type)
-			set_channel_type(peer->channel, type);
-	}
-#endif
-
 	tal_free(send_tlvs);
 
 	/* We've reestablished! */
@@ -6050,7 +6092,8 @@ static void handle_funding_depth(struct peer *peer, const u8 *msg)
 									      inflight->psbt,
 									      NULL,
 									      NULL,
-									      inflight->locked_scid);
+									      inflight->locked_scid,
+									      inflight->i_sent_sigs);
 					wire_sync_write(MASTER_FD, take(msg));
 					inflight_match = inflight;
 				}
@@ -6143,7 +6186,9 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 	const char *failstr;
 	struct amount_sat htlc_fee;
 	struct pubkey *path_key;
+	struct tlv_field *extra_tlvs;
 	struct tlv_update_add_htlc_tlvs *tlvs;
+	u8 *extra_tlvs_raw;
 
 	if (!peer->channel_ready[LOCAL] || !peer->channel_ready[REMOTE])
 		status_failed(STATUS_FAIL_MASTER_IO,
@@ -6151,19 +6196,39 @@ static void handle_offer_htlc(struct peer *peer, const u8 *inmsg)
 
 	if (!fromwire_channeld_offer_htlc(tmpctx, inmsg, &amount,
 					 &cltv_expiry, &payment_hash,
-					 onion_routing_packet, &path_key))
+					 onion_routing_packet, &path_key, &extra_tlvs_raw))
 		master_badmsg(WIRE_CHANNELD_OFFER_HTLC, inmsg);
 
-	if (path_key) {
+
+	if (extra_tlvs_raw || path_key) {
 		tlvs = tlv_update_add_htlc_tlvs_new(tmpctx);
-		tlvs->blinded_path = tal_dup(tlvs, struct pubkey, path_key);
-	} else
+	} else {
 		tlvs = NULL;
+	}
+
+	if (extra_tlvs_raw) {
+		const u8 *cursor = extra_tlvs_raw;
+		size_t max = tal_bytelen(extra_tlvs_raw);
+		u64 failedtype;
+		const u64 *allowed = cast_const(u64 *, FROMWIRE_TLV_ANY_TYPE);
+		if (!fromwire_tlv(&cursor, &max, NULL, 0,
+				  tlvs, &tlvs->fields,
+				  allowed, NULL, &failedtype)) {
+			status_unusual("Malformed TLV type %"PRIu64": %s",
+				failedtype, tal_hex(tmpctx, extra_tlvs_raw));
+		}
+		extra_tlvs = tlvs->fields;
+	} else {
+		extra_tlvs = NULL;
+	}
+	if (path_key) {
+		tlvs->blinded_path = tal_dup(tlvs, struct pubkey, path_key);
+	}
 
 	e = channel_add_htlc(peer->channel, LOCAL, peer->htlc_id,
 			     amount, cltv_expiry, &payment_hash,
 			     onion_routing_packet, take(path_key), NULL,
-			     &htlc_fee, true);
+			     &htlc_fee, extra_tlvs, true);
 	status_debug("Adding HTLC %"PRIu64" amount=%s cltv=%u gave %s",
 		     peer->htlc_id,
 		     fmt_amount_msat(tmpctx, amount),
@@ -6645,7 +6710,6 @@ static void init_channel(struct peer *peer)
 				    &channel_type,
 				    &peer->dev_disable_commit,
 				    &pbases,
-				    &peer->experimental_upgrade,
 				    &peer->splice_state->inflights,
 				    &peer->local_alias)) {
 		master_badmsg(WIRE_CHANNELD_INIT, msg);

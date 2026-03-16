@@ -29,9 +29,9 @@
 void fromwire_sciddir_or_pubkey(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 				struct sciddir_or_pubkey *sciddpk UNNEEDED)
 { fprintf(stderr, "fromwire_sciddir_or_pubkey called!\n"); abort(); }
-/* Generated stub for mvt_tag_str */
-const char *mvt_tag_str(enum mvt_tag tag UNNEEDED)
-{ fprintf(stderr, "mvt_tag_str called!\n"); abort(); }
+/* Generated stub for mvt_tag_parse */
+bool mvt_tag_parse(const char *buf UNNEEDED, size_t len UNNEEDED, enum mvt_tag *tag UNNEEDED)
+{ fprintf(stderr, "mvt_tag_parse called!\n"); abort(); }
 /* Generated stub for new_onionreply */
 struct onionreply *new_onionreply(const tal_t *ctx UNNEEDED, const u8 *contents TAKES UNNEEDED)
 { fprintf(stderr, "new_onionreply called!\n"); abort(); }
@@ -86,13 +86,13 @@ int main(int argc, char *argv[])
 	common_setup(argv[0]);
 
 	if (argv[1])
-		json = grab_file(tmpctx, argv[1]);
+		json = grab_file_str(tmpctx, argv[1]);
 	else {
 		char *dir = getenv("BOLTDIR");
-		json = grab_file(tmpctx,
-				 path_join(tmpctx,
-					   dir ? dir : ".tmp.lightningrfc",
-					   "bolt04/blinded-payment-onion-test.json"));
+		json = grab_file_str(tmpctx,
+				     path_join(tmpctx,
+					       dir ? dir : ".tmp.lightningrfc",
+					       "bolt04/blinded-payment-onion-test.json"));
 		if (!json) {
 			printf("test file not found, skipping\n");
 			goto out;

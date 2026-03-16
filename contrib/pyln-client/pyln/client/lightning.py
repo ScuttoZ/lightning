@@ -254,9 +254,12 @@ class UnixSocket(object):
                 # Open an fd to our home directory, that we can then find
                 # through `/proc/self/fd` and access the contents.
                 dirfd = os.open(dirname, os.O_DIRECTORY | os.O_RDONLY)
-                short_path = "/proc/self/fd/%d/%s" % (dirfd, basename)
-                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                self.sock.connect(short_path)
+                try:
+                    short_path = "/proc/self/fd/%d/%s" % (dirfd, basename)
+                    self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    self.sock.connect(short_path)
+                finally:
+                    os.close(dirfd)
             elif (e.args[0] == "AF_UNIX path too long" and os.uname()[0] == "Darwin"):
                 temp_dir = tempfile.mkdtemp()
                 temp_link = os.path.join(temp_dir, "socket_link")
@@ -581,16 +584,6 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("datastoreusage", payload)
 
-    def decodepay(self, bolt11, description=None):
-        """
-        Decode {bolt11}, using {description} if necessary.
-        """
-        payload = {
-            "bolt11": bolt11,
-            "description": description
-        }
-        return self.call("decodepay", payload)
-
     def deldatastore(self, key, generation=None):
         """
         Remove an existing entry from the datastore.
@@ -844,13 +837,14 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("fundchannel_cancel", payload)
 
-    def fundchannel_complete(self, node_id, psbt):
+    def fundchannel_complete(self, node_id, psbt, withhold=True):
         """
         Complete channel establishment with {id}, using {psbt}.
         """
         payload = {
             "id": node_id,
             "psbt": psbt,
+            "withhold": withhold,
         }
         return self.call("fundchannel_complete", payload)
 
@@ -1058,7 +1052,7 @@ class LightningRpc(UnixDomainSocketRpc):
         }
         return self.call("listpeers", payload)
 
-    def listpeerchannels(self, peer_id=None, short_channel_id=None):
+    def listpeerchannels(self, peer_id=None, short_channel_id=None, channel_id=None):
         """
         Show current peers channels, and if the {peer_id} is specified
         all the channels for the peer are returned, and if {short_channel_id} is
@@ -1067,6 +1061,7 @@ class LightningRpc(UnixDomainSocketRpc):
         payload = {
             "id": peer_id,
             "short_channel_id": short_channel_id,
+            "channel_id": channel_id,
         }
         return self.call("listpeerchannels", payload)
 
@@ -1126,7 +1121,7 @@ class LightningRpc(UnixDomainSocketRpc):
 
     def offer(self, amount, description=None, issuer=None, label=None, quantity_max=None, absolute_expiry=None,
               recurrence=None, recurrence_base=None, recurrence_paywindow=None, recurrence_limit=None,
-              single_use=None, recurrence_start_any_period=None):
+              single_use=None, fronting_nodes=None):
         """
         Create an offer (or returns an existing one), which is a precursor to creating one or more invoices.
         It automatically enables the processing of an incoming invoice_request, and issuing of invoices.
@@ -1143,7 +1138,7 @@ class LightningRpc(UnixDomainSocketRpc):
             "recurrence_paywindow": recurrence_paywindow,
             "recurrence_limit": recurrence_limit,
             "single_use": single_use,
-            "recurrence_start_any_period": recurrence_start_any_period,
+            "fronting_nodes": fronting_nodes,
         }
         return self.call("offer", payload)
 

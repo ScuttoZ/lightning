@@ -1,4 +1,5 @@
 #include "config.h"
+#include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <ccan/list/list.h>
 #include <ccan/mem/mem.h>
@@ -9,6 +10,7 @@
 #include <common/utils.h>
 #include <errno.h>
 #include <locale.h>
+#include <sodium.h>
 
 const tal_t *wally_tal_ctx = NULL;
 secp256k1_context *secp256k1_ctx;
@@ -30,6 +32,13 @@ void tal_wally_start(void)
 	}
 
 	wally_tal_ctx = tal_arr(NULL, char, 0);
+}
+
+void tal_wally_discard(void)
+{
+	assert(wally_tal_ctx);
+	assert(tal_first(wally_tal_ctx) == NULL);
+	wally_tal_ctx = tal_free(wally_tal_ctx);
 }
 
 void tal_wally_end(const tal_t *parent)
@@ -84,6 +93,18 @@ u8 *tal_hexdata(const tal_t *ctx, const void *str, size_t len)
 	return data;
 }
 
+static void destroy_munlock(const tal_t *ptr)
+{
+	sodium_munlock((void *)ptr, tal_bytelen(ptr));
+}
+
+void mlock_tal_memory(const tal_t *ptr)
+{
+	if (sodium_mlock((void *)ptr, tal_bytelen(ptr)) != 0)
+		abort();
+	tal_add_destructor(ptr, destroy_munlock);
+}
+
 bool tal_arr_eq_(const void *a, const void *b, size_t unused)
 {
 	return memeq(a, tal_bytelen(a), b, tal_bytelen(b));
@@ -99,6 +120,8 @@ void setup_locale(void)
 /* Initial creation of tmpctx. */
 void setup_tmpctx(void)
 {
+	/* Don't call me twice! */
+	assert(!tmpctx);
 	tmpctx = tal_arr_label(NULL, char, 0, "tmpctx");
 }
 
@@ -191,3 +214,22 @@ char *str_lowering(const void *ctx, const char *string TAKES)
 	for (char *p = ret; *p; p++) *p = tolower(*p);
 	return ret;
 }
+
+char *str_uppering(const void *ctx, const char *string TAKES)
+{
+	char *ret;
+
+	ret = tal_strdup(ctx, string);
+	for (char *p = ret; *p; p++) *p = toupper(*p);
+	return ret;
+}
+
+/* Realloc helper for tal membufs */
+void *membuf_tal_resize(struct membuf *mb, void *rawelems, size_t newsize)
+{
+	char *p = rawelems;
+
+	tal_resize(&p, newsize);
+	return p;
+}
+

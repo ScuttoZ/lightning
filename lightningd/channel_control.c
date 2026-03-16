@@ -1,36 +1,28 @@
 #include "config.h"
 #include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
-#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
+#include <common/daemon.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/json_stream.h>
-#include <common/memleak.h>
 #include <common/psbt_open.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/wire_error.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <hsmd/permissions.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closing_control.h>
-#include <lightningd/coin_mvts.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
-#include <lightningd/gossip_control.h>
+#include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
-#include <wally_bip32.h>
-#include <wally_psbt.h>
+#include <unistd.h>
 
 struct stfu_result
 {
@@ -803,7 +795,7 @@ bool depthcb_update_scid(struct channel *channel,
 	if (!channel->scid) {
 		wallet_annotate_txout(ld->wallet, outpoint,
 				      TX_CHANNEL_FUNDING, channel->dbid);
-		channel->scid = tal_dup(channel, struct short_channel_id, &scid);
+		channel_set_scid(channel, &scid);
 
 		/* If we have a zeroconf channel, i.e., no scid yet
 		 * but have exchange `channel_ready` messages, then we
@@ -815,12 +807,16 @@ bool depthcb_update_scid(struct channel *channel,
 			lockin_has_completed(channel, false);
 
 	} else {
+		struct short_channel_id old_scid = *channel->scid;
+
 		/* We freaked out if required when original was
 		 * removed, so just update now */
 		log_info(channel->log, "Short channel id changed from %s->%s",
 			 fmt_short_channel_id(tmpctx, *channel->scid),
 			 fmt_short_channel_id(tmpctx, scid));
-		*channel->scid = scid;
+		channel_set_scid(channel, &scid);
+		/* In case we broadcast it before (e.g. splice!) */
+		channel_add_old_scid(channel, old_scid);
 		channel_gossip_scid_changed(channel);
 	}
 
@@ -842,7 +838,7 @@ static void handle_add_inflight(struct lightningd *ld,
 	s64 splice_amnt;
 	struct wally_psbt *psbt;
 	struct channel_inflight *inflight;
-	bool i_am_initiator, force_sign_first;
+	bool i_am_initiator, force_sign_first, i_sent_sigs;
 
 	if (!fromwire_channeld_add_inflight(tmpctx,
 					    msg,
@@ -854,7 +850,8 @@ static void handle_add_inflight(struct lightningd *ld,
 					    &splice_amnt,
 					    &psbt,
 					    &i_am_initiator,
-					    &force_sign_first)) {
+					    &force_sign_first,
+					    &i_sent_sigs)) {
 		channel_internal_error(channel,
 				       "bad channel_add_inflight %s",
 				       tal_hex(channel, msg));
@@ -877,7 +874,8 @@ static void handle_add_inflight(struct lightningd *ld,
 				AMOUNT_SAT(0),
 				splice_amnt,
 				i_am_initiator,
-				force_sign_first);
+				force_sign_first,
+				i_sent_sigs);
 
 	log_debug(channel->log, "lightningd adding inflight with txid %s",
 		  fmt_bitcoin_txid(tmpctx,
@@ -898,9 +896,11 @@ static void handle_update_inflight(struct lightningd *ld,
 	struct bitcoin_tx *last_tx;
 	struct bitcoin_signature *last_sig;
 	struct short_channel_id *locked_scid;
+	bool i_sent_sigs;
 
 	if (!fromwire_channeld_update_inflight(tmpctx, msg, &psbt, &last_tx,
-					       &last_sig, &locked_scid)) {
+					       &last_sig, &locked_scid,
+					       &i_sent_sigs)) {
 		channel_internal_error(channel,
 				       "bad channel_add_inflight %s",
 				       tal_hex(channel, msg));
@@ -929,6 +929,7 @@ static void handle_update_inflight(struct lightningd *ld,
 		inflight->last_sig = *last_sig;
 
 	inflight->locked_scid = tal_steal(inflight, locked_scid);
+	inflight->i_sent_sigs = i_sent_sigs;
 
 	tal_wally_start();
 	if (wally_psbt_combine(inflight->funding_psbt, psbt) != WALLY_OK) {
@@ -951,13 +952,15 @@ static void channel_record_splice(struct channel *channel,
 				  struct amount_msat orig_our_msats,
 				  struct amount_sat orig_funding_sats,
 				  struct bitcoin_outpoint *funding,
-				  u32 blockheight, struct bitcoin_txid *txid, const struct channel_inflight *inflight)
+				  u32 blockheight,
+				  const struct bitcoin_txid *txid,
+				  const struct channel_inflight *inflight)
 {
 	struct chain_coin_mvt *mvt;
 	u32 output_count;
 
 	output_count = inflight->funding_psbt->num_outputs;
-	mvt = new_coin_channel_close(tmpctx, &channel->cid,
+	mvt = new_coin_channel_close(tmpctx, channel, NULL,
 				     txid,
 				     funding,
 				     blockheight,
@@ -965,7 +968,7 @@ static void channel_record_splice(struct channel *channel,
 				     orig_funding_sats,
 				     output_count,
 				     /* is_splice = */true);
-	notify_chain_mvt(channel->peer->ld, mvt);
+	wallet_save_chain_mvt(channel->peer->ld, mvt);
 }
 
 void channel_record_open(struct channel *channel, u32 blockheight, bool record_push)
@@ -993,7 +996,7 @@ void channel_record_open(struct channel *channel, u32 blockheight, bool record_p
 	/* If it's not in a block yet, send a proposal */
 	if (blockheight > 0)
 		mvt = new_coin_channel_open(tmpctx,
-					    &channel->cid,
+					    channel,
 					    &channel->funding,
 					    &channel->peer->id,
 					    blockheight,
@@ -1003,7 +1006,7 @@ void channel_record_open(struct channel *channel, u32 blockheight, bool record_p
 					    is_leased);
 	else
 		mvt = new_coin_channel_open_proposed(tmpctx,
-					    &channel->cid,
+					    channel,
 					    &channel->funding,
 					    &channel->peer->id,
 					    start_balance,
@@ -1011,15 +1014,17 @@ void channel_record_open(struct channel *channel, u32 blockheight, bool record_p
 					    channel->opener == LOCAL,
 					    is_leased);
 
-	notify_chain_mvt(channel->peer->ld, mvt);
+	wallet_save_chain_mvt(channel->peer->ld, mvt);
 
 	/* If we pushed sats, *now* record them */
 	if (is_pushed && record_push)
-		notify_channel_mvt(channel->peer->ld,
-				   new_coin_channel_push(tmpctx, &channel->cid,
+		wallet_save_channel_mvt(channel->peer->ld,
+				   new_coin_channel_push(tmpctx, channel,
+							 channel->opener == REMOTE ? COIN_CREDIT : COIN_DEBIT,
 							 channel->push,
-							 is_leased ? LEASE_FEE : PUSHED,
-							 channel->opener == REMOTE));
+							 is_leased
+							 ? mk_mvt_tags(MVT_LEASE_FEE)
+							 : mk_mvt_tags(MVT_PUSHED)));
 }
 
 void lockin_has_completed(struct channel *channel, bool record_push)
@@ -1121,13 +1126,16 @@ static void handle_peer_splice_locked(struct channel *channel, const u8 *msg)
 	wallet_htlcsigs_confirm_inflight(channel->peer->ld->wallet, channel,
 					 &inflight->funding->outpoint);
 
-	update_channel_from_inflight(channel->peer->ld, channel, inflight, true);
+	/* Stop watching previous funding tx (could be, for announcement) */
+	channel_unwatch_funding(channel->peer->ld, channel);
 
 	/* Stash prev funding data so we can log it after scid is updated
 	 * (to get the blockheight) */
 	prev_our_msats = channel->our_msat;
 	prev_funding_sats = channel->funding_sats;
 	prev_funding_out = channel->funding;
+
+	update_channel_from_inflight(channel->peer->ld, channel, inflight, true);
 
 	channel->our_msat.millisatoshis += splice_amnt * 1000; /* Raw: splicing */
 	channel->msat_to_us_min.millisatoshis += splice_amnt * 1000; /* Raw: splicing */
@@ -1811,6 +1819,11 @@ bool peer_start_channeld(struct channel *channel,
 		if (inflight->splice_locked_memonly)
 			continue;
 
+		if (!inflight->funding->splice_remote_funding) {
+			send_backtrace("Inflight has no splice_remote_funding?!");
+			continue;
+		}
+
 		infcopy = tal(inflights, struct inflight);
 
 		infcopy->remote_funding = *inflight->funding->splice_remote_funding;
@@ -1823,6 +1836,7 @@ bool peer_start_channeld(struct channel *channel,
 		infcopy->i_am_initiator = inflight->i_am_initiator;
 		infcopy->force_sign_first = inflight->force_sign_first;
 		infcopy->locked_scid = tal_dup_or_null(infcopy, struct short_channel_id, inflight->locked_scid);
+		infcopy->i_sent_sigs = inflight->i_sent_sigs;
 
 		tal_wally_start();
 		wally_psbt_clone_alloc(inflight->funding_psbt, 0, &infcopy->psbt);
@@ -1887,7 +1901,6 @@ bool peer_start_channeld(struct channel *channel,
 					     ? NULL
 					     : (u32 *)&ld->dev_disable_commit,
 				       pbases,
-				       ld->experimental_upgrade_protocol,
 				       cast_const2(const struct inflight **,
 						   inflights),
 				       *channel->alias[LOCAL]);
@@ -2391,6 +2404,11 @@ static struct command_result *single_splice_signed(struct command *cmd,
 		return command_fail(cmd,
 				    SPLICE_INPUT_ERROR,
 				    "Splice failed to convert to v2");
+
+	/* Update "funding" psbt now */
+	tal_free(channel->funding_psbt);
+	channel->funding_psbt = clone_psbt(channel, psbt);
+	wallet_channel_save(cmd->ld->wallet, channel);
 
 	msg = towire_channeld_splice_signed(tmpctx, psbt, sign_first);
 	subd_send_msg(channel->owner, take(msg));

@@ -1,25 +1,22 @@
 #include "config.h"
 #include <ccan/tal/str/str.h>
 #include <common/blockheight_states.h>
+#include <common/clock_time.h>
 #include <common/closing_fee.h>
 #include <common/fee_states.h>
 #include <common/json_command.h>
+#include <common/randbytes.h>
 #include <common/wire_error.h>
-#include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/channel_state_names_gen.h>
 #include <lightningd/connect_control.h>
-#include <lightningd/gossip_control.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
 #include <lightningd/opening_common.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
-#include <sodium/randombytes.h>
 #include <wallet/txfilter.h>
-#include <wire/peer_wire.h>
 
 void channel_set_owner(struct channel *channel, struct subd *owner)
 {
@@ -88,7 +85,8 @@ static void destroy_channel(struct channel *channel)
 	list_del_from(&channel->peer->channels, &channel->list);
 }
 
-void delete_channel(struct channel *channel STEALS, bool completely_eliminate)
+void delete_channel(struct channel *channel STEALS,
+		    bool completely_eliminate)
 {
 	const u8 *msg;
 	struct peer *peer = channel->peer;
@@ -111,6 +109,16 @@ void delete_channel(struct channel *channel STEALS, bool completely_eliminate)
 		if (!fromwire_hsmd_forget_channel_reply(msg))
 			fatal("HSM gave bad hsm_forget_channel_reply %s", tal_hex(msg, msg));
 	}
+
+	notify_channel_state_changed(channel->peer->ld,
+				     &channel->peer->id,
+				     &channel->cid,
+				     channel->scid,
+				     clock_time(),
+				     channel->state,
+				     CLOSED,
+				     REASON_UNKNOWN,
+				     NULL);
 
 	tal_free(channel);
 
@@ -172,7 +180,8 @@ new_inflight(struct channel *channel,
 	     const struct amount_sat lease_amt,
 	     s64 splice_amnt,
 	     bool i_am_initiator,
-	     bool force_sign_first)
+	     bool force_sign_first,
+	     bool i_sent_sigs)
 {
 	struct channel_inflight *inflight
 		= tal(channel, struct channel_inflight);
@@ -208,6 +217,7 @@ new_inflight(struct channel *channel,
 	inflight->i_am_initiator = i_am_initiator;
 	inflight->force_sign_first = force_sign_first;
 	inflight->locked_scid = NULL;
+	inflight->i_sent_sigs = i_sent_sigs;
 	inflight->splice_locked_memonly = false;
 
 	list_add_tail(&channel->inflights, &inflight->list);
@@ -242,6 +252,89 @@ struct open_attempt *new_channel_open_attempt(struct channel *channel)
 	return oa;
 }
 
+struct channel_type *desired_channel_type(const tal_t *ctx,
+					  const struct feature_set *our_features,
+					  const u8 *their_features)
+{
+	if (feature_negotiated(our_features, their_features,
+			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
+		return channel_type_anchors_zero_fee_htlc(ctx);
+	return channel_type_static_remotekey(ctx);
+}
+
+static void chanmap_remove(struct lightningd *ld,
+			   const struct channel *channel,
+			   struct short_channel_id scid)
+{
+	struct scid_to_channel *scc = channel_scid_map_get(ld->channels_by_scid, scid);
+	assert(scc->channel == channel);
+	tal_free(scc);
+}
+
+static void destroy_scid_to_channel(struct scid_to_channel *scc,
+				    struct lightningd *ld)
+{
+	if (!channel_scid_map_del(ld->channels_by_scid, scc))
+		abort();
+}
+
+static void chanmap_add(struct lightningd *ld,
+			struct channel *channel,
+			struct short_channel_id scid)
+{
+	struct scid_to_channel *scc = tal(channel, struct scid_to_channel);
+	scc->channel = channel;
+	scc->scid = scid;
+	channel_scid_map_add(ld->channels_by_scid, scc);
+	tal_add_destructor2(scc, destroy_scid_to_channel, ld);
+}
+
+void channel_set_scid(struct channel *channel, const struct short_channel_id *new_scid)
+{
+	struct lightningd *ld = channel->peer->ld;
+
+	/* Get rid of old one (if any) */
+	if (channel->scid != NULL) {
+		chanmap_remove(ld, channel, *channel->scid);
+		channel->scid = tal_free(channel->scid);
+	}
+
+	/* Add new one (if any) */
+	if (new_scid) {
+		channel->scid = tal_dup(channel, struct short_channel_id, new_scid);
+		chanmap_add(ld, channel, *new_scid);
+	}
+}
+
+void channel_add_old_scid(struct channel *channel,
+			  struct short_channel_id old_scid)
+{
+	/* If this is not public, we skip */
+	if (!(channel->channel_flags & CHANNEL_FLAGS_ANNOUNCE_CHANNEL))
+		return;
+
+	if (!channel->old_scids)
+		channel->old_scids = tal_dup(channel, struct short_channel_id, &old_scid);
+	else
+		tal_arr_expand(&channel->old_scids, old_scid);
+
+	chanmap_add(channel->peer->ld, channel, old_scid);
+}
+
+static void remove_from_dbid_map(struct channel *channel)
+{
+	if (!channel_dbid_map_del(channel->peer->ld->channels_by_dbid, channel))
+		abort();
+}
+
+void add_channel_to_dbid_map(struct lightningd *ld,
+			     struct channel *channel)
+{
+	assert(channel->dbid != 0);
+	channel_dbid_map_add(ld->channels_by_dbid, channel);
+	tal_add_destructor(channel, remove_from_dbid_map);
+}
+
 struct channel *new_unsaved_channel(struct peer *peer,
 				    u32 feerate_base,
 				    u32 feerate_ppm)
@@ -259,7 +352,6 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->openchannel_signed_cmd = NULL;
 	channel->state = DUALOPEND_OPEN_INIT;
 	channel->owner = NULL;
-	channel->scb = NULL;
 	channel->reestablished = false;
 	memset(&channel->billboard, 0, sizeof(channel->billboard));
 	channel->billboard.transient = tal_fmt(channel, "%s",
@@ -275,6 +367,7 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->last_htlc_sigs = NULL;
 	channel->remote_channel_ready = false;
 	channel->scid = NULL;
+	channel->old_scids = NULL;
 	channel->next_index[LOCAL] = 1;
 	channel->next_index[REMOTE] = 1;
 	channel->next_htlc_id = 0;
@@ -287,9 +380,11 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->shutdown_wrong_funding = NULL;
 	channel->closing_feerate_range = NULL;
 	channel->alias[REMOTE] = NULL;
-	/* We don't even bother checking for clashes. */
 	channel->alias[LOCAL] = tal(channel, struct short_channel_id);
-	randombytes_buf(channel->alias[LOCAL], sizeof(struct short_channel_id));
+	*channel->alias[LOCAL] = random_scid();
+	/* We don't check for uniqueness.  We would crash on a clash, but your machine is
+	 * probably broken beyond repair if it gets two equal 64 bit numbers */
+	chanmap_add(channel->peer->ld, channel, *channel->alias[LOCAL]);
 
 	channel->shutdown_scriptpubkey[REMOTE] = NULL;
 	channel->last_was_revoke = false;
@@ -305,7 +400,7 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	channel->close_blockheight = NULL;
 	/* In case someone looks at channels before open negotiation,
 	 * initialize this with default */
-	channel->type = default_channel_type(channel,
+	channel->type = desired_channel_type(channel,
 					     ld->our_features,
 					     peer->their_features);
 
@@ -340,6 +435,8 @@ struct channel *new_unsaved_channel(struct peer *peer,
 	/* channel->channel_gossip gets populated once we know if it's public. */
 	channel->channel_gossip = NULL;
 	channel->forgets = tal_arr(channel, struct command *, 0);
+	channel->funding_psbt = NULL;
+	channel->withheld = false;
 	list_add_tail(&peer->channels, &channel->list);
 	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
@@ -410,8 +507,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_sat our_funds,
 			    bool remote_channel_ready,
 			    /* NULL or stolen */
-			    struct short_channel_id *scid,
-			    struct short_channel_id *alias_local TAKES,
+			    struct short_channel_id *scid TAKES,
+			    struct short_channel_id *old_scids TAKES,
+			    struct short_channel_id alias_local,
 			    struct short_channel_id *alias_remote STEALS,
 			    struct channel_id *cid,
 			    struct amount_msat our_msat,
@@ -460,7 +558,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct peer_update *peer_update STEALS,
 			    u64 last_stable_connection,
 			    const struct channel_stats *stats,
-			    struct channel_state_change **state_changes STEALS)
+			    struct channel_state_change **state_changes STEALS,
+			    const struct wally_psbt *funding_psbt STEALS,
+			    bool withheld)
 {
 	struct channel *channel = tal(peer->ld, struct channel);
 	struct amount_msat htlc_min, htlc_max;
@@ -490,30 +590,6 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->billboard.transient = tal_strdup(channel, transient_billboard);
 	channel->channel_info = *channel_info;
 
-	/* If it's a unix domain socket connection, we don't save it */
-	if (peer->addr.itype == ADDR_INTERNAL_WIREADDR) {
-		channel->scb = tal(channel, struct modern_scb_chan);
-		channel->scb->id = dbid;
-		/* More useful to have last_known_addr, if avail */
-		if (peer->last_known_addr)
-			channel->scb->addr = *peer->last_known_addr;
-		channel->scb->addr = peer->addr.u.wireaddr.wireaddr;
-		channel->scb->node_id = peer->id;
-		channel->scb->funding = *funding;
-		channel->scb->cid = *cid;
-		channel->scb->funding_sats = funding_sats;
-		channel->scb->type = channel_type_dup(channel->scb, type);
-
-		struct tlv_scb_tlvs *scb_tlvs = tlv_scb_tlvs_new(channel);
-		scb_tlvs->shachain = &channel->their_shachain.chain;
-		scb_tlvs->basepoints = &channel->channel_info.theirbase;
-		scb_tlvs->opener = &channel->opener;
-		scb_tlvs->remote_to_self_delay = &channel->channel_info.their_config.to_self_delay;
-
-		channel->scb->tlvs = scb_tlvs;
-	} else
-		channel->scb = NULL;
-
 	if (!log) {
 		channel->log = new_logger(channel,
 					  peer->ld->log_book,
@@ -537,13 +613,18 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->push = push;
 	channel->our_funds = our_funds;
 	channel->remote_channel_ready = remote_channel_ready;
-	channel->scid = tal_steal(channel, scid);
-	channel->alias[LOCAL] = tal_dup_or_null(channel, struct short_channel_id, alias_local);
-	/* We always make sure this is set (historical channels from db might not) */
-	if (!channel->alias[LOCAL]) {
-		channel->alias[LOCAL] = tal(channel, struct short_channel_id);
-		randombytes_buf(channel->alias[LOCAL], sizeof(struct short_channel_id));
-	}
+	channel->scid = tal_dup_or_null(channel, struct short_channel_id, scid);
+	channel->old_scids = tal_dup_talarr(channel, struct short_channel_id, old_scids);
+	channel->alias[LOCAL] = tal_dup(channel, struct short_channel_id, &alias_local);
+	/* All these possible short_channel_id variants go in the lookup table! */
+	/* Stub channels all have the same scid though, *and* get loaded from db! */
+	if (channel->scid && !is_stub_scid(*channel->scid))
+		chanmap_add(peer->ld, channel, *channel->scid);
+	if (!is_stub_scid(*channel->alias[LOCAL]))
+		chanmap_add(peer->ld, channel, *channel->alias[LOCAL]);
+	for (size_t i = 0; i < tal_count(channel->old_scids); i++)
+		chanmap_add(peer->ld, channel, channel->old_scids[i]);
+
 	channel->alias[REMOTE] = tal_steal(channel, alias_remote);  /* Haven't gotten one yet. */
 	channel->cid = *cid;
 	channel->our_msat = our_msat;
@@ -619,6 +700,7 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	channel->rr_number = peer->ld->rr_counter++;
 	tal_add_destructor(channel, destroy_channel);
 
+	add_channel_to_dbid_map(peer->ld, channel);
 	list_head_init(&channel->inflights);
 
 	channel->closer = closer;
@@ -650,11 +732,12 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 	}
 	/* scid is NULL when opening a new channel so we don't
 	 * need to set error in that case as well */
-	if (scid && is_stub_scid(*scid))
+	if (channel->scid && is_stub_scid(*channel->scid))
 		channel->error = towire_errorfmt(peer->ld,
 						 &channel->cid,
 						 "We can't be together anymore.");
-
+	channel->funding_psbt = tal_steal(channel, funding_psbt);
+	channel->withheld = withheld;
 	return channel;
 }
 
@@ -737,55 +820,33 @@ struct channel *any_channel_by_scid(struct lightningd *ld,
 				    struct short_channel_id scid,
 				    bool privacy_leak_ok)
 {
-	struct peer *p;
-	struct channel *chan;
-	struct peer_node_id_map_iter it;
+	const struct scid_to_channel *scc = channel_scid_map_get(ld->channels_by_scid, scid);
+	if (!scc)
+		return NULL;
 
-	/* FIXME: Support lookup by scid directly! */
-	for (p = peer_node_id_map_first(ld->peers, &it);
-	     p;
-	     p = peer_node_id_map_next(ld->peers, &it)) {
-		list_for_each(&p->channels, chan, list) {
-			/* BOLT #2:
-			 * - MUST always recognize the `alias` as a
-			 *   `short_channel_id` for incoming HTLCs to this
-			 *   channel.
-			 */
-			if (chan->alias[LOCAL] &&
-			    short_channel_id_eq(scid, *chan->alias[LOCAL]))
-				return chan;
-			/* BOLT #2:
-			 * - if `channel_type` has `option_scid_alias` set:
-			 *   - MUST NOT allow incoming HTLCs to this channel
-			 *     using the real `short_channel_id`
-			 */
-			if (!privacy_leak_ok
-			    && channel_type_has(chan->type, OPT_SCID_ALIAS))
-				continue;
-			if (chan->scid
-			    && short_channel_id_eq(scid, *chan->scid))
-				return chan;
-		}
-	}
-	return NULL;
+	/* BOLT #2:
+	 * - MUST always recognize the `alias` as a `short_channel_id` for
+	 *   incoming HTLCs to this channel.
+	 */
+	if (scc->channel->alias[LOCAL]
+	    && short_channel_id_eq(scid, *scc->channel->alias[LOCAL]))
+		return scc->channel;
+
+	/* BOLT #2:
+	 * - if `channel_type` has `option_scid_alias` set:
+	 *   - MUST NOT allow incoming HTLCs to this channel using the real
+	 *     `short_channel_id`
+	 */
+	/* This means any scids other than the alias (handled above) cannot be exposed */
+	if (!privacy_leak_ok && channel_type_has(scc->channel->type, OPT_SCID_ALIAS))
+		return NULL;
+
+	return scc->channel;
 }
 
 struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid)
 {
-	struct peer *p;
-	struct channel *chan;
-	struct peer_node_id_map_iter it;
-
-	/* FIXME: Support lookup by id directly! */
-	for (p = peer_node_id_map_first(ld->peers, &it);
-	     p;
-	     p = peer_node_id_map_next(ld->peers, &it)) {
-		list_for_each(&p->channels, chan, list) {
-			if (chan->dbid == dbid)
-				return chan;
-		}
-	}
-	return NULL;
+	return channel_dbid_map_get(ld->channels_by_dbid, dbid);
 }
 
 struct channel *channel_by_cid(struct lightningd *ld,
@@ -962,7 +1023,7 @@ void channel_set_state(struct channel *channel,
 		struct channel_state_change *change;
 
 		change = new_channel_state_change(channel->state_changes,
-						  time_now(),
+						  clock_time(),
 						  old_state,
 						  state,
 						  reason,
@@ -1027,12 +1088,18 @@ static void channel_fail_perm(struct channel *channel,
 
 	channel_set_owner(channel, NULL);
 
-	if (channel_state_wants_onchain_fail(channel->state))
+	if (channel_state_wants_onchain_fail(channel->state) && !channel->withheld) {
 		channel_set_state(channel,
 				  channel->state,
 				  AWAITING_UNILATERAL,
 				  reason,
 				  why);
+	}
+
+	if (channel_state_open_uncommitted(channel->state)) {
+		delete_channel(channel, false);
+		return;
+	}
 
 	/* Drop non-cooperatively (unilateral) to chain. If we detect
 	 * the close from the blockchain, then we can observe
@@ -1040,8 +1107,6 @@ static void channel_fail_perm(struct channel *channel,
 	 * it doesn't stand a chance anyway. */
 	drop_to_chain(ld, channel, false, spent_by);
 
-	if (channel_state_open_uncommitted(channel->state))
-		delete_channel(channel, false);
 }
 
 void channel_fail_permanent(struct channel *channel,

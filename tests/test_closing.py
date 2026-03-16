@@ -1,7 +1,7 @@
 from fixtures import *  # noqa: F401,F403
 from pyln.client import RpcError, Millisatoshi
 from shutil import copyfile
-from pyln.testing.utils import SLOW_MACHINE
+from pyln.testing.utils import SLOW_MACHINE, VALGRIND
 from utils import (
     only_one, sync_blockheight, wait_for, TIMEOUT,
     account_balance, first_channel_id, closing_fee, TEST_NETWORK,
@@ -10,6 +10,8 @@ from utils import (
     mine_funding_to_announce, check_inspect_channel,
     first_scid, check_feerate
 )
+
+from typing import List, Optional
 
 import bitcoin
 import os
@@ -122,6 +124,12 @@ def test_closing_simple(node_factory, bitcoind, chainparams):
     tags = check_utxos_channel(l1, [channel_id], expected_1)
     check_utxos_channel(l2, [channel_id], expected_2, tags)
 
+    # Forget channel
+    bitcoind.generate_block(50)
+    sync_blockheight(bitcoind, [l1])
+    l1.restart()
+    assert only_one(l1.rpc.listclosedchannels()['closedchannels'])['channel_id'] == channel_id
+
 
 def test_closing_while_disconnected(node_factory, bitcoind, executor):
     l1, l2 = node_factory.line_graph(2, opts={'may_reconnect': True})
@@ -205,7 +213,7 @@ def test_closing_different_fees(node_factory, bitcoind, executor):
     balance = [False, True]
     num_peers = len(feerates) * len(balance)
 
-    addr = l1.rpc.newaddr()['bech32']
+    addr = l1.rpc.newaddr()['p2tr']
     bitcoind.rpc.sendtoaddress(addr, 1)
     numfunds = len(l1.rpc.listfunds()['outputs'])
     bitcoind.generate_block(1)
@@ -392,10 +400,9 @@ def closing_negotiation_step(node_factory, bitcoind, chainparams, opts):
     status_agreed_regex = re.compile("agreed on a closing fee of ([0-9]+) satoshi")
 
     # [fee_from_opener_status, fee_from_peer_status]
-    fees_from_status = [None, None]
+    fees_from_status: List[Optional[int], Optional[int]] = [None, None]
 
     def get_fee_from_status(node, peer_id, i):
-        nonlocal fees_from_status
         channel = only_one(node.rpc.listpeerchannels(peer_id)['channels'])
         status = channel['status'][0]
 
@@ -624,9 +631,9 @@ def test_penalty_inhtlc(node_factory, bitcoind, executor, chainparams, anchors):
 
     if anchors:
         expected_1['B'].append(('external', ['anchor'], None, None))
+        expected_1['B'].append(('external', ['anchor'], None, None))
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_1['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     # We use a subset of tags in expected_2 that are used in expected_1
     tags = check_utxos_channel(l1, [channel_id], expected_1)
@@ -760,9 +767,9 @@ def test_penalty_outhtlc(node_factory, bitcoind, executor, chainparams, anchors)
 
     if anchors:
         expected_1['B'].append(('external', ['anchor'], None, None))
+        expected_1['B'].append(('external', ['anchor'], None, None))
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_1['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     # We use a subset of tags in expected_2 that are used in expected_1
     tags = check_utxos_channel(l1, [channel_id], expected_1)
@@ -864,7 +871,8 @@ def test_channel_lease_post_expiry(node_factory, bitcoind, chainparams):
     bitcoind.generate_block(6)
     sync_blockheight(bitcoind, [l1, l2])
     # make sure we're at the right place for the csv lock
-    l2.daemon.wait_for_log('Blockheight: SENT_ADD_ACK_COMMIT->RCVD_ADD_ACK_REVOCATION LOCAL now 115')
+    height = bitcoind.rpc.getblockchaininfo()['blocks']
+    l2.daemon.wait_for_log(f'Blockheight: SENT_ADD_ACK_COMMIT->RCVD_ADD_ACK_REVOCATION LOCAL now {height}')
 
     # We need to give l1-l2 time to update their blockheights
     for i in range(0, 4000, 1000):
@@ -973,7 +981,8 @@ def test_channel_lease_unilat_closes(node_factory, bitcoind):
     bitcoind.generate_block(2)
     sync_blockheight(bitcoind, [l1, l2, l3])
     # make sure we're at the right place for the csv lock
-    l2.daemon.wait_for_log('Blockheight: SENT_ADD_ACK_COMMIT->RCVD_ADD_ACK_REVOCATION LOCAL now 110')
+    height = bitcoind.rpc.getblockchaininfo()['blocks']
+    l2.daemon.wait_for_log(f'Blockheight: SENT_ADD_ACK_COMMIT->RCVD_ADD_ACK_REVOCATION LOCAL now {height}')
     l2.stop()
 
     # unilateral close channels l1<->l2 & l3<->l2
@@ -1007,17 +1016,17 @@ def test_channel_lease_unilat_closes(node_factory, bitcoind):
 
     # we *shouldn't* be able to spend it, there's a lock on it
     with pytest.raises(RpcError, match='UTXO .* is csv locked'):
-        l2.rpc.withdraw(l2.rpc.newaddr()['bech32'], "all", utxos=[utxo1])
+        l2.rpc.withdraw(l2.rpc.newaddr()['p2tr'], "all", utxos=[utxo1])
 
     # we *can* spend the 1csv lock one
-    l2.rpc.withdraw(l2.rpc.newaddr()['bech32'], "all", utxos=[utxo3])
+    l2.rpc.withdraw(l2.rpc.newaddr()['p2tr'], "all", utxos=[utxo3])
 
     # This can timeout, so do it in easy stages.
     for i in range(16):
         bitcoind.generate_block(4032 // 16)
         sync_blockheight(bitcoind, [l2, l3])
 
-    l2.rpc.withdraw(l2.rpc.newaddr()['bech32'], "all", utxos=[utxo1])
+    l2.rpc.withdraw(l2.rpc.newaddr()['p2tr'], "all", utxos=[utxo1])
 
     # We actually mined this many blocks already, so we should see this message:
     l3.daemon.wait_for_log('waiting confirmation that we spent DELAYED_OUTPUT_TO_US .* using OUR_DELAYED_RETURN_TO_WALLET')
@@ -1347,9 +1356,9 @@ def test_penalty_htlc_tx_fulfill(node_factory, bitcoind, chainparams, anchors):
 
     if anchors:
         expected_2['B'].append(('external', ['anchor'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
         expected_3['B'].append(('external', ['anchor'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_3['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_3['B'].append(('external', ['anchor'], None, None))
         # We RBF spend the HTLC tx, which creates a new deposit
         expected_2['C'].append(('wallet', ['deposit'], None, None))
 
@@ -1571,9 +1580,9 @@ def test_penalty_htlc_tx_timeout(node_factory, bitcoind, chainparams, anchors):
 
     if anchors:
         expected_2['B'].append(('external', ['anchor'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
         expected_3['B'].append(('external', ['anchor'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_3['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_3['B'].append(('external', ['anchor'], None, None))
 
     # FIXME: Why does this fail?
     if not anchors:
@@ -1713,7 +1722,7 @@ def test_penalty_rbf_normal(node_factory, bitcoind, executor, chainparams, ancho
 
     if anchors:
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     check_utxos_channel(l2, [channel_id], expected_2)
 
@@ -1796,7 +1805,7 @@ def test_onchain_unwatch(node_factory, bitcoind, chainparams):
 
     # Now test unrelated onchain churn.
     # Daemon gets told about wallet; says it doesn't care.
-    l1.rpc.withdraw(l1.rpc.newaddr()['bech32'], 'all')
+    l1.rpc.withdraw(l1.rpc.newaddr('bech32')['bech32'], 'all')
     bitcoind.generate_block(1)
 
     l1.daemon.wait_for_log("but we don't care")
@@ -1806,7 +1815,7 @@ def test_onchain_unwatch(node_factory, bitcoind, chainparams):
 
     # So these should not generate further messages
     for i in range(5):
-        l1.rpc.withdraw(l1.rpc.newaddr()['bech32'], 'all')
+        l1.rpc.withdraw(l1.rpc.newaddr('bech32')['bech32'], 'all')
         bitcoind.generate_block(1)
         # Make sure it digests the block
         sync_blockheight(bitcoind, [l1])
@@ -1844,8 +1853,8 @@ def test_onchaind_replay(node_factory, bitcoind):
 
     # Wait for nodes to notice the failure, this seach needle is after the
     # DB commit so we're sure the tx entries in onchaindtxs have been added
-    l1.daemon.wait_for_log("Deleting channel .* due to the funding outpoint being spent")
-    l2.daemon.wait_for_log("Deleting channel .* due to the funding outpoint being spent")
+    l1.daemon.wait_for_log("closing soon due to the funding outpoint being spent")
+    l2.daemon.wait_for_log("closing soon due to the funding outpoint being spent")
 
     # We should at least have the init tx now
     assert len(l1.db_query("SELECT * FROM channeltxs;")) > 0
@@ -2062,9 +2071,9 @@ def test_onchain_timeout(node_factory, bitcoind, executor, chainparams, anchors)
 
     if anchors:
         expected_1['B'].append(('external', ['anchor'], None, None))
+        expected_1['B'].append(('external', ['anchor'], None, None))
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_1['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     # FIXME: Why does this fail?
     if not anchors:
@@ -2196,9 +2205,9 @@ def test_onchain_middleman_simple(node_factory, bitcoind, chainparams, anchors):
 
     if anchors:
         expected_1['B'].append(('external', ['anchor'], None, None))
+        expected_1['B'].append(('external', ['anchor'], None, None))
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_1['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     # FIXME: Why does this fail?
     if not anchors:
@@ -2326,9 +2335,9 @@ def test_onchain_middleman_their_unilateral_in(node_factory, bitcoind, chainpara
 
     if anchors:
         expected_1['B'].append(('external', ['anchor'], None, None))
+        expected_1['B'].append(('external', ['anchor'], None, None))
         expected_2['B'].append(('external', ['anchor'], None, None))
-        expected_1['B'].append(('wallet', ['anchor', 'ignored'], None, None))
-        expected_2['B'].append(('wallet', ['anchor', 'ignored'], None, None))
+        expected_2['B'].append(('external', ['anchor'], None, None))
 
     chan2_id = first_channel_id(l2, l3)
     # FIXME: Why does this fail?
@@ -2417,7 +2426,7 @@ def test_onchain_their_unilateral_out(node_factory, bitcoind, chainparams, ancho
             # Funding tx
             'A': [('wallet', ['deposit'], None, None), ('cid1', ['channel_open', 'opener'], ['channel_close'], 'B')],
             # Commitment tx
-            'B': [('wallet', ['deposit'], None, None), ('cid1', ['htlc_timeout'], ['to_wallet'], 'C'), ('external', ['anchor'], None, None), ('wallet', ['anchor', 'ignored'], None, None)],
+            'B': [('wallet', ['deposit'], None, None), ('cid1', ['htlc_timeout'], ['to_wallet'], 'C'), ('external', ['anchor'], None, None), ('external', ['anchor'], None, None)],
             # HTLC timeout tx
             'C': [('wallet', ['deposit'], None, None)],
         }
@@ -2426,7 +2435,7 @@ def test_onchain_their_unilateral_out(node_factory, bitcoind, chainparams, ancho
             # Funding tx
             'A': [('cid1', ['channel_open'], ['channel_close'], 'B')],
             # Commitment tx
-            'B': [('external', ['to_them'], None, None), ('external', ['htlc_timeout'], None, None), ('external', ['anchor'], None, None), ('wallet', ['anchor', 'ignored'], None, None)],
+            'B': [('external', ['to_them'], None, None), ('external', ['htlc_timeout'], None, None), ('external', ['anchor'], None, None), ('external', ['anchor'], None, None)],
         }
     else:
         expected_1 = {
@@ -3225,7 +3234,7 @@ def test_permfail(node_factory, bitcoind):
 def test_shutdown(node_factory):
     # Fail, in that it will exit before cleanup.
     l1 = node_factory.get_node(may_fail=True)
-    if not node_factory.valgrind:
+    if not VALGRIND:
         leaks = l1.rpc.dev_memleak()['leaks']
         if len(leaks):
             raise Exception("Node {} has memory leaks: {}"
@@ -3233,14 +3242,15 @@ def test_shutdown(node_factory):
     l1.rpc.stop()
 
 
-def test_option_upfront_shutdown_script(node_factory, bitcoind, executor, chainparams):
-    l1 = node_factory.get_node(start=False, allow_warning=True)
+@pytest.mark.parametrize("old_hsmsecret", [False, True])
+def test_option_upfront_shutdown_script(node_factory, bitcoind, executor, chainparams, old_hsmsecret):
+    l1 = node_factory.get_node(start=False, allow_warning=True, old_hsmsecret=old_hsmsecret)
     # Insist on upfront script we're not going to match.
     # '0014' + l1.rpc.call('dev-listaddrs', [10])['addresses'][-1]['bech32_redeemscript']
     l1.daemon.env["DEV_OPENINGD_UPFRONT_SHUTDOWN_SCRIPT"] = "00143d43d226bcc27019ade52d7a3dc52a7ac1be28b8"
     l1.start()
 
-    l2 = node_factory.get_node(allow_warning=True)
+    l2 = node_factory.get_node(allow_warning=True, old_hsmsecret=old_hsmsecret)
     l1.rpc.connect(l2.info['id'], 'localhost', l2.port)
     l1.fundchannel(l2, 1000000, False)
 
@@ -3274,10 +3284,16 @@ def test_option_upfront_shutdown_script(node_factory, bitcoind, executor, chainp
     wait_for(lambda: [c['state'] for c in l2.rpc.listpeerchannels()['channels']] == ['ONCHAIN', 'ONCHAIN'])
 
     # Figure out what address it will try to use.
-    keyidx = int(l1.db_query("SELECT intval FROM vars WHERE name='bip32_max_index';")[0]['intval'])
+    # With BIP86 mnemonic format (old_hsmsecret=False), addresses use bip86_max_index
+    # With old hsmsecret (old_hsmsecret=True), use bip32_max_index
+    if old_hsmsecret:
+        keyidx = int(l1.db_query("SELECT intval FROM vars WHERE name='bip32_max_index';")[0]['intval'])
+    else:
+        keyidx = int(l1.db_query("SELECT intval FROM vars WHERE name='bip86_max_index';")[0]['intval'])
 
     # Expect 1 for change address, plus 1 for the funding address of the actual
     # funding tx.
+    # dev-listaddrs now handles both BIP32 and BIP86 wallets automatically
     addr = l1.rpc.call('dev-listaddrs', [keyidx + 2])['addresses'][-1]
     # the above used to be keyidx + 3, but that was when `fundchannel`
     # used the `txprepare`-`txdiscard`-`txprepare` trick, which skipped
@@ -3359,7 +3375,7 @@ Try a range of future segwit versions as shutdown scripts.  We create many nodes
     # Give it one UTXO to spend for each node.
     addresses = {}
     for n in nodes:
-        addresses[l1.rpc.newaddr()['bech32']] = (10**6 + 100000) / 10**8
+        addresses[l1.rpc.newaddr('bech32')['bech32']] = (10**6 + 100000) / 10**8
     bitcoind.rpc.sendmany("", addresses)
     bitcoind.generate_block(1)
     wait_for(lambda: len(l1.rpc.listfunds()['outputs']) == len(addresses))
@@ -3430,7 +3446,7 @@ def test_closing_higherfee(node_factory, bitcoind, executor, anchors):
     wait_for(lambda: l2.rpc.listpeerchannels()['channels'][0]['state'] == 'CLOSINGD_COMPLETE')
 
 
-@unittest.skipIf(True, "Test is extremely flaky")
+@pytest.mark.flaky(reruns=3)
 def test_htlc_rexmit_while_closing(node_factory, executor):
     """Retranmitting an HTLC revocation while shutting down should work"""
     # FIXME: This should be in lnprototest!  UNRELIABLE.
@@ -3780,7 +3796,7 @@ def test_closing_anchorspend_htlc_tx_rbf(node_factory, bitcoind):
     fundsats = int(Millisatoshi(only_one(l1.rpc.listfunds()['outputs'])['amount_msat']).to_satoshi())
     psbt = l1.rpc.fundpsbt("all", "1000perkw", 1000)['psbt']
     # Pay 5k sats in fees, send most to l2
-    psbt = l1.rpc.addpsbtoutput(fundsats - 24000 - 5000, psbt, destination=l2.rpc.newaddr()['bech32'])['psbt']
+    psbt = l1.rpc.addpsbtoutput(fundsats - 24000 - 5000, psbt, destination=l2.rpc.newaddr()['p2tr'])['psbt']
     # 12x2000 sat outputs for l1 to use.
     for i in range(12):
         psbt = l1.rpc.addpsbtoutput(2000, psbt)['psbt']
@@ -3876,7 +3892,7 @@ def test_htlc_no_force_close(node_factory, bitcoind, anchors):
         for opt in opts:
             opt['dev-force-features'] = "-23"
 
-    l1, l2, l3 = node_factory.line_graph(3, opts=opts)
+    l1, l2, l3 = node_factory.line_graph(3, opts=opts, wait_for_announce=True)
 
     MSATS = 12300000
     inv = l3.rpc.invoice(MSATS, 'label', 'description')
@@ -3905,11 +3921,11 @@ def test_htlc_no_force_close(node_factory, bitcoind, anchors):
     # l3 gets upset, drops to chain when there are < 4 blocks remaining.
     # But tx doesn't get mined...
     bitcoind.generate_block(8)
-    l3.daemon.wait_for_log("Peer permanent failure in CHANNELD_NORMAL: Fulfilled HTLC 0 SENT_REMOVE_.* cltv 114 hit deadline")
+    l3.daemon.wait_for_log("Peer permanent failure in CHANNELD_NORMAL: Fulfilled HTLC 0 SENT_REMOVE_.* cltv 119 hit deadline")
 
     # l2 closes drops the commitment tx at block 115 (one block after timeout)
     bitcoind.generate_block(4)
-    l2.daemon.wait_for_log("Peer permanent failure in CHANNELD_NORMAL: Offered HTLC 0 SENT_ADD_ACK_REVOCATION cltv 114 hit deadline")
+    l2.daemon.wait_for_log("Peer permanent failure in CHANNELD_NORMAL: Offered HTLC 0 SENT_ADD_ACK_REVOCATION cltv 119 hit deadline")
     l1.set_feerates((15000, 15000, 15000, 15000))
 
     # Two more blocks, with no htlc tx.
@@ -3920,7 +3936,7 @@ def test_htlc_no_force_close(node_factory, bitcoind, anchors):
     bitcoind.generate_block(1, needfeerate=9999999)
 
     # l2 will have abandoned l2->l3 HTLC to close l1->l2.
-    l2.daemon.wait_for_log(r'Abandoning unresolved onchain HTLC at block 117 \(expired at 114\) to avoid peer closing incoming HTLC at block 120')
+    l2.daemon.wait_for_log(r'Abandoning unresolved onchain HTLC at block 122 \(expired at 119\) to avoid peer closing incoming HTLC at block 125')
 
     # l1 should not have force-closed, htlc should be finished by l2.
     assert not l1.daemon.is_in_log('Peer permanent failure in CHANNELD_NORMAL')
@@ -3998,7 +4014,7 @@ def test_peer_anchor_push(node_factory, bitcoind, executor, chainparams):
     NUM_OUTPUTS = 10
     psbt = l2.rpc.fundpsbt("all", "1000perkw", 1000)['psbt']
     # Pay 5k sats in fees.
-    psbt = l2.rpc.addpsbtoutput(fundsats - OUTPUT_SAT * NUM_OUTPUTS - 5000, psbt, destination=l3.rpc.newaddr()['bech32'])['psbt']
+    psbt = l2.rpc.addpsbtoutput(fundsats - OUTPUT_SAT * NUM_OUTPUTS - 5000, psbt, destination=l3.rpc.newaddr()['p2tr'])['psbt']
     for _ in range(NUM_OUTPUTS):
         psbt = l2.rpc.addpsbtoutput(OUTPUT_SAT, psbt)['psbt']
     l2.rpc.sendpsbt(l2.rpc.signpsbt(psbt)['signed_psbt'])
@@ -4050,6 +4066,7 @@ def test_peer_anchor_push(node_factory, bitcoind, executor, chainparams):
         l2.daemon.wait_for_log("sendrawtx exit 0")
         # Check feerate for entire package (commitment tx + anchor) is ~ correct
         details = bitcoind.rpc.getrawmempool(True).values()
+        print(f"mempool = {details}")
         total_weight = sum([d['weight'] for d in details])
         total_fees = sum([float(d['fees']['base']) * 100_000_000 for d in details])
         total_feerate_perkw = total_fees / total_weight * 1000
@@ -4082,12 +4099,12 @@ def test_closing_cpfp(node_factory, bitcoind):
 
     l1out = only_one([o for o in l1.rpc.listfunds()['outputs'] if o != change])
     assert l1out['txid'] == close_txid
-    l1.rpc.withdraw(l1.rpc.newaddr()['bech32'], 'all', '20000perkb', minconf=0, utxos=["{}:{}".format(l1out['txid'], l1out['output'])])
+    l1.rpc.withdraw(l1.rpc.newaddr('bech32')['bech32'], 'all', '20000perkb', minconf=0, utxos=["{}:{}".format(l1out['txid'], l1out['output'])])
 
     # l2 should be able to do this too!
     l2out = only_one(l2.rpc.listfunds()['outputs'])
     assert l2out['txid'] == close_txid
-    l2.rpc.withdraw(l2.rpc.newaddr()['bech32'], 'all', '20000perkb', minconf=0, utxos=["{}:{}".format(l2out['txid'], l2out['output'])])
+    l2.rpc.withdraw(l2.rpc.newaddr('bech32')['bech32'], 'all', '20000perkb', minconf=0, utxos=["{}:{}".format(l2out['txid'], l2out['output'])])
 
     # There should be *three* transactions in mempool now!
     bitcoind.generate_block(1, wait_for_mempool=3)
@@ -4140,7 +4157,7 @@ def test_closing_no_anysegwit_retry(node_factory, bitcoind):
     with pytest.raises(RpcError, match=r'Peer does not allow v1\+ shutdown addresses'):
         l1.rpc.close(l2.info['id'], destination='bcrt1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k0ylj56')
 
-    oldaddr = l1.rpc.newaddr()['bech32']
+    oldaddr = l1.rpc.newaddr('bech32')['bech32']
     l1.rpc.close(l2.info['id'], destination=oldaddr)
 
 
@@ -4165,7 +4182,10 @@ def test_closing_ignore_fee_limits(node_factory, bitcoind, executor):
 def test_anchorspend_using_to_remote(node_factory, bitcoind, anchors):
     """Make sure we can use `to_remote` output of previous close to spend anchor"""
     # Try with old output from both anchor and non-anchor channel.
-    l4_opts = {}
+
+    # We want l2 to process the WIRE_UPDATE_FULFILL_HTLC, so l4 drops
+    # on WIRE_REVOKE_AND_ACK after that.
+    l4_opts = {'disconnect': ['-WIRE_REVOKE_AND_ACK*2']}
     if anchors is False:
         l4_opts['dev-force-features'] = "-23"
 
@@ -4178,11 +4198,12 @@ def test_anchorspend_using_to_remote(node_factory, bitcoind, anchors):
     # this to use anchor.
     node_factory.join_nodes([l4, l2])
 
-    # l4 unilaterally closes, l2 gets to-remote with its output.
+    # l4 disconnects after receiving fulfill.  It then unilaterally
+    # closes, l2 gets to-remote with its output.
     l4.rpc.pay(l2.rpc.invoice(100000000, 'test', 'test')['bolt11'])
     wait_for(lambda: only_one(l4.rpc.listpeerchannels()['channels'])['htlcs'] != [])
 
-    l4.rpc.disconnect(l2.info['id'], force=True)
+    wait_for(lambda: only_one(l4.rpc.listpeers()['peers'])['connected'] is False)
     close = l4.rpc.close(l2.info['id'], 1)
     bitcoind.generate_block(1, wait_for_mempool=only_one(close['txids']))
     wait_for(lambda: len(l2.rpc.listfunds()['outputs']) == 1)
@@ -4265,7 +4286,7 @@ def test_onchain_reestablish_reply(node_factory, bitcoind, executor):
 
     # We block l3 from seeing close, so it will try to reestablish.
     def no_new_blocks(req):
-        return {"error": "go away"}
+        return {"error": {"code": -8, "message": "Block height out of range"}}
     l3.daemon.rpcproxy.mock_rpc('getblockhash', no_new_blocks)
 
     l2.rpc.disconnect(l3.info['id'], force=True)
@@ -4286,6 +4307,10 @@ def test_onchain_reestablish_reply(node_factory, bitcoind, executor):
     # Then we get the error, close.
     l3.daemon.wait_for_log("peer_in WIRE_ERROR")
     wait_for(lambda: only_one(l3.rpc.listpeerchannels(l2.info['id'])['channels'])['state'] == 'AWAITING_UNILATERAL')
+
+    # If we're slow enough, l3 can get upset with the invalid
+    # responses from bitcoind, so stop that now.
+    l3.daemon.rpcproxy.mock_rpc('getblockhash', None)
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'elementsd anchors not supportd')
@@ -4348,7 +4373,7 @@ def test_reestablish_closed_channels(node_factory, bitcoind):
 
     # We block l2 from seeing close, so it will try to reestablish.
     def no_new_blocks(req):
-        return {"error": "go away"}
+        return {"error": {"code": -8, "message": "Block height out of range"}}
     l2.daemon.rpcproxy.mock_rpc('getblockhash', no_new_blocks)
 
     # Make a payment, make sure it's entirely finished before we close.
@@ -4373,6 +4398,10 @@ def test_reestablish_closed_channels(node_factory, bitcoind):
 
     # Make sure l2 was happy with the reestablish message.
     assert not l2.daemon.is_in_log('bad reestablish')
+
+    # If we're slow enough, l2 can get upset with the invalid
+    # responses from bitcoind, so stop that now.
+    l2.daemon.rpcproxy.mock_rpc('getblockhash', None)
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', "elementsd doesn't use p2tr anyway")

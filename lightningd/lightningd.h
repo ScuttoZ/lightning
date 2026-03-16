@@ -69,9 +69,6 @@ struct config {
 	/* Minimal amount of effective funding_satoshis for accepting channels */
 	u64 min_capacity_sat;
 
-	/* This is the key we use to encrypt `hsm_secret`. */
-	struct secret *keypass;
-
 	/* How long before we give up waiting for INIT msg */
 	u32 connection_timeout_secs;
 
@@ -215,6 +212,11 @@ struct lightningd {
 	struct peer_node_id_map *peers;
 	/* And those in database by dbid */
 	struct peer_dbid_map *peers_by_dbid;
+	/* Here are all our channels and their aliases */
+	struct channel_scid_map *channels_by_scid;
+
+	/* Open channels by dbid */
+	struct channel_dbid_map *channels_by_dbid;
 
 	/* Outstanding connect commands. */
 	struct list_head connects;
@@ -234,6 +236,8 @@ struct lightningd {
 
 	/* Derive all our keys from here (see bip32_pubkey) */
 	struct ext_key *bip32_base;
+	/* Derive all our BIP86 keys from here */
+	struct ext_key *bip86_base;
 	struct wallet *wallet;
 
 	/* Outstanding waitsendpay commands. */
@@ -301,9 +305,6 @@ struct lightningd {
 	/* Allow and accept localhost node_announcement addresses */
 	bool dev_allow_localhost;
 
-	/* Timestamp to use for gossipd, iff non-zero */
-	u32 dev_gossip_time;
-
 	/* Speedup gossip propagation, for testing. */
 	bool dev_fast_gossip;
 	bool dev_fast_gossip_prune;
@@ -368,6 +369,9 @@ struct lightningd {
 	/* Tell connectd to block more than 1 simultanous connection attempt */
 	bool dev_limit_connections_inflight;
 
+	/* Tell connectd we don't want TCP_NODELAY */
+	bool dev_keep_nagle;
+
 	/* tor support */
 	struct wireaddr *proxyaddr;
 	bool always_use_proxy;
@@ -378,7 +382,13 @@ struct lightningd {
 
 	char *wallet_dsn;
 
-	bool encrypted_hsm;
+	/* For migration from old accounts.db */
+	char *old_bookkeeper_dir;
+	char *old_bookkeeper_db;
+
+	/* HSM passphrase for any format that needs it */
+	char *hsm_passphrase;
+
 	/* What (additional) messages the HSM accepts */
 	u32 *hsm_capabilities;
 
@@ -410,9 +420,6 @@ struct lightningd {
 	 * since we otherwise would outright reject them. */
 	u64 *accept_extra_tlv_types;
 
-	/* --experimental-upgrade-protocol */
-	bool experimental_upgrade_protocol;
-
 	/* --invoices-onchain-fallback */
 	bool unified_invoices;
 
@@ -427,6 +434,9 @@ struct lightningd {
 
 	/* Minimum number of peers seeker should maintain. */
 	u32 autoconnect_seeker_peers;
+
+	/* Nodes to use for invoices / offers */
+	struct node_id *fronting_nodes;
 };
 
 /* Turning this on allows a tal allocation to return NULL, rather than aborting.

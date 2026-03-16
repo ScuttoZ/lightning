@@ -1,18 +1,17 @@
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/tal/str/str.h>
 #include <common/bolt12.h>
 #include <common/bolt12_id.h>
+#include <common/features.h>
 #include <common/gossmap.h>
 #include <common/iso4217.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/onion_message.h>
 #include <common/overflows.h>
+#include <common/randbytes.h>
 #include <plugins/offers.h>
 #include <plugins/offers_offer.h>
-#include <sodium/randombytes.h>
 
 static bool msat_or_any(const char *buffer,
 			const jsmntok_t *tok,
@@ -99,7 +98,7 @@ static struct command_result *param_amount(struct command *cmd,
 }
 
 /* BOLT 13:
- * - MUST set `time_unit` to 0 (seconds), 1 (days), 2 (months), 3 (years).
+ * - MUST set `time_unit` to 0 (seconds), 1 (days), or 2 (months).
  */
 struct time_string {
 	const char *suffix;
@@ -124,8 +123,6 @@ static const struct time_string *json_to_time(const char *buffer,
 		{ "weeks", 1, 7 },
 		{ "month", 2, 1 },
 		{ "months", 2, 1 },
-		{ "year", 3, 1 },
-		{ "years", 3, 1 },
 	};
 
 	for (size_t i = 0; i < ARRAY_SIZE(suffixes); i++) {
@@ -167,33 +164,15 @@ static struct command_result *param_recurrence_base(struct command *cmd,
 						    struct recurrence_base **base)
 {
 	*base = tal(cmd, struct recurrence_base);
-	(*base)->start_any_period = true;
-
+	(*base)->proportional_amount = false;
 	if (!json_to_u64(buffer, tok, &(*base)->basetime))
 		return command_fail_badparam(cmd, name, buffer, tok,
 					     "not a valid basetime");
 	return NULL;
 }
 
-static struct command_result *param_recurrence_start_any_period(struct command *cmd,
-								const char *name,
-								const char *buffer,
-								const jsmntok_t *tok,
-								struct recurrence_base **base)
-{
-	bool *val;
-	struct command_result *res = param_bool(cmd, name, buffer, tok, &val);
-	if (res)
-		return res;
 
-	if (*val == false && !*base)
-		return command_fail_badparam(cmd, name, buffer, tok,
-					     "Cannot set to false without specifying recurrence_base!");
-	(*base)->start_any_period = false;
-	return NULL;
-}
-
-/* -time+time[%] */
+/* -time+time */
 static struct command_result *param_recurrence_paywindow(struct command *cmd,
 							 const char *name,
 							 const char *buffer,
@@ -205,19 +184,13 @@ static struct command_result *param_recurrence_paywindow(struct command *cmd,
 
 	*paywindow = tal(cmd, struct recurrence_paywindow);
 	t = *tok;
-	if (json_tok_endswith(buffer, &t, "%")) {
-		(*paywindow)->proportional_amount = true;
-		t.end--;
-	} else
-		(*paywindow)->proportional_amount = false;
-
 	if (!json_tok_startswith(buffer, &t, "-"))
 		return command_fail_badparam(cmd, name, buffer, tok,
-					     "expected -time+time[%]");
+					     "expected -time+time");
 	t.start++;
 	if (!split_tok(buffer, &t, '+', &before, &after))
 		return command_fail_badparam(cmd, name, buffer, tok,
-					     "expected -time+time[%]");
+					     "expected -time+time");
 
 	if (!json_to_u32(buffer, &before, &(*paywindow)->seconds_before))
 		return command_fail_badparam(cmd, name, buffer, &before,
@@ -232,6 +205,7 @@ struct offer_info {
 	struct tlv_offer *offer;
 	const char *label;
 	bool *single_use;
+	const struct pubkey *fronting_nodes;
 };
 
 static struct command_result *check_result(struct command *cmd,
@@ -278,10 +252,56 @@ static struct command_result *create_offer(struct command *cmd,
 	return send_outreq(req);
 }
 
+/* Create num_node_ids paths from these node_ids to us (one hop each) */
+static struct blinded_path **offer_onehop_paths(const tal_t *ctx,
+						const struct offers_data *od,
+						const struct tlv_offer *offer,
+						const struct pubkey *neighbors,
+						size_t num_neighbors)
+{
+	struct pubkey *ids = tal_arr(tmpctx, struct pubkey, 2);
+	struct secret blinding_path_secret;
+	struct sha256 offer_id;
+	struct blinded_path **offer_paths;
+
+	/* Note: "id" of offer minus paths */
+	assert(!offer->offer_paths);
+	offer_offer_id(offer, &offer_id);
+
+	offer_paths = tal_arr(ctx, struct blinded_path *, num_neighbors);
+	for (size_t i = 0; i < num_neighbors; i++) {
+		ids[0] = neighbors[i];
+		ids[1] = od->id;
+
+		/* So we recognize this */
+		/* We can check this when they try to take up offer. */
+		bolt12_path_secret(&od->offerblinding_base, &offer_id,
+				   &blinding_path_secret);
+
+		offer_paths[i]
+			= incoming_message_blinded_path(offer_paths,
+							ids,
+							NULL,
+							&blinding_path_secret);
+	}
+	return offer_paths;
+}
+
+/* Common case of making a single path */
+static struct blinded_path **offer_onehop_path(const tal_t *ctx,
+					       const struct offers_data *od,
+					       const struct tlv_offer *offer,
+					       const struct pubkey *neighbor)
+{
+	return offer_onehop_paths(ctx, od, offer, neighbor, 1);
+}
+
 static struct command_result *found_best_peer(struct command *cmd,
 					      const struct chaninfo *best,
 					      struct offer_info *offinfo)
 {
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+
 	/* BOLT #12:
 	 *   - if it is connected only by private channels:
 	 *     - MUST include `offer_paths` containing one or more paths to the node from
@@ -292,29 +312,9 @@ static struct command_result *found_best_peer(struct command *cmd,
 		plugin_log(cmd->plugin, LOG_UNUSUAL,
 			   "No incoming channel to public peer, so no blinded path");
 	} else {
-		struct pubkey *ids;
-		struct secret blinding_path_secret;
-		struct sha256 offer_id;
-
-		/* Note: "id" of offer minus paths */
-		offer_offer_id(offinfo->offer, &offer_id);
-
-		/* Make a small 1-hop path to us */
-		ids = tal_arr(tmpctx, struct pubkey, 2);
-		ids[0] = best->id;
-		ids[1] = id;
-
-		/* So we recognize this */
-		/* We can check this when they try to take up offer. */
-		bolt12_path_secret(&offerblinding_base, &offer_id,
-				   &blinding_path_secret);
-
-		offinfo->offer->offer_paths = tal_arr(offinfo->offer, struct blinded_path *, 1);
-		offinfo->offer->offer_paths[0]
-			= incoming_message_blinded_path(offinfo->offer->offer_paths,
-							ids,
-							NULL,
-							&blinding_path_secret);
+		offinfo->offer->offer_paths
+			= offer_onehop_path(offinfo->offer, od,
+					    offinfo->offer, &best->id);
 	}
 
 	return create_offer(cmd, offinfo);
@@ -323,16 +323,32 @@ static struct command_result *found_best_peer(struct command *cmd,
 static struct command_result *maybe_add_path(struct command *cmd,
 					     struct offer_info *offinfo)
 {
-	/* BOLT #12:
-	 *   - if it is connected only by private channels:
-	 *     - MUST include `offer_paths` containing one or more paths to the node from
-	 *       publicly reachable nodes.
-	 */
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+
+	/* Populate paths assuming not already set by dev_paths */
 	if (!offinfo->offer->offer_paths) {
-		if (we_want_blinded_path(cmd->plugin, false))
-			return find_best_peer(cmd, OPT_ONION_MESSAGES,
-					      found_best_peer, offinfo);
+		/* BOLT #12:
+		 *   - if it is connected only by private channels:
+		 *     - MUST include `offer_paths` containing one or more paths to the node from
+		 *       publicly reachable nodes.
+		 */
+		if (we_want_blinded_path(cmd->plugin, offinfo->fronting_nodes, false)) {
+			/* We use *all* fronting nodes (not just "best" one)
+			 * for offers */
+			if (offinfo->fronting_nodes) {
+				offinfo->offer->offer_paths
+					= offer_onehop_paths(offinfo->offer, od,
+							     offinfo->offer,
+							     offinfo->fronting_nodes,
+							     tal_count(offinfo->fronting_nodes));
+			} else {
+				return find_best_peer(cmd, 1ULL << OPT_ONION_MESSAGES,
+						      NULL,
+						      found_best_peer, offinfo);
+			}
+		}
 	}
+
 	return create_offer(cmd, offinfo);
 }
 
@@ -379,6 +395,7 @@ static struct command_result *param_paths(struct command *cmd, const char *name,
 {
 	size_t i;
 	const jsmntok_t *t;
+	const struct offers_data *od = get_offers_data(cmd->plugin);
 
 	if (tok->type != JSMN_ARRAY)
 		return command_fail_badparam(cmd, name, buffer, tok, "Must be array");
@@ -421,7 +438,7 @@ static struct command_result *param_paths(struct command *cmd, const char *name,
 								     "invalid pubkey");
 				}
 			}
-			if (j == t->size - 1 && !pubkey_eq(&pk, &id))
+			if (j == t->size - 1 && !pubkey_eq(&pk, &od->id))
 				return command_fail_badparam(cmd, name, buffer, p,
 							     "final pubkey must be this node");
 			(*paths)[i]->path[j] = pk;
@@ -430,48 +447,84 @@ static struct command_result *param_paths(struct command *cmd, const char *name,
 	return NULL;
 }
 
+static struct command_result *param_pubkey_arr(struct command *cmd,
+					       const char *name,
+					       const char *buffer,
+					       const jsmntok_t *tok,
+					       const struct pubkey **keys)
+{
+	size_t i;
+	const jsmntok_t *t;
+	struct pubkey *arr;
+
+	if (tok->type != JSMN_ARRAY)
+		return command_fail_badparam(cmd, name, buffer, tok,
+					     "should be an array of nodes");
+
+	arr = tal_arr(cmd, struct pubkey, tok->size);
+	json_for_each_arr(i, t, tok) {
+		if (!json_to_pubkey(buffer, t, &arr[i]))
+			return command_fail_badparam(cmd, name, buffer, t,
+						     "invalid pubkey");
+	}
+	*keys = arr;
+	return NULL;
+}
+
 struct command_result *json_offer(struct command *cmd,
 				  const char *buffer,
 				  const jsmntok_t *params)
 {
+	const struct offers_data *od = get_offers_data(cmd->plugin);
 	const char *desc, *issuer;
 	struct tlv_offer *offer;
 	struct offer_info *offinfo = tal(cmd, struct offer_info);
 	struct path **paths;
+	bool *proportional, *optional_recurrence;
 
 	offinfo->offer = offer = tlv_offer_new(offinfo);
 
-	if (!param(cmd, buffer, params,
-		   p_req("amount", param_amount, offer),
-		   p_opt("description", param_escaped_string, &desc),
-		   p_opt("issuer", param_escaped_string, &issuer),
-		   p_opt("label", param_escaped_string, &offinfo->label),
-		   p_opt("quantity_max", param_u64, &offer->offer_quantity_max),
-		   p_opt("absolute_expiry", param_u64, &offer->offer_absolute_expiry),
-		   p_opt("recurrence", param_recurrence, &offer->offer_recurrence),
-		   p_opt("recurrence_base",
-			 param_recurrence_base,
-			 &offer->offer_recurrence_base),
-		   p_opt("recurrence_paywindow",
-			 param_recurrence_paywindow,
-			 &offer->offer_recurrence_paywindow),
-		   p_opt("recurrence_limit",
-			 param_number,
-			 &offer->offer_recurrence_limit),
-		   p_opt_def("single_use", param_bool,
-			     &offinfo->single_use, false),
-		   p_opt("recurrence_start_any_period",
-			 param_recurrence_start_any_period,
-			 &offer->offer_recurrence_base),
-		   p_opt("dev_paths", param_paths, &paths),
-		   NULL))
+	if (!param_check(cmd, buffer, params,
+			 p_req("amount", param_amount, offer),
+			 p_opt("description", param_escaped_string, &desc),
+			 p_opt("issuer", param_escaped_string, &issuer),
+			 p_opt("label", param_escaped_string, &offinfo->label),
+			 p_opt("quantity_max", param_u64, &offer->offer_quantity_max),
+			 p_opt("absolute_expiry", param_u64, &offer->offer_absolute_expiry),
+			 p_opt("recurrence", param_recurrence, &offer->offer_recurrence_compulsory),
+			 p_opt("recurrence_base",
+			       param_recurrence_base,
+			       &offer->offer_recurrence_base),
+			 p_opt("recurrence_paywindow",
+			       param_recurrence_paywindow,
+			       &offer->offer_recurrence_paywindow),
+			 p_opt("recurrence_limit",
+			       param_number,
+			       &offer->offer_recurrence_limit),
+			 p_opt_def("single_use", param_bool,
+				   &offinfo->single_use, false),
+			 p_opt_def("proportional_amount",
+				   param_bool,
+				   &proportional, false),
+			 p_opt_def("optional_recurrence",
+				   param_bool,
+				   &optional_recurrence, false),
+			 p_opt("fronting_nodes",
+			       param_pubkey_arr,
+			       &offinfo->fronting_nodes),
+			 p_opt("dev_paths", param_paths, &paths),
+			 NULL))
 		return command_param_failed();
 
-	/* Doesn't make sense to have max quantity 1. */
-	if (offer->offer_quantity_max && *offer->offer_quantity_max == 1)
-		return command_fail_badparam(cmd, "quantity_max",
-					     buffer, params,
-					     "must be 0 or > 1");
+
+	/* If they don't specify explicitly, use config (if any) */
+	if (!offinfo->fronting_nodes)
+		offinfo->fronting_nodes = od->fronting_nodes;
+	else if (tal_count(offinfo->fronting_nodes) == 0) {
+		/* [] means "no fronting" */
+		offinfo->fronting_nodes = tal_free(offinfo->fronting_nodes);
+	}
+
 	/* BOLT #12:
 	 *
 	 * - if the chain for the invoice is not solely bitcoin:
@@ -484,7 +537,7 @@ struct command_result *json_offer(struct command *cmd,
 		offer->offer_chains[0] = chainparams->genesis_blockhash;
 	}
 
-	if (!offer->offer_recurrence) {
+	if (!offer_recurrence(offer)) {
 		if (offer->offer_recurrence_limit)
 			return command_fail_badparam(cmd, "recurrence_limit",
 						     buffer, params,
@@ -512,6 +565,30 @@ struct command_result *json_offer(struct command *cmd,
 		return command_fail_badparam(cmd, "description", buffer, params,
 					     "description is required for the user to know what it was they paid for");
 
+	if (*proportional) {
+		if (!offer->offer_recurrence_base) {
+			return command_fail_badparam(cmd, "proportional_amount", buffer, params,
+						     "proportional_amount needs recurrence_base");
+		}
+		offer->offer_recurrence_base->proportional_amount = true;
+	}
+
+	if (*optional_recurrence) {
+		/* Makes no sense to do optional if you have a recurrence_base (which
+		 * will be rejected by non-recurrent-understanding nodes anyway) */
+		if (offer->offer_recurrence_base) {
+			return command_fail_badparam(cmd, "optional_recurrence",
+						     buffer, params,
+						     "incompatible with recurrence_base");
+		}
+		/* Move compulsory to optional */
+		offer->offer_recurrence_optional = offer->offer_recurrence_compulsory;
+		offer->offer_recurrence_compulsory = NULL;
+	}
+
+	if (command_check_only(cmd))
+		return command_check_done(cmd);
+
 	/* BOLT #12:
 	 * - if it sets `offer_issuer`:
 	 *   - SHOULD set it to identify the issuer of the invoice clearly.
@@ -531,7 +608,7 @@ struct command_result *json_offer(struct command *cmd,
 	 *   - MUST set `offer_issuer_id` to the node's public key to request the
 	 *     invoice from.
 	 */
-	offer->offer_issuer_id = tal_dup(offer, struct pubkey, &id);
+	offer->offer_issuer_id = tal_dup(offer, struct pubkey, &od->id);
 
 	/* Now rest of offer will not change: we use pathless offer to create secret. */
 	if (paths) {
@@ -541,7 +618,7 @@ struct command_result *json_offer(struct command *cmd,
 		offer_offer_id(offer, &offer_id);
 
 		/* We can check this when they try to take up offer. */
-		bolt12_path_secret(&offerblinding_base, &offer_id,
+		bolt12_path_secret(&od->offerblinding_base, &offer_id,
 				   &blinding_path_secret);
 
 		offer->offer_paths = tal_arr(offer, struct blinded_path *, tal_count(paths));
@@ -603,7 +680,15 @@ static struct command_result *found_best_peer_invrequest(struct command *cmd,
 							 const struct chaninfo *best,
 							 struct invrequest_data *irdata)
 {
+	const struct offers_data *od = get_offers_data(cmd->plugin);
+
 	if (!best) {
+		/* Don't allow bare invoices if they explicitly told us to front */
+		if (od->fronting_nodes) {
+			return command_fail(cmd, LIGHTNINGD,
+					    "Could not find neighbour fronting node");
+		}
+
 		/* FIXME: Make this a warning in the result! */
 		plugin_log(cmd->plugin, LOG_UNUSUAL,
 			   "No incoming channel to public peer, so no blinded path for invoice request");
@@ -627,11 +712,11 @@ static struct command_result *found_best_peer_invrequest(struct command *cmd,
 		/* Make a small 1-hop path to us */
 		ids = tal_arr(tmpctx, struct pubkey, 2);
 		ids[0] = best->id;
-		ids[1] = id;
+		ids[1] = od->id;
 
 		/* So we recognize this */
 		/* We can check this when they try to take up invoice_request. */
-		bolt12_path_secret(&offerblinding_base, &invreq_id,
+		bolt12_path_secret(&od->offerblinding_base, &invreq_id,
 				   &blinding_path_secret);
 
 		plugin_log(cmd->plugin, LOG_DBG,
@@ -654,6 +739,7 @@ struct command_result *json_invoicerequest(struct command *cmd,
 					   const char *buffer,
 					   const jsmntok_t *params)
 {
+	const struct offers_data *od = get_offers_data(cmd->plugin);
 	const char *desc, *issuer, *label;
 	struct tlv_invoice_request *invreq;
 	struct amount_msat *msat;
@@ -710,8 +796,8 @@ struct command_result *json_invoicerequest(struct command *cmd,
 	 * - MUST set `invreq_metadata` to an unpredictable series of bytes.
 	 */
 	invreq->invreq_metadata = tal_arr(invreq, u8, 16);
-	randombytes_buf(invreq->invreq_metadata,
-			tal_bytelen(invreq->invreq_metadata));
+	randbytes(invreq->invreq_metadata,
+		    tal_bytelen(invreq->invreq_metadata));
 
 	/* BOLT #12:
 	 * - otherwise (not responding to an offer):
@@ -719,21 +805,20 @@ struct command_result *json_invoicerequest(struct command *cmd,
 	 *   - MUST set `invreq_payer_id` (as it would set `offer_issuer_id` for an offer).
 	 */
 	/* FIXME: Allow invoicerequests using aliases! */
-	invreq->invreq_payer_id = tal_dup(invreq, struct pubkey, &id);
+	invreq->invreq_payer_id = tal_dup(invreq, struct pubkey, &od->id);
 
 	/* BOLT #12:
 	 * - if it supports bolt12 invoice request features:
 	 *   - MUST set `invreq_features`.`features` to the bitmap of features.
 	 */
 
-	/* FIXME: We only set blinded path if private/noaddr, we should allow
-	 * setting otherwise! */
-	if (we_want_blinded_path(cmd->plugin, false)) {
+	if (we_want_blinded_path(cmd->plugin, od->fronting_nodes, false)) {
 		struct invrequest_data *idata = tal(cmd, struct invrequest_data);
 		idata->invreq = invreq;
 		idata->single_use = *single_use;
 		idata->label = label;
-		return find_best_peer(cmd, OPT_ONION_MESSAGES,
+		return find_best_peer(cmd, 1ULL << OPT_ONION_MESSAGES,
+				      od->fronting_nodes,
 				      found_best_peer_invrequest, idata);
 	}
 

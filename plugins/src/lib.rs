@@ -2,6 +2,7 @@ use crate::codec::{JsonCodec, JsonRpcCodec};
 pub use anyhow::anyhow;
 use anyhow::{Context, Result};
 use futures::sink::SinkExt;
+use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 extern crate log;
 use log::trace;
@@ -204,9 +205,18 @@ where
         self.hooks.insert(
             hookname.to_string(),
             Hook {
+                name: hookname.to_string(),
                 callback: Box::new(move |p, r| Box::pin(callback(p, r))),
+                before: Vec::new(),
+                after: Vec::new(),
+                filters: None,
             },
         );
+        self
+    }
+
+    pub fn hook_from_builder(mut self, hook: HookBuilder<S>) -> Builder<S, I, O> {
+        self.hooks.insert(hook.name.clone(), hook.build());
         self
     }
 
@@ -411,10 +421,21 @@ where
             .chain(self.wildcard_subscription.iter().map(|_| String::from("*")))
             .collect();
 
+        let hooks: Vec<messages::Hook> = self
+            .hooks
+            .values()
+            .map(|v| messages::Hook {
+                name: v.name.clone(),
+                before: v.before.clone(),
+                after: v.after.clone(),
+                filters: v.filters.clone(),
+            })
+            .collect();
+
         messages::GetManifestResponse {
             options: self.options.values().cloned().collect(),
             subscriptions,
-            hooks: self.hooks.keys().map(|s| s.clone()).collect(),
+            hooks,
             rpcmethods,
             notifications: self.notifications.clone(),
             featurebits: self.featurebits.clone(),
@@ -455,6 +476,56 @@ where
             self.option_values.insert(name.to_string(), option_value);
         }
         Ok(call.configuration)
+    }
+}
+
+impl<S> HookBuilder<S>
+where
+    S: Send + Clone,
+{
+    pub fn new<C, F>(name: &str, callback: C) -> Self
+    where
+        C: Send + Sync + 'static,
+        C: Fn(Plugin<S>, Request) -> F + 'static,
+        F: Future<Output = Response> + Send + 'static,
+    {
+        Self {
+            name: name.to_string(),
+            callback: Box::new(move |p, r| Box::pin(callback(p, r))),
+            before: Vec::new(),
+            after: Vec::new(),
+            filters: None,
+        }
+    }
+
+    pub fn before(mut self, before: Vec<String>) -> Self {
+        self.before = before;
+        self
+    }
+
+    pub fn after(mut self, after: Vec<String>) -> Self {
+        self.after = after;
+        self
+    }
+
+    pub fn filters(mut self, filters: Vec<HookFilter>) -> Self {
+        // Empty Vec would filter everything, must be None instead to not get serialized
+        if filters.is_empty() {
+            self.filters = None;
+        } else {
+            self.filters = Some(filters);
+        }
+        self
+    }
+
+    fn build(self) -> Hook<S> {
+        Hook {
+            callback: self.callback,
+            name: self.name,
+            before: self.before,
+            after: self.after,
+            filters: self.filters,
+        }
     }
 }
 
@@ -542,7 +613,29 @@ struct Hook<S>
 where
     S: Clone + Send,
 {
+    name: String,
     callback: AsyncCallback<S>,
+    before: Vec<String>,
+    after: Vec<String>,
+    filters: Option<Vec<HookFilter>>,
+}
+
+pub struct HookBuilder<S>
+where
+    S: Clone + Send,
+{
+    name: String,
+    callback: AsyncCallback<S>,
+    before: Vec<String>,
+    after: Vec<String>,
+    filters: Option<Vec<HookFilter>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum HookFilter {
+    Str(String),
+    Int(i64),
 }
 
 impl<S> Plugin<S>
@@ -813,7 +906,11 @@ where
                         match &self.wildcard_subscription {
                             Some(cb) => {
                                 let call = cb(plugin.clone(), params.clone());
-                                tokio::spawn(async move { call.await.unwrap() });
+                                tokio::spawn(async move {
+                                    if let Err(e) = call.await {
+                                        log::warn!("Wildcard notification handler error: '{}'", e)
+                                    }
+                                });
                             }
                             None => {}
                         };
@@ -823,7 +920,11 @@ where
                         match self.subscriptions.get(method) {
                             Some(cb) => {
                                 let call = cb(plugin.clone(), params.clone());
-                                tokio::spawn(async move { call.await.unwrap() });
+                                tokio::spawn(async move {
+                                    if let Err(e) = call.await {
+                                        log::warn!("Notification handler error: '{}'", e)
+                                    }
+                                });
                             }
                             None => {
                                 if self.wildcard_subscription.is_none() {
@@ -868,11 +969,19 @@ where
         method: String,
         v: serde_json::Value,
     ) -> Result<(), Error> {
+        // Modern has them inside object of same name.
+        // This is deprecated, scheduled for removal 26.09.
+        let mut params = match &v {
+            serde_json::Value::Object(map) => map.clone(),
+            _ => return Err(anyhow::anyhow!("params must be a JSON object")),
+        };
+        params.insert(method.clone(), json!(v));
+
         self.sender
             .send(json!({
                 "jsonrpc": "2.0",
                 "method": method,
-                "params": v,
+                "params": params,
             }))
             .await
             .context("sending custom notification")?;

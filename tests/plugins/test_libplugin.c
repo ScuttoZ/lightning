@@ -12,6 +12,7 @@ struct test_libplugin {
 	bool self_disable;
 	bool dont_shutdown;
 	u32 dynamic_opt;
+	const char **strarr;
 };
 
 static struct test_libplugin *get_test_libplugin(struct plugin *plugin)
@@ -45,6 +46,8 @@ static struct command_result *json_helloworld(struct command *cmd,
 					      const jsmntok_t *params)
 {
 	const char *name;
+	const char *response_buf;
+	const jsmntok_t *response;
 
 	if (!param(cmd, buf, params,
 		   p_opt("name", param_string, &name),
@@ -52,6 +55,12 @@ static struct command_result *json_helloworld(struct command *cmd,
 		return command_param_failed();
 
 	plugin_notify_message(cmd, LOG_INFORM, "Notification from %s", "json_helloworld");
+
+	response = jsonrpc_request_sync(cmd, cmd, "listpeers", NULL, &response_buf);
+	plugin_log(cmd->plugin, LOG_INFORM, "listpeers gave %zu tokens: %.*s",
+		   tal_count(response),
+		   json_tok_full_len(response),
+		   json_tok_full(response_buf, response));
 
 	if (!name)
 		return jsonrpc_get_datastore_binary(cmd,
@@ -189,6 +198,64 @@ static struct command_result *json_checkthis(struct command *cmd,
 	return send_outreq(req);
 }
 
+static struct command_result *spam_done(struct command *cmd, void *unused)
+{
+	return command_success(cmd, json_out_obj(cmd, NULL, NULL));
+}
+
+static struct command_result *spam_errcb(struct command *cmd,
+					 const char *method,
+					 const char *buf,
+					 const jsmntok_t *tok,
+					 void *unused)
+{
+	plugin_err(cmd->plugin, "%.*s",
+		   json_tok_full_len(tok),
+		   json_tok_full(buf, tok));
+}
+
+static struct command_result *json_spamcommand(struct command *cmd,
+					       const char *buf,
+					       const jsmntok_t *params)
+{
+	u64 *iterations;
+	struct request_batch *batch;
+
+	if (!param(cmd, buf, params,
+		   p_req("iterations", param_u64, &iterations),
+		   NULL))
+		return command_param_failed();
+
+	batch = request_batch_new(cmd, NULL, spam_errcb, spam_done, NULL);
+	for (size_t i = 0; i < *iterations; i++) {
+		struct out_req *req = add_to_batch(cmd, batch, "batching");
+		json_add_bool(req->js, "enable", true);
+		send_outreq(req);
+	}
+	return batch_done(cmd, batch);
+}
+
+static struct command_result *json_spamlistcommand(struct command *cmd,
+						   const char *buf,
+						   const jsmntok_t *params)
+{
+	u64 *iterations;
+	struct request_batch *batch;
+
+	if (!param(cmd, buf, params,
+		   p_req("iterations", param_u64, &iterations),
+		   NULL))
+		return command_param_failed();
+
+	batch = request_batch_new(cmd, NULL, spam_errcb, spam_done, NULL);
+	for (size_t i = 0; i < *iterations; i++) {
+		struct out_req *req = add_to_batch(cmd, batch, "listinvoices");
+		send_outreq(req);
+	}
+	return batch_done(cmd, batch);
+}
+
+
 static char *set_dynamic(struct plugin *plugin,
 			 const char *arg,
 			 bool check_only,
@@ -220,6 +287,13 @@ static const char *init(struct command *init_cmd,
 	if (tlp->somearg)
 		plugin_log(p, LOG_DBG, "somearg = %s", tlp->somearg);
 	tlp->somearg = tal_free(tlp->somearg);
+
+	for (size_t i = 0; i < tal_count(tlp->strarr); i++) {
+		plugin_log(p, LOG_DBG, "multiopt#%zu = %s",
+			   i, tlp->strarr[i]);
+	}
+	if (tlp->somearg)
+		plugin_log(p, LOG_DBG, "somearg = %s", tlp->somearg);
 
 	if (tlp->self_disable)
 		return "Disabled via selfdisable option";
@@ -262,6 +336,14 @@ static const struct plugin_command commands[] = { {
 		"checkthis",
 		json_checkthis,
 	},
+	{
+		"spamcommand",
+		json_spamcommand,
+	},
+	{
+		"spamlistcommand",
+		json_spamlistcommand,
+	},
 };
 
 static const char *before[] = { "dummy", NULL };
@@ -287,6 +369,25 @@ static const struct plugin_notification notifs[] = { {
 	}
 };
 
+static char *set_multi_string_option(struct plugin *plugin,
+				     const char *arg,
+				     bool check_only,
+				     const char ***arr)
+{
+	if (!check_only)
+		tal_arr_expand(arr, tal_strdup(*arr, arg));
+	return NULL;
+}
+
+static bool multi_string_jsonfmt(struct plugin *plugin, struct json_stream *js, const char *fieldname, const char ***arr)
+{
+	json_array_start(js, fieldname);
+	for (size_t i = 0; i < tal_count(*arr); i++)
+		json_add_string(js, NULL, (*arr)[i]);
+	json_array_end(js);
+	return true;
+}
+
 int main(int argc, char *argv[])
 {
 	setup_locale();
@@ -298,6 +399,7 @@ int main(int argc, char *argv[])
 	tlp->self_disable = false;
 	tlp->dont_shutdown = false;
 	tlp->dynamic_opt = 7;
+	tlp->strarr = tal_arr(tlp, const char *, 0);
 
 	plugin_main(argv, init, take(tlp), PLUGIN_RESTARTABLE, true, NULL,
 		    commands, ARRAY_SIZE(commands),
@@ -328,5 +430,11 @@ int main(int argc, char *argv[])
 					  "Set me!",
 					  set_dynamic, u32_jsonfmt,
 					  &tlp->dynamic_opt),
+		    plugin_option_multi("multiopt",
+					"string",
+					"Set me multiple times!",
+					set_multi_string_option,
+					multi_string_jsonfmt,
+					&tlp->strarr),
 		    NULL);
 }

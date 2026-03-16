@@ -5,23 +5,29 @@ on:
     branches:
       - "master"
   pull_request:
-
+    types: [opened, synchronize, edited]
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
-  # Makes the upload-artifact work more reliably at the cost
-  # of a bit of compile time.
-  RUST_PROFILE: release
+  # Reduce size, helps upload-artifact work more reliably
+  RUST_PROFILE: small
   SLOW_MACHINE: 1
-  CI_SERVER_URL: "http://35.239.136.52:3170"
+  # This is for the pytest-trackflaky:
+  # CI_SERVER_URL: "http://35.239.136.52:3170"
+  PYTEST_OPTS_BASE: "-vvv --junit-xml=report.xml --timeout=1800 --durations=10"
+  TEST_LOG_IGNORE_ERRORS: "1"
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   prebuild:
     name: Pre-build checks
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    if: |
+      github.event.action != 'edited' ||
+      contains(github.event.pull_request.body, 'Changelog')
     env:
       BOLTDIR: bolts
     strategy:
@@ -71,16 +77,21 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
           bash -x .github/scripts/setup.sh
-          pip install -U pip wheel poetry
-          poetry self add poetry-plugin-export
-          # Export and then use pip to install into the current env
-          poetry export -o /tmp/requirements.txt --without-hashes --with dev
-          pip install -r /tmp/requirements.txt
           # We're going to check BOLT quotes, so get the latest version
           git clone https://github.com/lightning/bolts.git ../${BOLTDIR}
       - name: Configure
@@ -88,16 +99,20 @@ jobs:
       - name: Check source
         env:
           VALGRIND: 0
-          PYTEST_OPTS: --timeout=1200
-        run: make check-source BASE_REF="origin/${{ github.base_ref }}"
-      - name: Check Generated Files have been updated
-        run: make check-gen-updated
-      - name: Check docs
-        run: make check-doc
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }}
+        run: |
+          uv run make -j $(nproc) check-source BASE_REF="origin/${{ github.base_ref }}" CARGO=false CC=devtools/cc-nobuild SUPPRESS_GENERATION=1
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-prebuild
+          path: report.xml
+          if-no-files-found: ignore
 
   compile:
-    name: Compile CLN ${{ matrix.cfg }}
-    runs-on: ubuntu-22.04
+    name: Build ${{ matrix.cfg }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs:
       - prebuild
@@ -108,19 +123,30 @@ jobs:
           - CFG: compile-gcc
             VALGRIND: 1
             COMPILER: gcc
+            DEBUG_BUILD: --enable-debugbuild
+          - CFG: compile-gcc-O1
+            VALGRIND: 1
+            COMPILER: gcc
+            COPTFLAGS_VAR: COPTFLAGS="-O1"
+            DEBUG_BUILD: --enable-debugbuild
           - CFG: compile-gcc-O3
             VALGRIND: 1
             COMPILER: gcc
             COPTFLAGS_VAR: COPTFLAGS="-O3 -Werror"
+            DEBUG_BUILD:
           # While we're at it let's try to compile with clang
           - CFG: compile-clang
             VALGRIND: 1
             COMPILER: clang
+            COPTFLAGS_VAR: COPTFLAGS="-O3"
+            DEBUG_BUILD: --enable-debugbuild
           - CFG: compile-clang-sanitizers
             COMPILER: clang
             ASAN: 1
             UBSAN: 1
             VALGRIND: 0
+            COPTFLAGS_VAR: COPTFLAGS="-O1"
+            DEBUG_BUILD:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -128,11 +154,25 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
           bash -x .github/scripts/setup.sh
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - run: sccache --zero-stats
 
       - name: Build
         env:
@@ -141,32 +181,80 @@ jobs:
           UBSAN: ${{ matrix.UBSAN }}
           VALGRIND: ${{ matrix.VALGRIND }}
           COMPAT: 1
-          CFG: ${{ matrix.CFG }}
+          RUSTC_WRAPPER: sccache
         run: |
           set -e
-          pip3 install --user pip wheel poetry
-          poetry self add poetry-plugin-export
-          poetry export -o requirements.txt --with dev --without-hashes
-          python3 -m pip install -r requirements.txt
-          ./configure --enable-debugbuild CC="$COMPILER" ${{ matrix.COPTFLAGS_VAR }}
+          ./configure ${{ matrix.DEBUG_BUILD }} CC="sccache $COMPILER" ${{ matrix.COPTFLAGS_VAR }}
 
-          make -j $(nproc) testpack.tar.bz2
+          uv run make -j $(nproc) testpack.tar.gz
 
           # Rename now so we don't clash
-          mv testpack.tar.bz2 cln-${CFG}.tar.bz2
-      - name: Check rust packages
-        run: cargo test --all
+          mv testpack.tar.gz cln-${{ matrix.CFG }}.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: cln-${{ matrix.CFG }}.tar.bz2
-          path: cln-${{ matrix.CFG }}.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
+          path: cln-${{ matrix.CFG }}.tar.gz
+
+  check-compiled-source:
+    runs-on: ubuntu-24.04
+    needs:
+      - compile
+    strategy:
+      matrix:
+        CFG: [compile-gcc]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
+
+      - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
+        run: |
+          bash -x .github/scripts/setup.sh
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - run: sccache --zero-stats
+
+      - name: Check
+        run: |
+          uv run eatmydata make -j $(nproc) check-source-bolt check-python check-gen-updated check-doc CARGO=false CC=devtools/cc-nobuild SUPPRESS_GENERATION=1
+      - name: Check rust packages
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo test --all
 
   check-units:
     # The unit test checks are not in the critical path (not dependent
     # on the integration tests), so run them with `valgrind`
     name: Run unit tests
-    runs-on: ubuntu-22.04
-    timeout-minutes: 30
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     env:
       BOLTDIR: bolts
     needs:
@@ -175,7 +263,7 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - CFG: compile-gcc
+          - CFG: compile-gcc-O1
             VALGRIND: 1
           - CFG: compile-clang-sanitizers
             VALGRIND: 0
@@ -186,34 +274,47 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
           bash -x .github/scripts/setup.sh
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq lowdown
-          pip install -U pip wheel poetry
-          poetry self add poetry-plugin-export
-          # Export and then use pip to install into the current env
-          poetry export -o /tmp/requirements.txt --without-hashes --with dev
-          pip install -r /tmp/requirements.txt
           # We're going to check BOLT quotes, so get the latest version
           git clone https://github.com/lightning/bolts.git ../${BOLTDIR}
 
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-${{ matrix.CFG }}.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
+
+      # external/Makefile uses `TARGET_DIR := external/build-$(shell ${CC} -dumpmachine)` so we need sccache to "work" for that.
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Check
         run: |
-          tar -xaf cln-${{ matrix.CFG }}.tar.bz2
-          eatmydata make -j $(nproc) check-units installcheck VALGRIND=${{ matrix.VALGRIND }}
+          uv run eatmydata make -j $(nproc) check-units installcheck VALGRIND=${{ matrix.VALGRIND }} CARGO=false CC=devtools/cc-nobuild SUPPRESS_GENERATION=1
 
   check-fuzz:
     name: Run fuzz regression tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs:
       - prebuild
     steps:
@@ -223,56 +324,225 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
           bash -x .github/scripts/setup.sh
-          pip install -U pip wheel poetry
-          poetry self add poetry-plugin-export
-          # Export and then use pip to install into the current env
-          poetry export -o /tmp/requirements.txt --without-hashes --with dev
-          pip install -r /tmp/requirements.txt
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - run: sccache --zero-stats
 
       - name: Build
+        env:
+          RUSTC_WRAPPER: sccache
         run: |
-          ./configure --enable-debugbuild --enable-fuzzing --enable-address-sanitizer --enable-ub-sanitizer --disable-valgrind CC=clang
-          make -j $(nproc) check-fuzz
+          ./configure --enable-debugbuild --enable-fuzzing --enable-address-sanitizer --enable-ub-sanitizer --disable-valgrind CC="sccache clang"
+          uv run make -j $(nproc) check-fuzz
 
-  integration:
-    name: Test CLN ${{ matrix.name }}
-    runs-on: ubuntu-22.04
+  check-downgrade:
+    name: Check we can downgrade the node
+    runs-on: ubuntu-24.04
+    needs:
+      - check-compiled-source
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - CFG: compile-gcc
+            TEST_DB_PROVIDER: sqlite3
+            TEST_NETWORK: regtest
+            VALGRIND: 1
+          - CFG: compile-gcc
+            TEST_DB_PROVIDER: postgres
+            TEST_NETWORK: regtest
+          - CFG: compile-gcc
+            TEST_DB_PROVIDER: sqlite3
+            TEST_NETWORK: liquid-regtest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
+
+      - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
+        run: |
+          bash -x .github/scripts/setup.sh
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Fetch and unpack previous CLN
+        run: |
+          mkdir old-cln
+          cd old-cln
+          wget https://github.com/ElementsProject/lightning/releases/download/v25.12/clightning-v25.12-ubuntu-24.04-amd64.tar.xz
+          tar -xaf clightning-v25.12-ubuntu-24.04-amd64.tar.xz
+
+      - name: Switch network
+        if: ${{ matrix.TEST_NETWORK == 'liquid-regtest' }}
+        run: |
+          # Loading the network from config.vars rather than the envvar is a terrible idea...
+          sed -i 's/TEST_NETWORK=regtest/TEST_NETWORK=liquid-regtest/g' config.vars
+          cat config.vars
+          touch -d yesterday config.vars
+
+      - name: Test
+        env:
+          SLOW_MACHINE: 1
+          TEST_DEBUG: 1
+          TEST_DB_PROVIDER: ${{ matrix.TEST_DB_PROVIDER }}
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
+          LIGHTNINGD_POSTGRES_NO_VACUUM: 1
+          VALGRIND: ${{ matrix.VALGRIND }}
+          PREV_LIGHTNINGD: old-cln/usr/bin/lightningd
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }}
+        run: |
+          env
+          cat config.vars
+          sg wireshark "uv run eatmydata pytest tests/test_downgrade.py -n $(($(nproc) + 1)) ${PYTEST_OPTS}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-check-downgrade-${{ matrix.TEST_DB_PROVIDER }}-${{ matrix.TEST_NETWORK }}
+          path: report.xml
+          if-no-files-found: ignore
+
+  # For speed, we run a first integration test using gcc and sqlite3, in 6 parts.
+  # If that passes, we move on to the more complete integration tests.
+  first-integration:
+    name: First Integration Tests (${{ matrix.GROUP }}/${{ matrix.GROUP_COUNT }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RUST_PROFILE: release  # Has to match the one in the compile step
-      PYTEST_OPTS: --timeout=1200
+      RUST_PROFILE: small # Has to match the one in the compile step
     needs:
       - compile
     strategy:
       fail-fast: false
       matrix:
+        CFG: [compile-gcc]
+        GROUP: [1,2,3,4,5,6]
+        GROUP_COUNT: [6]
+        TEST_DB_PROVIDER: [sqlite3]
+        COMPILER: [gcc]
+        TEST_NETWORK: [regtest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
+
+      - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
+        run: |
+          bash -x .github/scripts/setup.sh
+
+      - name: Download build
+        uses: actions/download-artifact@v4
+        with:
+          name: cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
+
+      - name: Test
+        env:
+          COMPILER: ${{ matrix.COMPILER }}
+          EXPERIMENTAL_DUAL_FUND: ${{ matrix.EXPERIMENTAL_DUAL_FUND }}
+          EXPERIMENTAL_SPLICING: ${{ matrix.EXPERIMENTAL_SPLICING }}
+          COMPAT: 1
+          SLOW_MACHINE: 1
+          TEST_DEBUG: 1
+          TEST_DB_PROVIDER: ${{ matrix.TEST_DB_PROVIDER }}
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
+          LIGHTNINGD_POSTGRES_NO_VACUUM: 1
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }} --test-group-random-seed=42
+        run: |
+          env
+          cat config.vars
+          VALGRIND=0 sg wireshark "uv run eatmydata pytest tests/ -n $(($(nproc) + 1)) ${PYTEST_OPTS} --test-group=${{ matrix.GROUP }} --test-group-count=${{ matrix.GROUP_COUNT }}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-first-integration-${{ matrix.GROUP }}
+          path: report.xml
+          if-no-files-found: ignore
+
+  full-integration:
+    name: Test CLN ${{ matrix.name }} Full Integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      RUST_PROFILE: small # Has to match the one in the compile step
+    needs:
+      - first-integration
+    strategy:
+      fail-fast: false
+      matrix:
         include:
-          - NAME: gcc
-            CFG: compile-gcc
-            TEST_DB_PROVIDER: sqlite3
-            COMPILER: gcc
-            TEST_NETWORK: regtest
-          # While we're at it let's try to compile with clang
-          - NAME: clang
-            CFG: compile-clang
-            TEST_DB_PROVIDER: sqlite3
-            COMPILER: clang
-            TEST_NETWORK: regtest
+          # We do a clang run, but with minimum BTC version, to avoid YA test run.
           # And of course we want to test postgres too
           - NAME: postgres
-            CFG: compile-gcc
+            CFG: compile-gcc-O3
             COMPILER: gcc
             TEST_DB_PROVIDER: postgres
             TEST_NETWORK: regtest
           # And don't forget about elements (like cdecker did when
           # reworking the CI...)
           - NAME: liquid
-            CFG: compile-gcc
+            CFG: compile-gcc-O3
             COMPILER: gcc
             TEST_NETWORK: liquid-regtest
             TEST_DB_PROVIDER: sqlite3
@@ -285,7 +555,7 @@ jobs:
             EXPERIMENTAL_DUAL_FUND: 1
           # And splicing!
           - NAME: splicing
-            CFG: compile-gcc
+            CFG: compile-gcc-O3
             TEST_DB_PROVIDER: sqlite3
             COMPILER: gcc
             TEST_NETWORK: regtest
@@ -297,28 +567,33 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
-        run: |
-          pip3 install --user pip wheel poetry
-          poetry install
-
-      - name: Install bitcoind
         env:
           TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
-        run: .github/scripts/install-bitcoind.sh
+        run: |
+          bash -x .github/scripts/setup.sh
 
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-${{ matrix.CFG }}.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
 
-      - name: Unpack pre-built CLN
-        env:
-          CFG: ${{ matrix.CFG }}
+      - name: Unpack prebuilt binaries
         run: |
-          tar -xaf cln-${CFG}.tar.bz2
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
 
       - name: Switch network
         if: ${{ matrix.TEST_NETWORK == 'liquid-regtest' }}
@@ -333,52 +608,38 @@ jobs:
           EXPERIMENTAL_DUAL_FUND: ${{ matrix.EXPERIMENTAL_DUAL_FUND }}
           EXPERIMENTAL_SPLICING: ${{ matrix.EXPERIMENTAL_SPLICING }}
           COMPAT: 1
-          CFG: ${{ matrix.CFG }}
           SLOW_MACHINE: 1
-          PYTEST_PAR: 10
           TEST_DEBUG: 1
           TEST_DB_PROVIDER: ${{ matrix.TEST_DB_PROVIDER }}
           TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
           LIGHTNINGD_POSTGRES_NO_VACUUM: 1
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }}
         run: |
           env
           cat config.vars
-          VALGRIND=0 poetry run eatmydata pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
+          VALGRIND=0 sg wireshark "uv run eatmydata pytest tests/ -n $(($(nproc) + 1)) ${PYTEST_OPTS}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-integration-${{ matrix.name }}
+          path: report.xml
+          if-no-files-found: ignore
 
   integration-valgrind:
-    name: Valgrind Test CLN ${{ matrix.name }}
-    runs-on: ubuntu-22.04
+    name: Valgrind Test CLN (${{ matrix.GROUP }}/${{ matrix.GROUP_COUNT }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RUST_PROFILE: release  # Has to match the one in the compile step
-      CFG: compile-gcc
-      PYTEST_OPTS: --test-group-random-seed=42 --timeout=1800
+      RUST_PROFILE: small # Has to match the one in the compile step
     needs:
-      - compile
+      - check-compiled-source
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - NAME: Valgrind (01/10)
-            PYTEST_OPTS: --test-group=1  --test-group-count=10
-          - NAME: Valgrind (02/10)
-            PYTEST_OPTS: --test-group=2  --test-group-count=10
-          - NAME: Valgrind (03/10)
-            PYTEST_OPTS: --test-group=3  --test-group-count=10
-          - NAME: Valgrind (04/10)
-            PYTEST_OPTS: --test-group=4  --test-group-count=10
-          - NAME: Valgrind (05/10)
-            PYTEST_OPTS: --test-group=5  --test-group-count=10
-          - NAME: Valgrind (06/10)
-            PYTEST_OPTS: --test-group=6  --test-group-count=10
-          - NAME: Valgrind (07/10)
-            PYTEST_OPTS: --test-group=7  --test-group-count=10
-          - NAME: Valgrind (08/10)
-            PYTEST_OPTS: --test-group=8  --test-group-count=10
-          - NAME: Valgrind (09/10)
-            PYTEST_OPTS: --test-group=9  --test-group-count=10
-          - NAME: Valgrind (10/10)
-            PYTEST_OPTS: --test-group=10 --test-group-count=10
+        CFG: [compile-gcc-O1]
+        GROUP: [1,2,3,4,5,6,7,8,9,10,11,12]
+        GROUP_COUNT: [12]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -386,68 +647,63 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -yyq valgrind
-          pip3 install --user pip wheel poetry
-          poetry install
-
-      - name: Install bitcoind
-        run: .github/scripts/install-bitcoind.sh
+          bash -x .github/scripts/setup.sh
 
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-compile-gcc.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
 
-      - name: Unpack build
-        run: tar -xvjf cln-compile-gcc.tar.bz2
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
 
       - name: Test
         env:
           SLOW_MACHINE: 1
           TEST_DEBUG: 1
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }} --test-group-random-seed=42
         run: |
-          VALGRIND=1 poetry run eatmydata pytest tests/ -vvv -n 3 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
+          VALGRIND=1 sg wireshark "uv run eatmydata pytest tests/ -n $(($(nproc) + 1)) ${PYTEST_OPTS} --test-group=${{ matrix.GROUP }} --test-group-count=${{ matrix.GROUP_COUNT }}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-integration-valgrind-${{ matrix.GROUP }}
+          path: report.xml
+          if-no-files-found: ignore
 
   integration-sanitizers:
-    name: Sanitizers Test CLN
-    runs-on: ubuntu-22.04
+    name: ASan/UBSan (${{ matrix.GROUP }}/${{ matrix.GROUP_COUNT }})
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RUST_PROFILE: release
+      RUST_PROFILE: small
       SLOW_MACHINE: 1
       TEST_DEBUG: 1
-      PYTEST_OPTS: --test-group-random-seed=42 --timeout=1800
     needs:
-      - compile
+      - check-compiled-source
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - NAME: ASan/UBSan (01/10)
-            PYTEST_OPTS: --test-group=1  --test-group-count=10
-          - NAME: ASan/UBSan (02/10)
-            PYTEST_OPTS: --test-group=2  --test-group-count=10 -n 1
-          - NAME: ASan/UBSan (03/10)
-            PYTEST_OPTS: --test-group=3  --test-group-count=10
-          - NAME: ASan/UBSan (04/10)
-            PYTEST_OPTS: --test-group=4  --test-group-count=10
-          - NAME: ASan/UBSan (05/10)
-            PYTEST_OPTS: --test-group=5  --test-group-count=10
-          - NAME: ASan/UBSan (06/10)
-            PYTEST_OPTS: --test-group=6  --test-group-count=10
-          - NAME: ASan/UBSan (07/10)
-            PYTEST_OPTS: --test-group=7  --test-group-count=10
-          - NAME: ASan/UBSan (08/10)
-            PYTEST_OPTS: --test-group=8  --test-group-count=10
-          - NAME: ASan/UBSan (09/10)
-            PYTEST_OPTS: --test-group=9  --test-group-count=10
-          - NAME: ASan/UBSan (10/10)
-            PYTEST_OPTS: --test-group=10 --test-group-count=10
+        CFG: [compile-clang-sanitizers]
+        GROUP: [1,2,3,4,5,6]
+        GROUP_COUNT: [6]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -455,41 +711,59 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
           bash -x .github/scripts/setup.sh
-          set -e
-          pip3 install --user wheel poetry
-          poetry install --with dev --no-root
-
-      - name: Install bitcoind
-        run: .github/scripts/install-bitcoind.sh
 
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-compile-clang-sanitizers.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
 
-      - name: Unpack build
-        run: tar -xvjf cln-compile-clang-sanitizers.tar.bz2
+      - name: Unpack prebuilt binaries
+        run: |
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
 
       - name: Test
+        env:
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }} --test-group-random-seed=42 
         run: |
-          poetry run eatmydata pytest tests/ -vvv -n 2 ${PYTEST_OPTS}  ${{ matrix.PYTEST_OPTS }}
+          sg wireshark "uv run eatmydata pytest tests/ -n $(($(nproc) + 1)) ${PYTEST_OPTS} --test-group=${{ matrix.GROUP }} --test-group-count=${{ matrix.GROUP_COUNT }}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-integration-sanitizers-${{ matrix.GROUP }}
+          path: report.xml
+          if-no-files-found: ignore
 
   update-docs-examples:
     name: Update examples in doc schemas (disabled temporarily!)
     if: false
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      matrix:
+        CFG: [compile-gcc]
     env:
       VALGRIND: 0
       GENERATE_EXAMPLES: 1
-      PYTEST_OPTS: --timeout=1200
       TEST_NETWORK: regtest
     needs:
       - compile
@@ -499,36 +773,50 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
+
       - name: Install dependencies
         run: |
           bash -x .github/scripts/setup.sh
-          pip install -U pip wheel poetry
-          poetry self add poetry-plugin-export
-          poetry export -o /tmp/requirements.txt --without-hashes --with dev
-          pip install -r /tmp/requirements.txt
-      - name: Install bitcoind
-        env:
-          TEST_NETWORK: regtest
-        run: .github/scripts/install-bitcoind.sh
+
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-compile-gcc.tar.bz2
-      - name: Unpack pre-built CLN
+          name: cln-${{ matrix.CFG }}.tar.gz
+      - name: Unpack prebuilt binaries
         run: |
-          tar -xaf cln-compile-gcc.tar.bz2
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
+
       - name: Test
+        env:
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }}
         run: |
-          eatmydata make -j $(nproc) check-doc-examples
+          uv run eatmydata make -j $(($(nproc) + 1)) check-doc-examples CARGO=false CC=devtools/cc-nobuild SUPPRESS_GENERATION=1
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-update-docs-examples
+          path: report.xml
+          if-no-files-found: ignore
 
   min-btc-support:
     name: Test minimum supported BTC v${{ matrix.MIN_BTC_VERSION }} with ${{ matrix.NAME }}
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      RUST_PROFILE: release  # Has to match the one in the compile step
-      PYTEST_OPTS: --timeout=1200
+      RUST_PROFILE: small # Has to match the one in the compile step
     needs:
       - compile
     strategy:
@@ -540,7 +828,7 @@ jobs:
             TEST_DB_PROVIDER: sqlite3
             COMPILER: clang
             TEST_NETWORK: regtest
-            MIN_BTC_VERSION: '25.0'
+            MIN_BTC_VERSION: "25.0"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -548,12 +836,21 @@ jobs:
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/ci-cache
+          key: apt-${{ runner.os }}
 
       - name: Install dependencies
+        env:
+          TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
         run: |
-          pip3 install --user pip wheel poetry
-          poetry install
+          bash -x .github/scripts/setup.sh
 
       - name: Download Bitcoin Core
         run: wget "https://bitcoincore.org/bin/bitcoin-core-${{ matrix.MIN_BTC_VERSION }}/bitcoin-${{ matrix.MIN_BTC_VERSION }}-x86_64-linux-gnu.tar.gz"
@@ -570,74 +867,67 @@ jobs:
       - name: Download build
         uses: actions/download-artifact@v4
         with:
-          name: cln-${{ matrix.CFG }}.tar.bz2
+          name: cln-${{ matrix.CFG }}.tar.gz
 
-      - name: Unpack pre-built CLN
-        env:
-          CFG: ${{ matrix.CFG }}
+      - name: Unpack prebuilt binaries
         run: |
-          tar -xaf cln-${CFG}.tar.bz2
+          git submodule sync && git submodule update --init --recursive
+          # Make sure source appears older than what we're about to unpack
+          find . -type f -print0 | xargs -0 touch -d yesterday
+          tar xaf cln-${{ matrix.CFG }}.tar.gz
 
       - name: Test
         env:
           COMPILER: ${{ matrix.COMPILER }}
           COMPAT: 1
-          CFG: ${{ matrix.CFG }}
           SLOW_MACHINE: 1
-          PYTEST_PAR: 10
           TEST_DEBUG: 1
           TEST_DB_PROVIDER: ${{ matrix.TEST_DB_PROVIDER }}
           TEST_NETWORK: ${{ matrix.TEST_NETWORK }}
           LIGHTNINGD_POSTGRES_NO_VACUUM: 1
+          PYTEST_OPTS: ${{ env.PYTEST_OPTS_BASE }}
         run: |
           env
           cat config.vars
-          VALGRIND=0 poetry run eatmydata pytest tests/ -vvv -n ${PYTEST_PAR} ${PYTEST_OPTS}
+          VALGRIND=0 sg wireshark "uv run eatmydata pytest tests/ -n $(($(nproc) + 1)) ${PYTEST_OPTS}"
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-min-btc-support-${{ matrix.NAME }}
+          path: report.xml
+          if-no-files-found: ignore
 
-  check-flake:
-    name: Check Nix Flake
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: true
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          submodules: 'recursive'
-      - name: Check Nix flake inputs
-        uses: DeterminateSystems/flake-checker-action@v8
-      - name: Install Nix
-        uses: cachix/install-nix-action@V27
-        with:
-          nix_path: nixpkgs=channel:nixos-24.05
-      - name: Check flake
-        run: nix flake check .?submodules=1#
 
   gather:
     # A dummy task that depends on the full matrix of tests, and
     # signals successful completion. Used for the PR status to pass
     # before merging.  Needs to run even if they failed!
     name: CI completion
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs:
-      - integration
+      - first-integration
+      - full-integration
       - check-units
       - integration-valgrind
       - integration-sanitizers
       - min-btc-support
-      - check-flake
+      - check-downgrade
+      - check-compiled-source
     if: ${{ always() }}
     steps:
       - name: Complete
         env:
-          JOB_NAMES: "INTEGRATION CHECK_UNITS VALGRIND SANITIZERS BTC FLAKE"
-          INTEGRATION: ${{ needs.integration.result }}
+          JOB_NAMES: "FIRST_INTEGRATION FULL_INTEGRATION CHECK_UNITS VALGRIND SANITIZERS BTC CHECK_COMPILED_SOURCE"
+          FIRST_INTEGRATION: ${{ needs['first-integration'].result }}
+          FULL_INTEGRATION: ${{ needs['full-integration'].result }}
           CHECK_UNITS: ${{ needs['check-units'].result }}
           VALGRIND: ${{ needs['integration-valgrind'].result }}
           SANITIZERS: ${{ needs['integration-sanitizers'].result }}
           DOCS: ${{ needs['update-docs-examples'].result }}
           BTC: ${{ needs['min-btc-support'].result }}
-          FLAKE: ${{ needs['check-flake'].result }}
+          CHECK_DOWNGRADE: ${{ needs['check-downgrade'].result }}
+          CHECK_COMPILED_SOURCE: ${{ needs['check-compiled-source'].result }}
         run: |
           failed=""
           for name in $JOB_NAMES; do

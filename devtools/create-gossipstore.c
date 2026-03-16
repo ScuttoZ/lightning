@@ -4,8 +4,9 @@
 #include <ccan/opt/opt.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <common/gossip_store.h>
+#include <common/gossip_store_wiregen.h>
+#include <common/utils.h>
 #include <fcntl.h>
-#include <gossipd/gossip_store_wiregen.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -47,7 +48,8 @@ static void write_outmsg(int outfd, const u8 *outmsg, u32 timestamp)
 {
 	struct gossip_hdr hdr;
 
-	hdr.len = cpu_to_be32(tal_count(outmsg));
+	hdr.flags = CPU_TO_BE16(GOSSIP_STORE_COMPLETED_BIT);
+	hdr.len = cpu_to_be16(tal_count(outmsg));
 	hdr.crc = cpu_to_be32(crc32c(timestamp, outmsg, tal_count(outmsg)));
 	hdr.timestamp = cpu_to_be32(timestamp);
 

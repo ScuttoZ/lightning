@@ -12,7 +12,9 @@
 
 void init(int *argc, char ***argv)
 {
-	common_setup("fuzzer");
+	/* Don't call this if we're in unit-test mode, as libfuzz.c does it */
+	if (!tmpctx)
+		common_setup("fuzzer");
 	chainparams = chainparams_for_network("bitcoin");
 }
 
@@ -54,7 +56,7 @@ void run(const uint8_t *data, size_t size)
 	if (!(amount_sat_add(&funding, to_us, to_them)))
 		return;
 	/* .. And < max_btc as we assert it's not nonsensical! */
-	max = AMOUNT_SAT((u32)WALLY_SATOSHI_PER_BTC * WALLY_BTC_MAX);
+	max = AMOUNT_SAT((u64)WALLY_SATOSHI_PER_BTC * WALLY_BTC_MAX);
 	if (amount_sat_greater(funding, max)) {
 		funding = max;
 		to_us = amount_sat_div(max, 2);

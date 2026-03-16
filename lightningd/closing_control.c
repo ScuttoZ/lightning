@@ -1,43 +1,27 @@
 #include "config.h"
-#include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
-#include <ccan/cast/cast.h>
-#include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <closingd/closingd_wiregen.h>
-#include <common/close_tx.h>
 #include <common/closing_fee.h>
-#include <common/configdir.h>
-#include <common/fee_states.h>
-#include <common/initial_commit_tx.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/timeout.h>
-#include <common/utils.h>
-#include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/permissions.h>
 #include <inttypes.h>
-#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/closing_control.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
+#include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/log.h>
 #include <lightningd/opening_common.h>
-#include <lightningd/options.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_fd.h>
-#include <lightningd/subd.h>
 #include <openingd/dualopend_wiregen.h>
-#include <wally_bip32.h>
 
 struct close_command {
 	/* Inside struct lightningd close_commands. */
@@ -54,18 +38,7 @@ static void
 resolve_one_close_command(struct close_command *cc, bool cooperative,
 			  const struct bitcoin_tx **close_txs)
 {
-	assert(tal_count(close_txs));
 	struct json_stream *result = json_stream_success(cc->cmd);
-	const struct bitcoin_tx *close_tx = close_txs[tal_count(close_txs) - 1];
-
-	if (command_deprecated_out_ok(cc->cmd, "tx", "v24.11", "v25.11"))
-		json_add_tx(result, "tx", close_tx);
-	if (!invalid_last_tx(close_tx)) {
-		struct bitcoin_txid txid;
-		bitcoin_txid(close_tx, &txid);
-		if (command_deprecated_out_ok(cc->cmd, "txid", "v24.11", "v25.11"))
-			json_add_txid(result, "txid", &txid);
-	}
 
 	json_array_start(result, "txs");
 	for (int i = 0; i < tal_count(close_txs); i++)
@@ -527,19 +500,6 @@ void peer_start_closingd(struct channel *channel, struct peer_fd *peer_fd)
 	/* We don't expect a response: it will give us feedback on
 	 * signatures sent and received, then closing_complete. */
 	subd_send_msg(channel->owner, take(initmsg));
-}
-
-static struct command_result *param_outpoint(struct command *cmd,
-					     const char *name,
-					     const char *buffer,
-					     const jsmntok_t *tok,
-					     struct bitcoin_outpoint **outp)
-{
-	*outp = tal(cmd, struct bitcoin_outpoint);
-	if (json_to_outpoint(buffer, tok, *outp))
-		return NULL;
-	return command_fail_badparam(cmd, name, buffer, tok,
-				     "should be a txid:outnum");
 }
 
 static struct command_result *param_feerate_range(struct command *cmd,

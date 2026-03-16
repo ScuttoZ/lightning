@@ -1,8 +1,11 @@
 #! /usr/bin/make
 
 WALLET_LIB_SRC :=		\
+	wallet/account_migration.c \
+	wallet/datastore.c 	\
 	wallet/db.c		\
 	wallet/invoices.c	\
+	wallet/migrations.c	\
 	wallet/psbt_fixup.c	\
 	wallet/txfilter.c	\
 	wallet/wallet.c		\
@@ -30,11 +33,18 @@ ALL_C_HEADERS += $(WALLET_HDRS)
 # The following files contain SQL-annotated statements that we need to extact
 WALLET_SQL_FILES := 			\
 	$(DB_SQL_FILES)			\
+	wallet/account_migration.c	\
 	wallet/db.c 			\
+	wallet/datastore.c 		\
 	wallet/invoices.c		\
+	wallet/migrations.c 		\
 	wallet/wallet.c 		\
 	wallet/test/run-db.c		\
 	wallet/test/run-wallet.c	\
+	wallet/test/run-chain_moves_duplicate-detect.c	\
+	wallet/test/run-migrate_remove_chain_moves_duplicates.c \
+	tools/lightning-downgrade.c \
+
 
 wallet/statements_gettextgen.po: $(WALLET_SQL_FILES) $(FORCE)
 	@if $(call SHA256STAMP_CHANGED); then \

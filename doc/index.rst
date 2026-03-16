@@ -16,6 +16,7 @@ Core Lightning Documentation
    addpsbtoutput <addpsbtoutput.7.md>
    askrene-age <askrene-age.7.md>
    askrene-bias-channel <askrene-bias-channel.7.md>
+   askrene-bias-node <askrene-bias-node.7.md>
    askrene-create-channel <askrene-create-channel.7.md>
    askrene-create-layer <askrene-create-layer.7.md>
    askrene-disable-node <askrene-disable-node.7.md>
@@ -38,14 +39,13 @@ Core Lightning Documentation
    bkpr-listbalances <bkpr-listbalances.7.md>
    bkpr-listincome <bkpr-listincome.7.md>
    blacklistrune <blacklistrune.7.md>
+   cancelrecurringinvoice <cancelrecurringinvoice.7.md>
    check <check.7.md>
    checkmessage <checkmessage.7.md>
    checkrune <checkrune.7.md>
+   clnrest-register-path <clnrest-register-path.7.md>
    close <close.7.md>
    commando <commando.7.md>
-   commando-blacklist <commando-blacklist.7.md>
-   commando-listrunes <commando-listrunes.7.md>
-   commando-rune <commando-rune.7.md>
    connect <connect.7.md>
    createinvoice <createinvoice.7.md>
    createonion <createonion.7.md>
@@ -53,10 +53,10 @@ Core Lightning Documentation
    datastore <datastore.7.md>
    datastoreusage <datastoreusage.7.md>
    decode <decode.7.md>
-   decodepay <decodepay.7.md>
    deldatastore <deldatastore.7.md>
    delforward <delforward.7.md>
    delinvoice <delinvoice.7.md>
+   delnetworkevent <delnetworkevent.7.md>
    delpay <delpay.7.md>
    deprecations <deprecations.7.md>
    dev-forget-channel <dev-forget-channel.7.md>
@@ -68,6 +68,7 @@ Core Lightning Documentation
    enableoffer <enableoffer.7.md>
    exposesecret <exposesecret.7.md>
    feerates <feerates.7.md>
+   fetchbip353 <fetchbip353.7.md>
    fetchinvoice <fetchinvoice.7.md>
    fundchannel <fundchannel.7.md>
    fundchannel_cancel <fundchannel_cancel.7.md>
@@ -87,12 +88,15 @@ Core Lightning Documentation
    invoicerequest <invoicerequest.7.md>
    keysend <keysend.7.md>
    lightning-cli <lightning-cli.1.md>
+   lightning-downgrade <lightning-downgrade.8.md>
    lightning-hsmtool <lightning-hsmtool.8.md>
    lightning-reckless <lightning-reckless.1.md>
    lightningd <lightningd.8.md>
    lightningd-config <lightningd-config.5.md>
    lightningd-rpc <lightningd-rpc.7.md>
    listaddresses <listaddresses.7.md>
+   listchainmoves <listchainmoves.7.md>
+   listchannelmoves <listchannelmoves.7.md>
    listchannels <listchannels.7.md>
    listclosedchannels <listclosedchannels.7.md>
    listconfigs <listconfigs.7.md>
@@ -102,6 +106,7 @@ Core Lightning Documentation
    listhtlcs <listhtlcs.7.md>
    listinvoicerequests <listinvoicerequests.7.md>
    listinvoices <listinvoices.7.md>
+   listnetworkevents <listnetworkevents.7.md>
    listnodes <listnodes.7.md>
    listoffers <listoffers.7.md>
    listpays <listpays.7.md>
@@ -144,6 +149,7 @@ Core Lightning Documentation
    showrunes <showrunes.7.md>
    signinvoice <signinvoice.7.md>
    signmessage <signmessage.7.md>
+   signmessagewithkey <signmessagewithkey.7.md>
    signpsbt <signpsbt.7.md>
    splice_init <splice_init.7.md>
    splice_signed <splice_signed.7.md>

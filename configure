@@ -13,7 +13,7 @@ ARCH=$(uname -m)
 if [ "$OS-$ARCH" = "Darwin-arm64" ]; then
 CPATH=/opt/homebrew/include
 LIBRARY_PATH=/opt/homebrew/lib
-export PKG_CONFIG_PATH=/opt/homebrew/opt/sqlite/lib/pkgconfig
+export PKG_CONFIG_PATH=${PKG_CONFIG_PATH}:/opt/homebrew/opt/sqlite/lib/pkgconfig
 else
 CPATH=/usr/local/lib
 LIBRARY_PATH=/usr/local/lib
@@ -82,6 +82,24 @@ default_python()
     done
 }
 
+# We want GNU sed, which, among other things, recognizes '\t'.
+# We don't want to get confused with some random program called gsed,
+# so we actually test.
+default_sed()
+{
+    SED_BINS="gsed sed"
+    for s in $SED_BINS; do
+        if [ "$(which $s)" != "" ] ; then
+            if [ "$(printf x | $s 's/x/\t/')" = "	" ]; then
+		echo "$s"
+                return
+            fi
+        fi
+    done
+    echo "No valid sed found?" >&2
+    exit 1
+}
+
 # Takes PYTHON var
 default_pytest()
 {
@@ -134,7 +152,7 @@ default_valgrind_setting()
 
 default_rust_setting()
 {
-    if cargo --version > /dev/null 2>&1 && rustfmt --version >/dev/null 2>&1; then
+    if cargo --version > /dev/null 2>&1; then
 	echo 1
     else
 	echo 0
@@ -148,7 +166,20 @@ set_defaults()
     # which matters since you might explicitly set of these blank.
     PREFIX=${PREFIX:-/usr/local}
     CC=${CC:-cc}
-    CDEBUGFLAGS=${CDEBUGFLAGS--std=gnu11 -g -fstack-protector-strong}
+            # Detect macOS and use appropriate debug flags for libbacktrace compatibility
+    if [ "$(uname -s)" = "Darwin" ]; then
+        # Always override to avoid DWARF 5
+        CDEBUGFLAGS="-std=gnu11 -g -gdwarf-4 -fno-standalone-debug -fstack-protector-strong"
+        # Set SDKROOT for macOS
+        SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+
+        # Optional: confirm dsymutil is available
+        if ! command -v dsymutil >/dev/null 2>&1; then
+            echo "Warning: dsymutil not found. Install Xcode Command Line Tools for better debug support."
+        fi
+    else
+        CDEBUGFLAGS=${CDEBUGFLAGS--std=gnu11 -g -fstack-protector-strong}
+    fi
     DEBUGBUILD=${DEBUGBUILD:-0}
     COMPAT=${COMPAT:-1}
     STATIC=${STATIC:-0}
@@ -171,14 +202,25 @@ set_defaults()
 	FUZZFLAGS="-fsanitize=fuzzer-no-link -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"
 	CSANFLAGS="$CSANFLAGS $FUZZFLAGS"
     fi
-    echo CSANFLAGS = $CSANFLAGS
     PYTHON=${PYTHON-$(default_python)}
+    SED=${SED-$(default_sed)}
     PYTEST=${PYTEST-$(default_pytest $PYTHON)}
     COPTFLAGS=${COPTFLAGS-$(default_coptflags "$DEBUGBUILD")}
     CONFIGURATOR_CC=${CONFIGURATOR_CC-$CC}
     VALGRIND=${VALGRIND:-$(default_valgrind_setting)}
     TEST_NETWORK=${TEST_NETWORK:-regtest}
     RUST=${RUST:-$(default_rust_setting)}
+}
+
+# Given CC and FLAGS do we support -ffunction-sections and --gc-sections?
+have_function_sections()
+{
+    # This gets removed automatically on exit!
+    TMPCFILE=$CONFIG_VAR_FILE.$$.c
+    TMPOBJFILE=$CONFIG_VAR_FILE.$$.o
+    
+    echo "int foo(void); int foo(void) { return 0; }" > $TMPCFILE
+    $1 $2 -ffunction-sections -Wl,--gc-sections -c $TMPCFILE -o $TMPOBJFILE
 }
 
 usage()
@@ -194,10 +236,14 @@ usage()
     usage_with_default "CWARNFLAGS" "$DEFAULT_CWARNFLAGS"
     usage_with_default "COPTFLAGS" "$DEFAULT_COPTFLAGS"
     usage_with_default "CDEBUGFLAGS" "$CDEBUGFLAGS"
+    if [ "$(uname -s)" = "Darwin" ]; then
+        echo "    Note: On macOS, -g is used instead of -g3 for libbacktrace compatibility"
+    fi
     usage_with_default "CONFIGURATOR_CC" "${CONFIGURATOR_CC:-$CC}"
     echo "    To override compile line for configurator itself"
     usage_with_default "PYTEST" "$PYTEST"
     usage_with_default "VALGRIND" "$VALGRIND"
+    usage_with_default "SED" "$SED"
 
     echo "Options include:"
     usage_with_default "--prefix=" "$PREFIX"
@@ -319,10 +365,19 @@ EOF
     done
 fi
 
+# We call this first, so we can make sure configurator runs with it as a sanity check!
+if have_function_sections $CC "${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS"; then
+    HAVE_FUNCTION_SECTIONS=1
+    LDFLAGS="-Wl,--gc-sections"
+    COPTFLAGS="$COPTFLAGS -ffunction-sections"
+else
+    HAVE_FUNCTION_SECTIONS=0
+    LDFLAGS=
+fi
 
 # We assume warning flags don't affect congfigurator that much!
 echo -n "Compiling $CONFIGURATOR..."
-$CC ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS -o $CONFIGURATOR $CONFIGURATOR.c
+$CC ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS $LDFLAGS -o $CONFIGURATOR $CONFIGURATOR.c
 echo "done"
 
 if [ "$CLANG_COVERAGE" = "1" ]; then
@@ -370,7 +425,7 @@ if command -v "${PG_CONFIG}" >/dev/null; then
 fi
 
 # Clean up on exit.
-trap "rm -f $CONFIG_VAR_FILE.$$" 0
+trap "rm -f $CONFIG_VAR_FILE.$$*" 0
 
 $CONFIGURATOR --extra-tests --autotools-style --var-file=$CONFIG_VAR_FILE.$$ --header-file=$CONFIG_HEADER.$$ --configurator-cc="$CONFIGURATOR_CC" --wrapper="$CONFIGURATOR_WRAPPER" "$CC" ${CWARNFLAGS-$BASE_WARNFLAGS} $CDEBUGFLAGS $COPTFLAGS $CSANFLAGS -I$CPATH -L$LIBRARY_PATH $SQLITE3_CFLAGS $SODIUM_CFLAGS $POSTGRES_INCLUDE <<EOF
 
@@ -412,20 +467,6 @@ int main(void)
 	                                                key);
 	printf("%p\n", crypto_aead_chacha20poly1305_ietf_encrypt);
 	printf("%d\n", crypto_aead_chacha20poly1305_ietf_NPUBBYTES);
-	return 0;
-}
-/*END*/
-var=HAVE_SQLITE3_EXPANDED_SQL
-desc=sqlite3_expanded_sql
-style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
-link=$SQLITE3_LDLIBS
-code=
-#include <sqlite3.h>
-#include <stdio.h>
-
-int main(void)
-{
-	printf("%p\n", sqlite3_expanded_sql);
 	return 0;
 }
 /*END*/
@@ -488,29 +529,6 @@ code=
 #error "Not modern GCC"
 #endif
 /*END*/
-var=HAVE_PWRITEV
-desc=pwritev() defined
-style=DEFINES_EVERYTHING|EXECUTE|MAY_NOT_COMPILE
-code=
-#include <sys/uio.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-
-int main(void)
-{
-	struct iovec iov[2];
-	int fd = open("/dev/null", O_WRONLY);
-
-	iov[0].iov_base = "hello";
-	iov[0].iov_len = 5;
-	iov[1].iov_base = " world";
-	iov[1].iov_len = 6;
-	if (pwritev(fd, iov, 2, 0) == 11)
-		return 0;
-	return 1;
-}
-/*END*/
 EOF
 
 if check_command 'python3-mako' python3 -c 'import mako'; then
@@ -519,10 +537,9 @@ else
     HAVE_PYTHON3_MAKO=0
 fi
 
-if check_command 'lowdown' lowdown; then
-    HAVE_LOWDOWN=1
-else
-    HAVE_LOWDOWN=0
+if ! check_command 'lowdown' lowdown; then
+    echo "*** We need lowdown!" >&2
+    exit 1
 fi
 
 if echo | check_command sha256sum sha256sum; then
@@ -541,6 +558,45 @@ if ! check_command 'jq' jq; then
     exit 1
 fi
 
+# Detect LLVM paths for fuzzing on macOS
+LLVM_LIBDIR=""
+FUZZER_LIB=""
+LLVM_LDFLAGS=""
+if [ "$OS" = "Darwin" ] && [ "$FUZZING" = "1" ]; then
+    echo -n "Detecting LLVM paths for fuzzing... "
+
+    # Try to find LLVM using Homebrew
+    if command -v brew >/dev/null 2>&1; then
+        LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || echo "")
+        if [ -n "$LLVM_PREFIX" ]; then
+            LLVM_LIBDIR="$LLVM_PREFIX/lib"
+
+            # Find the fuzzer library
+            # Look for libclang_rt.fuzzer_osx.a in the clang lib directories
+            CLANG_VERSION=$(ls -1 "$LLVM_LIBDIR/clang" 2>/dev/null | sort -V | tail -n1)
+            if [ -n "$CLANG_VERSION" ]; then
+                FUZZER_LIB="$LLVM_LIBDIR/clang/$CLANG_VERSION/lib/darwin/libclang_rt.fuzzer_osx.a"
+                if [ ! -f "$FUZZER_LIB" ]; then
+                    echo "Warning: Could not find fuzzer library at $FUZZER_LIB" >&2
+                    FUZZER_LIB=""
+                fi
+            fi
+
+            # Set LLVM C++ library path
+            if [ -d "$LLVM_PREFIX/lib/c++" ]; then
+                LLVM_LDFLAGS="-L$LLVM_PREFIX/lib/c++ -lc++"
+            fi
+
+            echo "found at $LLVM_PREFIX"
+        else
+            echo "not found"
+            echo "Warning: LLVM not found via Homebrew. Fuzzing may not work." >&2
+        fi
+    else
+        echo "not found (Homebrew not available)"
+    fi
+fi
+
 # Now we can finally set our warning flags
 if [ -z ${CWARNFLAGS+x} ]; then
     CWARNFLAGS=$(default_cwarnflags "$COPTFLAGS" \
@@ -554,8 +610,13 @@ add_var CONFIGURATOR_CC "$CONFIGURATOR_CC"
 add_var CWARNFLAGS "$CWARNFLAGS"
 add_var CDEBUGFLAGS "$CDEBUGFLAGS"
 add_var COPTFLAGS "$COPTFLAGS"
+if [ -n "${SDKROOT:-}" ]; then
+    add_var SDKROOT "$SDKROOT"
+fi
 add_var CSANFLAGS "$CSANFLAGS"
 add_var FUZZFLAGS "$FUZZFLAGS"
+add_var FUZZER_LIB "$FUZZER_LIB"
+add_var LLVM_LDFLAGS "$LLVM_LDFLAGS"
 add_var SQLITE3_CFLAGS "$SQLITE3_CFLAGS"
 add_var SQLITE3_LDLIBS "$SQLITE3_LDLIBS"
 add_var POSTGRES_INCLUDE "$POSTGRES_INCLUDE"
@@ -572,11 +633,12 @@ add_var ASAN "$ASAN"
 add_var UBSAN "$UBSAN"
 add_var TEST_NETWORK "$TEST_NETWORK"
 add_var HAVE_PYTHON3_MAKO "$HAVE_PYTHON3_MAKO"
-add_var HAVE_LOWDOWN "$HAVE_LOWDOWN"
 add_var SHA256SUM "$SHA256SUM"
 add_var FUZZING "$FUZZING"
 add_var RUST "$RUST"
 add_var PYTHON "$PYTHON"
+add_var SED "$SED"
+add_var HAVE_FUNCTION_SECTIONS "$HAVE_FUNCTION_SECTIONS"
 
 # Hack to avoid sha256 name clash with libwally: will be fixed when that
 # becomes a standalone shared lib.
@@ -586,6 +648,11 @@ echo '#include "ccan_compat.h"' >> $CONFIG_HEADER.$$
 while IFS='=' read VAR VAL; do
     eval $VAR=\"$VAL\"
 done < $CONFIG_VAR_FILE.$$
+
+if [ "$HAVE_GOOD_LIBSODIUM" != 1 ]; then
+    echo "*** We need a libsodium >= 1.0.4 (released 2015-06-11)." >&2
+    exit 1
+fi
 
 if [ "$HAVE_SQLITE3" = 0 -a "$HAVE_POSTGRES" = 0 ]; then
     # I have no database yet I must schema!)

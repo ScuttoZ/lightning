@@ -21,9 +21,8 @@
  * before anything else. */
 #include "config.h"
 
-/*~ This is Ian Lance Taylor's libbacktrace.  It turns out that it's
- * horrifically difficult to obtain a decent backtrace in C; the standard
- * backtrace function is useless in most programs. */
+/*~ Various bitcoin-related helpers live in the bitcoin/ directory */
+#include <bitcoin/script.h>
 
 /*~ These headers are from CCAN: http://ccodearchive.net.
  *
@@ -37,8 +36,8 @@
  */
 #include <ccan/array_size/array_size.h>
 #include <ccan/closefrom/closefrom.h>
+#include <ccan/io/io.h>
 #include <ccan/json_escape/json_escape.h>
-#include <ccan/opt/opt.h>
 #include <ccan/pipecmd/pipecmd.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/tal/grab_file/grab_file.h>
@@ -47,28 +46,25 @@
 
 /*~ This is common code: routines shared by one or more executables
  *  (separate daemons, or the lightning-cli program). */
-#include <common/configdir.h>
 #include <common/daemon.h>
 #include <common/deprecation.h>
 #include <common/ecdh_hsmd.h>
-#include <common/hsm_encryption.h>
-#include <common/json_stream.h>
+#include <common/errcode.h>
+#include <common/hsm_secret.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/trace.h>
 #include <common/version.h>
-#include <db/exec.h>
 
+#include <db/exec.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <header_versions_gen.h>
-#include <hsmd/hsmd_wiregen.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closed_channel.h>
-#include <lightningd/coin_mvts.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/gossip_control.h>
 #include <lightningd/hsm_control.h>
@@ -76,7 +72,6 @@
 #include <lightningd/lightningd.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/peer_htlcs.h>
-#include <lightningd/plugin.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/runes.h>
 #include <lightningd/subd.h>
@@ -130,7 +125,6 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_disconnect_fd = -1;
 	ld->dev_subdaemon_fail = false;
 	ld->dev_allow_localhost = false;
-	ld->dev_gossip_time = 0;
 	ld->dev_fast_gossip = false;
 	ld->dev_fast_gossip_prune = false;
 	ld->dev_throttle_gossip = false;
@@ -156,6 +150,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->dev_handshake_no_reply = false;
 	ld->dev_strict_forwarding = false;
 	ld->dev_limit_connections_inflight = false;
+	ld->dev_keep_nagle = false;
 
 	/*~ We try to ensure enough fds for twice the number of channels
 	 * we start with.  We have a developer option to change that factor
@@ -190,40 +185,40 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	 * list attached to the channel structure itself, or even left them in
 	 * the database rather than making an in-memory version.  Obviously
 	 * I was in a premature optimization mood when I wrote this: */
-	ld->htlcs_in = tal(ld, struct htlc_in_map);
-	htlc_in_map_init(ld->htlcs_in);
+	ld->htlcs_in = new_htable(ld, htlc_in_map);
 
 	/*~ Note also: we didn't need to use an allocation here!  We could
 	 * have simply made the `struct htlc_out_map` a member.  But we
 	 * override the htable allocation routines to use tal(), and they
 	 * want a tal parent, so we always make our hash table a tallocated
 	 * object. */
-	ld->htlcs_out = tal(ld, struct htlc_out_map);
-	htlc_out_map_init(ld->htlcs_out);
+	ld->htlcs_out = new_htable(ld, htlc_out_map);
 
 	/*~ This is the hash table of peers: converted from a
 	 *  linked-list as part of the 100k-peers project! */
-	ld->peers = tal(ld, struct peer_node_id_map);
-	peer_node_id_map_init(ld->peers);
+	ld->peers = new_htable(ld, peer_node_id_map);
 	/*~ And this was done at the same time, for db lookups at startup */
-	ld->peers_by_dbid = tal(ld, struct peer_dbid_map);
-	peer_dbid_map_init(ld->peers_by_dbid);
+	ld->peers_by_dbid = new_htable(ld, peer_dbid_map);
+
+	/*~ This speeds lookups for short_channel_ids to their channels. */
+	ld->channels_by_scid = new_htable(ld, channel_scid_map);
+
+	/*~ Coin movements in db are indexed by the channel dbid. */
+	ld->channels_by_dbid = new_htable(ld, channel_dbid_map);
 
 	/*~ For multi-part payments, we need to keep some incoming payments
 	 * in limbo until we get all the parts, or we time them out. */
-	ld->htlc_sets = tal(ld, struct htlc_set_map);
-	htlc_set_map_init(ld->htlc_sets);
+	ld->htlc_sets = new_htable(ld, htlc_set_map);
 
 	/*~ We keep a map of closed channels.  Mainly so we can respond to peers
 	 * who talk to us about long-closed channels. */
-	ld->closed_channels = tal(ld, struct closed_channel_map);
-	closed_channel_map_init(ld->closed_channels);
+	ld->closed_channels = new_htable(ld, closed_channel_map);
 
-	/*~ We have a multi-entry log-book infrastructure: we define a 10MB log
-	 * book to hold all the entries (and trims as necessary), and multiple
+	/*~ We have a multi-entry log-book infrastructure: we define a 16MB log
+	 * book to hold all the entries in a circular buffer, and multiple
 	 * log objects which each can write into it, each with a unique
 	 * prefix. */
-	ld->log_book = new_log_book(ld, 10*1024*1024);
+	ld->log_book = new_log_book(ld);
 	/*~ Note the tal context arg (by convention, the first argument to any
 	 * allocation function): ld->log will be implicitly freed when ld
 	 * is. */
@@ -235,6 +230,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->alias = NULL;
 	ld->rgb = NULL;
 	ld->recover = NULL;
+	ld->hsm_passphrase = NULL;
 	list_head_init(&ld->connects);
 	list_head_init(&ld->waitsendpay_commands);
 	list_head_init(&ld->close_commands);
@@ -263,9 +259,8 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	ld->try_reexec = false;
 	ld->recover_secret = NULL;
 	ld->db_upgrade_ok = NULL;
-
-	/* --experimental-upgrade-protocol */
-	ld->experimental_upgrade_protocol = false;
+	ld->old_bookkeeper_dir = NULL;
+	ld->old_bookkeeper_db = NULL;
 
 	/* --invoices-onchain-fallback */
 	ld->unified_invoices = false;
@@ -314,10 +309,10 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/*~ This is set when a JSON RPC command comes in to shut us down. */
 	ld->stop_conn = NULL;
 
-	/*~ This is used to signal that `hsm_secret` is encrypted, and will
-	 * be set to `true` if the `--encrypted-hsm` option is passed at startup.
+	/*~ This is used to store the passphrase for hsm_secret if needed.
+	 * It will be set if the `--hsm-passphrase` option is passed at startup.
 	 */
-	ld->encrypted_hsm = false;
+	ld->hsm_passphrase = NULL;
 
 	/* This is used to override subdaemons */
 	strmap_init(&ld->alt_subdaemons);
@@ -377,6 +372,7 @@ static struct lightningd *new_lightningd(const tal_t *ctx)
 	/* The gossip seeker automatically connects to a this many peers */
 	ld->autoconnect_seeker_peers = 10;
 
+	ld->fronting_nodes = tal_arr(ld, struct node_id, 0);
 	return ld;
 }
 
@@ -387,9 +383,10 @@ static const char *subdaemons[] = {
 	"lightning_closingd",
 	"lightning_connectd",
 	"lightning_gossipd",
+	"lightning_gossip_compactd",
 	"lightning_hsmd",
 	"lightning_onchaind",
-	"lightning_openingd"
+	"lightning_openingd",
 };
 
 /* Return true if called with a recognized subdaemon e.g. "hsmd" */
@@ -484,8 +481,8 @@ void test_subdaemons(const struct lightningd *ld)
 			err(EXITCODE_SUBDAEMON_FAIL, "Could not run %s", dpath);
 
 		/*~ CCAN's grab_file module contains a routine to read into a
-		 * tallocated buffer until EOF */
-		verstring = grab_fd(tmpctx, outfd);
+		 * tallocated buffer until EOF (with nul appended!) */
+		verstring = grab_fd_str(tmpctx, outfd);
 		/*~ Like many CCAN modules, it set errno on failure, which
 		 * err (ccan/err, but usually just the BSD <err.h>) prints */
 		if (!verstring)
@@ -680,7 +677,7 @@ static void init_txfilter(struct wallet *w,
 	struct ext_key ext;
 	/*~ Note the use of ccan/short_types u64 rather than uint64_t.
 	 * Thank me later. */
-	u64 bip32_max_index;
+	u64 bip32_max_index, bip86_max_index;
 
 	bip32_max_index = db_get_intvar(w->db, "bip32_max_index", 0);
 	/*~ One of the C99 things I unequivocally approve: for-loop scope. */
@@ -689,6 +686,20 @@ static void init_txfilter(struct wallet *w,
 			abort();
 		}
 		txfilter_add_derkey(filter, ext.pub_key);
+	}
+
+	/* If BIP86 is enabled, also add BIP86-derived keys to the filter */
+	if (w->ld->bip86_base) {
+		bip86_max_index = db_get_intvar(w->db, "bip86_max_index", 0);
+		for (u64 i = 0; i <= bip86_max_index + w->keyscan_gap; i++) {
+			struct pubkey pubkey;
+			bip86_pubkey(w->ld, &pubkey, i);
+			/* Add both P2TR and P2WPKH scripts since BIP86 keys can be used for both */
+			u8 *p2tr_script = scriptpubkey_p2tr(tmpctx, &pubkey);
+			txfilter_add_scriptpubkey(filter, take(p2tr_script));
+			u8 *p2wpkh_script = scriptpubkey_p2wpkh(tmpctx, &pubkey);
+			txfilter_add_scriptpubkey(filter, take(p2wpkh_script));
+		}
 	}
 }
 
@@ -929,7 +940,7 @@ static struct feature_set *default_features(const tal_t *ctx)
 		OPTIONAL_FEATURE(OPT_ZEROCONF),
 		OPTIONAL_FEATURE(OPT_QUIESCE),
 		OPTIONAL_FEATURE(OPT_ONION_MESSAGES),
-		OPTIONAL_FEATURE(OPT_CHANNEL_TYPE),
+		COMPULSORY_FEATURE(OPT_CHANNEL_TYPE),
 		OPTIONAL_FEATURE(OPT_ROUTE_BLINDING),
 		OPTIONAL_FEATURE(OPT_PROVIDE_STORAGE),
 		/* Removed later for elements */
@@ -1183,8 +1194,6 @@ int main(int argc, char *argv[])
 	bool try_reexec;
 	size_t num_channels;
 
-	trace_span_start("lightningd/startup", argv);
-
 	/*~ What happens in strange locales should stay there. */
 	setup_locale();
 
@@ -1207,6 +1216,10 @@ int main(int argc, char *argv[])
 	/*~ Every daemon calls this in some form: the hooks are for dumping
 	 * backtraces when we crash (if supported on this platform). */
 	daemon_setup(argv[0], log_backtrace_print, log_backtrace_exit);
+
+	/*~ We enable trace as early as possible, but it uses support functions
+	 * (particularly if we're avoid entropy) so do it after daemon_setup. */
+	trace_span_start("lightningd/startup", argv);
 
 	/*~ There's always a battle between what a constructor like this
 	 * should do, and what should be added later by the caller.  In
@@ -1310,11 +1323,6 @@ int main(int argc, char *argv[])
 	/*~ This is the ccan/io central poll override from above. */
 	io_poll_override(io_poll_lightningd);
 
-	/*~ If hsm_secret is encrypted, we don't need its encryption key
-	 * anymore. Note that sodium_munlock() also zeroes the memory.*/
-	if (ld->config.keypass)
-		discard_key(take(ld->config.keypass));
-
 	/*~ Our default color and alias are derived from our node id, so we
 	 * can only set those now (if not set by config options). */
 	setup_color_and_alias(ld);
@@ -1364,6 +1372,9 @@ int main(int argc, char *argv[])
 	trace_span_end(ld->topology);
 
 	db_begin_transaction(ld->wallet->db);
+	trace_span_start("delete_old_htlcs", ld->wallet);
+	wallet_delete_old_htlcs(ld->wallet);
+	trace_span_end(ld->wallet);
 
 	/*~ Pull peers, channels and HTLCs from db. Needs to happen after the
 	 *  topology is initialized since some decisions rely on being able to
@@ -1442,9 +1453,10 @@ int main(int argc, char *argv[])
 		plugin_hook_call_recover(ld, NULL, payload);
 	}
 
-	/*~ If we have channels closing, make sure we re-xmit the last
+	/*~ If we have channels closing or opening, make sure we re-xmit the last
 	 * transaction, in case bitcoind lost it. */
 	db_begin_transaction(ld->wallet->db);
+	resend_opening_transactions(ld);
 	resend_closing_transactions(ld);
 	db_commit_transaction(ld->wallet->db);
 

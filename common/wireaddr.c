@@ -48,7 +48,6 @@ bool fromwire_wireaddr(const u8 **cursor, size_t *max, struct wireaddr *addr)
 	case ADDR_TYPE_DNS:
 		addr->addrlen = fromwire_u8(cursor, max);
 		memset(&addr->addr, 0, sizeof(addr->addr));
-		addr->addr[addr->addrlen] = 0;
 		break;
 	default:
 		return false;
@@ -263,7 +262,7 @@ char *fmt_wireaddr_without_port(const tal_t * ctx, const struct wireaddr *a)
 		return tal_fmt(ctx, "%s.onion",
 			       b32_encode(tmpctx, a->addr, a->addrlen));
 	case ADDR_TYPE_DNS:
-		return tal_fmt(ctx, "%s", a->addr);
+		return tal_fmt(ctx, "%.*s", a->addrlen, a->addr);
 	}
 
 	hex = tal_hexstr(ctx, a->addr, a->addrlen);

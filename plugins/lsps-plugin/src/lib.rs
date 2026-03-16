@@ -1,2 +1,3 @@
-pub mod jsonrpc;
-pub mod lsps0;
+pub mod cln_adapters;
+pub mod core;
+pub mod proto;

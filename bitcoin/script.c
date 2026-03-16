@@ -5,10 +5,10 @@
 #include <bitcoin/preimage.h>
 #include <bitcoin/pubkey.h>
 #include <bitcoin/script.h>
-#include <ccan/endian/endian.h>
 #include <ccan/mem/mem.h>
+#include <common/randbytes.h>
 #include <common/utils.h>
-#include <sodium/randombytes.h>
+#include <wally_script.h>
 
 /* To push 0-75 bytes onto stack. */
 #define OP_PUSHBYTES(val) (val)
@@ -184,17 +184,6 @@ u8 *scriptpubkey_p2pkh(const tal_t *ctx, const struct bitcoin_address *addr)
 	add_op(&script, OP_EQUALVERIFY);
 	add_op(&script, OP_CHECKSIG);
 	assert(tal_count(script) == BITCOIN_SCRIPTPUBKEY_P2PKH_LEN);
-	return script;
-}
-
-u8 *scriptpubkey_opreturn_padded(const tal_t *ctx)
-{
-	u8 *script = tal_arr(ctx, u8, 0);
-	u8 random[20];
-	randombytes_buf(random, sizeof(random));
-
-	add_op(&script, OP_RETURN);
-	script_push_bytes(&script, random, sizeof(random));
 	return script;
 }
 

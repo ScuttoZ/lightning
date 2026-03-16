@@ -10,7 +10,9 @@
 
 void init(int *argc, char ***argv)
 {
-	common_setup("fuzzer");
+	/* Don't call this if we're in unit-test mode, as libfuzz.c does it */
+	if (!tmpctx)
+		common_setup("fuzzer");
 }
 
 void run(const uint8_t *data, size_t size)
@@ -23,14 +25,13 @@ void run(const uint8_t *data, size_t size)
 	size_t wire_max;
 	uint8_t *wire_buf;
 
-	/* 32 (txid) + 4 (vout) */
-	if (size < 36)
+	if (size < sizeof(outpoint))
 		return;
 
-	v1_chunks = get_chunks(NULL, data, size, 36);
+	v1_chunks = get_chunks(NULL, data, size, sizeof(outpoint));
 	for (size_t i = 0; i < tal_count(v1_chunks); i++) {
 		wire_ptr = v1_chunks[i];
-		wire_max = 36;
+		wire_max = sizeof(outpoint);
 		fromwire_bitcoin_outpoint(&wire_ptr, &wire_max, &outpoint);
 		assert(wire_ptr);
 		derive_channel_id(&chan_id, &outpoint);
@@ -54,13 +55,16 @@ void run(const uint8_t *data, size_t size)
 	}
 	tal_free(v2_chunks);
 
-	marshal_chunks = get_chunks(NULL, data, size, 32);
+	marshal_chunks = get_chunks(NULL, data, size, sizeof(chan_id));
 	for (size_t i = 0; i < tal_count(marshal_chunks); i++) {
 		wire_ptr = marshal_chunks[i];
 		wire_max = tal_count(marshal_chunks[i]);
+
 		fromwire_channel_id(&wire_ptr, &wire_max, &chan_id);
-		wire_buf = tal_arr(NULL, uint8_t, tal_count(marshal_chunks[i]));
+		wire_buf = tal_arr(NULL, uint8_t, 0);
 		towire_channel_id(&wire_buf, &chan_id);
+		assert(!memcmp(marshal_chunks[i], wire_buf, tal_count(marshal_chunks[i])));
+
 		tal_free(wire_buf);
 	}
 	tal_free(marshal_chunks);

@@ -1,7 +1,6 @@
 #ifndef LIGHTNING_LIGHTNINGD_BITCOIND_H
 #define LIGHTNING_LIGHTNINGD_BITCOIND_H
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <bitcoin/tx.h>
 #include <ccan/list/list.h>
 #include <ccan/strmap/strmap.h>
@@ -78,7 +77,7 @@ void bitcoind_sendrawtx_(const tal_t *ctx,
 			 const char *id_prefix TAKES,
 			 const char *hextx,
 			 bool allowhighfees,
-			 void (*cb)(struct bitcoind *bitcoind,
+			 void (*cb)(struct bitcoind *,
 				    bool success, const char *msg, void *),
 			 void *arg);
 #define bitcoind_sendrawtx(ctx, bitcoind_, id_prefix, hextx, allowhighfees, cb, arg) \

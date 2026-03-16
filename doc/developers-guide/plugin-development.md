@@ -1,10 +1,12 @@
 ---
-title: "Plugin Development"
-slug: "plugin-development"
-excerpt: "Customise your Core Lightning node by leveraging its powerful modular architecture via plugins."
-hidden: false
-createdAt: "2022-12-09T09:56:22.085Z"
-updatedAt: "2023-02-06T03:21:36.614Z"
+title: Plugin Development
+slug: plugin-development
+content:
+  excerpt: >-
+    Customise your Core Lightning node by leveraging its powerful modular
+    architecture via plugins.
+privacy:
+  view: public
 ---
 Plugins are a simple yet powerful way to extend the functionality provided by Core Lightning. They are subprocesses that are started by the main `lightningd` daemon and can interact with `lightningd` in a variety of ways:
 
@@ -12,3 +14,4 @@ Plugins are a simple yet powerful way to extend the functionality provided by Co
 - **[JSON-RPC command passthrough](doc:json-rpc-passthrough)** adds a way for plugins to add their own commands to the JSON-RPC interface.
 - **[Event stream subscriptions](doc:event-notifications)** provide plugins with a push-based notification mechanism about events from the `lightningd`.
 - **[Hooks](doc:hooks)** are a primitive that allows plugins to be notified about internal events in `lightningd` and alter its behavior or inject custom behaviors.
+- **[Dynamic REST paths](ref:clnrest-register-path)** allows a plugin to register an rpc command with a custom REST path for ``clnrest``.

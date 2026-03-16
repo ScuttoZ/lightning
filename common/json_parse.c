@@ -4,23 +4,14 @@
 #include <bitcoin/preimage.h>
 #include <bitcoin/privkey.h>
 #include <bitcoin/psbt.h>
-#include <bitcoin/pubkey.h>
-#include <bitcoin/tx.h>
-#include <ccan/json_escape/json_escape.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/time/time.h>
-#include <common/amount.h>
-#include <common/channel_id.h>
 #include <common/json_parse.h>
 #include <common/node_id.h>
 #include <common/overflows.h>
 #include <common/utils.h>
 #include <errno.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <wire/onion_wire.h>
 
 bool json_to_millionths(const char *buffer, const jsmntok_t *tok,
 			u64 *millionths)
@@ -30,7 +21,7 @@ bool json_to_millionths(const char *buffer, const jsmntok_t *tok,
 
 	*millionths = 0;
 	for (int i = tok->start; i < tok->end; i++) {
-		if (isdigit(buffer[i])) {
+		if (cisdigit(buffer[i])) {
 			has_digits = true;
 			/* Ignore too much precision */
 			if (decimal_places >= 0 && ++decimal_places > 6)
@@ -233,6 +224,7 @@ static void parse_number(const char **guide, u32 *number)
 	char *endp;
 	long int l;
 
+	errno = 0;
 	l = strtol(*guide, &endp, 10);
 	assert(endp != *guide);
 	assert(errno != ERANGE);
@@ -518,6 +510,7 @@ bool json_to_bitcoin_amount(const char *buffer, const jsmntok_t *tok,
 	char *end;
 	unsigned long btc, sat;
 
+	errno = 0;
 	btc = strtoul(buffer + tok->start, &end, 10);
 	if (btc == ULONG_MAX && errno == ERANGE)
 		return false;
@@ -630,16 +623,7 @@ bool json_to_channel_id(const char *buffer, const jsmntok_t *tok,
 bool json_to_coin_mvt_tag(const char *buffer, const jsmntok_t *tok,
 			  enum mvt_tag *tag)
 {
-	enum mvt_tag i_tag;
-	for (size_t i = 0; i < NUM_MVT_TAGS; i++) {
-		i_tag = (enum mvt_tag) i;
-		if (json_tok_streq(buffer, tok, mvt_tag_str(i_tag))) {
-			*tag = i_tag;
-			return true;
-		}
-	}
-
-	return false;
+	return mvt_tag_parse(buffer + tok->start, tok->end - tok->start, tag);
 }
 
 bool split_tok(const char *buffer, const jsmntok_t *tok,
@@ -682,4 +666,14 @@ json_tok_channel_id(const char *buffer, const jsmntok_t *tok,
 {
 	return hex_decode(buffer + tok->start, tok->end - tok->start,
 			  cid, sizeof(*cid));
+}
+
+void json_dup_contents(const tal_t *ctx,
+		       const char *buffer,
+		       const jsmntok_t *tok,
+		       const char **new_buffer,
+		       const jsmntok_t **new_toks)
+{
+	*new_buffer = tal_dup_arr(ctx, char, buffer, tok->end, 0);
+	*new_toks = tal_dup_arr(ctx, jsmntok_t, tok, json_next(tok) - tok, 0);
 }

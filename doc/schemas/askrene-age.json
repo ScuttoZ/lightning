@@ -5,7 +5,7 @@
   "title": "Command for expiring information in a layer",
   "added": "v24.11",
   "description": [
-    "The **askrene-age** RPC command tells askrene that information added to a layer by *askrene-inform-channel* beyond a certain age is less useful.  It currently completely forgets constraints older than *cutoff*."
+    "The **askrene-age** RPC command tells askrene that information added to a layer by *askrene-inform-channel* and *askrene-bias-channel* beyond a certain age is less useful.  It currently completely forgets constraints and biases older than *cutoff*."
   ],
   "request": {
     "required": [
@@ -55,10 +55,10 @@
     "lightning-askrene-listlayers(7)"
   ],
   "author": [
-    "Rusty Russell <<rusty@rustcorp.com.au>> is mainly responsible."
+    "Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) is mainly responsible."
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {

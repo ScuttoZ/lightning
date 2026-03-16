@@ -17,7 +17,7 @@ but configuable with lightningd-config(5)).
 JSON WIRE FORMAT
 ----------------
 
-JSON RPC is defined at <https://www.jsonrpc.org/specification> and
+JSON RPC is defined at [https://www.jsonrpc.org/specification](https://www.jsonrpc.org/specification) and
 generally involves writing a JSON request with a unique ID, and
 receiving a response containing that ID.
 
@@ -101,7 +101,7 @@ referred to in addition to simple JSON types:
 * `u64`: a JSON number without decimal point in the range 0 to 18446744073709551615 inclusive.
 * `u32`: a JSON number without decimal point in the range 0 to 4294967295 inclusive.
 * `u16`: a JSON number without decimal point in the range 0 to 65535 inclusive.
-* `u16`: a JSON number without decimal point in the range 0 to 255 inclusive.
+* `u8`: a JSON number without decimal point in the range 0 to 255 inclusive.
 * `pubkey`: a 66-character `hex` which is an SEC-1 encoded secp256k1 point (usually used as a public key).
 * `msat`: a `u64` which indicates an amount of millisatoshis.  Deprecated: may also be a string of the number, with "msat" appended.  As an input parameter, lightningd(8) will accept strings with suffixes (see below).
 * `txid`: a 64-character `hex` Bitcoin transaction identifier.
@@ -283,7 +283,7 @@ hex) that occurs.  It's extremely noisy though!
 AUTHOR
 ------
 
-Rusty Russell <<rusty@rustcorp.com.au>> wrote this man page, and
+Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) wrote this man page, and
 much of the configuration language, but many others did the hard work of
 actually implementing these options.
 
@@ -295,7 +295,7 @@ lightningd-config(5), lightning-notifications(7), lightningd(8)
 RESOURCES
 ---------
 
-Main web site: <https://github.com/ElementsProject/lightning>
+Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)
 
 COPYING
 -------

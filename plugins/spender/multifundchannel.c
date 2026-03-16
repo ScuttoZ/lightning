@@ -11,6 +11,7 @@
 #include <common/memleak.h>
 #include <common/psbt_open.h>
 #include <common/pseudorand.h>
+#include <inttypes.h>
 #include <plugins/spender/multifundchannel.h>
 #include <plugins/spender/openchannel.h>
 
@@ -1449,7 +1450,7 @@ after_getfeerate(struct command *cmd,
 			JSON_SCAN(json_to_number, &feerate));
 	if (err)
 		mfc_fail(mfc, JSONRPC2_INVALID_PARAMS,
-			 "Unable to parse feerate %s: %*.s",
+			 "Unable to parse feerate %s: %.*s",
 			 err, json_tok_full_len(result),
 			 json_tok_full(buf, result));
 

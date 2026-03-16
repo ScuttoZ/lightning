@@ -10,8 +10,10 @@ static void db_log_(struct logger *log UNUSED, enum log_level level UNUSED, cons
 #include "db/db_sqlite3.c"
 #include "db/exec.c"
 #include "db/utils.c"
+#include "wallet/datastore.c"
 #include "wallet/db.c"
 #include "wallet/wallet.c"
+#include "wallet/migrations.c"
 
 #include "test_utils.h"
 
@@ -25,6 +27,9 @@ static void db_log_(struct logger *log UNUSED, enum log_level level UNUSED, cons
 /* Generated stub for bip32_pubkey */
 void bip32_pubkey(struct lightningd *ld UNNEEDED, struct pubkey *pubkey UNNEEDED, u32 index UNNEEDED)
 { fprintf(stderr, "bip32_pubkey called!\n"); abort(); }
+/* Generated stub for bip86_pubkey */
+void bip86_pubkey(struct lightningd *ld UNNEEDED, struct pubkey *pubkey UNNEEDED, u32 index UNNEEDED)
+{ fprintf(stderr, "bip86_pubkey called!\n"); abort(); }
 /* Generated stub for bitcoind_getrawblockbyheight_ */
 void bitcoind_getrawblockbyheight_(const tal_t *ctx UNNEEDED,
 				   struct bitcoind *bitcoind UNNEEDED,
@@ -36,12 +41,29 @@ void bitcoind_getrawblockbyheight_(const tal_t *ctx UNNEEDED,
 					      void *arg) UNNEEDED,
 				   void *arg UNNEEDED)
 { fprintf(stderr, "bitcoind_getrawblockbyheight_ called!\n"); abort(); }
+/* Generated stub for chain_mvt_index_created */
+u64 chain_mvt_index_created(struct lightningd *ld UNNEEDED,
+			    struct db *db UNNEEDED,
+			    const struct mvt_account_id *account UNNEEDED,
+			    struct amount_msat credit UNNEEDED,
+			    struct amount_msat debit UNNEEDED)
+{ fprintf(stderr, "chain_mvt_index_created called!\n"); abort(); }
+/* Generated stub for channel_by_dbid */
+struct channel *channel_by_dbid(struct lightningd *ld UNNEEDED, const u64 dbid UNNEEDED)
+{ fprintf(stderr, "channel_by_dbid called!\n"); abort(); }
 /* Generated stub for channel_gossip_get_remote_update */
 const struct peer_update *channel_gossip_get_remote_update(const struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_gossip_get_remote_update called!\n"); abort(); }
 /* Generated stub for channel_gossip_update */
 void channel_gossip_update(struct channel *channel UNNEEDED)
 { fprintf(stderr, "channel_gossip_update called!\n"); abort(); }
+/* Generated stub for channel_mvt_index_created */
+u64 channel_mvt_index_created(struct lightningd *ld UNNEEDED,
+			      struct db *db UNNEEDED,
+			      const struct mvt_account_id *account UNNEEDED,
+			      struct amount_msat credit UNNEEDED,
+			      struct amount_msat debit UNNEEDED)
+{ fprintf(stderr, "channel_mvt_index_created called!\n"); abort(); }
 /* Generated stub for channel_scid_or_local_alias */
 struct short_channel_id channel_scid_or_local_alias(const struct channel *chan UNNEEDED)
 { fprintf(stderr, "channel_scid_or_local_alias called!\n"); abort(); }
@@ -54,15 +76,6 @@ void connect_htlc_in(struct htlc_in_map *map UNNEEDED, struct htlc_in *hin UNNEE
 /* Generated stub for connect_htlc_out */
 void connect_htlc_out(struct htlc_out_map *map UNNEEDED, struct htlc_out *hout UNNEEDED)
 { fprintf(stderr, "connect_htlc_out called!\n"); abort(); }
-/* Generated stub for create_onionreply */
-struct onionreply *create_onionreply(const tal_t *ctx UNNEEDED,
-				     const struct secret *shared_secret UNNEEDED,
-				     const u8 *failure_msg UNNEEDED)
-{ fprintf(stderr, "create_onionreply called!\n"); abort(); }
-/* Generated stub for derive_channel_id */
-void derive_channel_id(struct channel_id *channel_id UNNEEDED,
-		       const struct bitcoin_outpoint *outpoint UNNEEDED)
-{ fprintf(stderr, "derive_channel_id called!\n"); abort(); }
 /* Generated stub for fatal */
 void   fatal(const char *fmt UNNEEDED, ...)
 { fprintf(stderr, "fatal called!\n"); abort(); }
@@ -72,9 +85,6 @@ void  fatal_vfmt(const char *fmt UNNEEDED, va_list ap UNNEEDED)
 /* Generated stub for find_peer_by_dbid */
 struct peer *find_peer_by_dbid(struct lightningd *ld UNNEEDED, u64 dbid UNNEEDED)
 { fprintf(stderr, "find_peer_by_dbid called!\n"); abort(); }
-/* Generated stub for fmt_channel_id */
-char *fmt_channel_id(const tal_t *ctx UNNEEDED, const struct channel_id *channel_id UNNEEDED)
-{ fprintf(stderr, "fmt_channel_id called!\n"); abort(); }
 /* Generated stub for forward_index_created */
 u64 forward_index_created(struct lightningd *ld UNNEEDED,
 			  enum forward_status status UNNEEDED,
@@ -160,10 +170,6 @@ struct invoices *invoices_new(const tal_t *ctx UNNEEDED,
 void logv(struct logger *logger UNNEEDED, enum log_level level UNNEEDED, const struct node_id *node_id UNNEEDED,
 	  bool call_notifier UNNEEDED, const char *fmt UNNEEDED, va_list ap UNNEEDED)
 { fprintf(stderr, "logv called!\n"); abort(); }
-/* Generated stub for memleak_scan_outpointfilter */
-void memleak_scan_outpointfilter(struct htable *memtable UNNEEDED,
-				 const struct outpointfilter *opf UNNEEDED)
-{ fprintf(stderr, "memleak_scan_outpointfilter called!\n"); abort(); }
 /* Generated stub for new_channel */
 struct channel *new_channel(struct peer *peer UNNEEDED, u64 dbid UNNEEDED,
 			    /* NULL or stolen */
@@ -187,8 +193,9 @@ struct channel *new_channel(struct peer *peer UNNEEDED, u64 dbid UNNEEDED,
 			    struct amount_sat our_funds UNNEEDED,
 			    bool remote_channel_ready UNNEEDED,
 			    /* NULL or stolen */
-			    struct short_channel_id *scid STEALS UNNEEDED,
-			    struct short_channel_id *alias_local STEALS UNNEEDED,
+			    struct short_channel_id *scid TAKES UNNEEDED,
+			    struct short_channel_id *old_scids TAKES UNNEEDED,
+			    struct short_channel_id alias_local UNNEEDED,
 			    struct short_channel_id *alias_remote STEALS UNNEEDED,
 			    struct channel_id *cid UNNEEDED,
 			    struct amount_msat our_msatoshi UNNEEDED,
@@ -237,7 +244,9 @@ struct channel *new_channel(struct peer *peer UNNEEDED, u64 dbid UNNEEDED,
 			    struct peer_update *peer_update STEALS UNNEEDED,
 			    u64 last_stable_connection UNNEEDED,
 			    const struct channel_stats *stats UNNEEDED,
-			    struct channel_state_change **state_changes STEALS UNNEEDED)
+			    struct channel_state_change **state_changes STEALS UNNEEDED,
+			    const struct wally_psbt *funding_psbt STEALS UNNEEDED,
+			    bool withheld UNNEEDED)
 { fprintf(stderr, "new_channel called!\n"); abort(); }
 /* Generated stub for new_channel_state_change */
 struct channel_state_change *new_channel_state_change(const tal_t *ctx UNNEEDED,
@@ -247,14 +256,6 @@ struct channel_state_change *new_channel_state_change(const tal_t *ctx UNNEEDED,
 						      enum state_change cause UNNEEDED,
 						      const char *message TAKES UNNEEDED)
 { fprintf(stderr, "new_channel_state_change called!\n"); abort(); }
-/* Generated stub for new_coin_wallet_deposit */
-struct chain_coin_mvt *new_coin_wallet_deposit(const tal_t *ctx UNNEEDED,
-					       const struct bitcoin_outpoint *outpoint UNNEEDED,
-					       u32 blockheight UNNEEDED,
-					       struct amount_sat amount UNNEEDED,
-					       enum mvt_tag tag)
-
-{ fprintf(stderr, "new_coin_wallet_deposit called!\n"); abort(); }
 /* Generated stub for new_inflight */
 struct channel_inflight *new_inflight(struct channel *channel UNNEEDED,
 	     struct pubkey *remote_funding STEALS UNNEEDED,
@@ -272,7 +273,8 @@ struct channel_inflight *new_inflight(struct channel *channel UNNEEDED,
 	     const struct amount_sat lease_amt UNNEEDED,
 	     s64 splice_amnt UNNEEDED,
 	     bool i_am_initiator UNNEEDED,
-	     bool force_sign_first UNNEEDED)
+	     bool force_sign_first UNNEEDED,
+	     bool i_sent_sigs UNNEEDED)
 { fprintf(stderr, "new_inflight called!\n"); abort(); }
 /* Generated stub for new_logger */
 struct logger *new_logger(const tal_t *ctx UNNEEDED, struct log_book *record UNNEEDED,
@@ -288,8 +290,15 @@ struct peer *new_peer(struct lightningd *ld UNNEEDED, u64 dbid UNNEEDED,
 		      bool connected_incoming UNNEEDED)
 { fprintf(stderr, "new_peer called!\n"); abort(); }
 /* Generated stub for notify_chain_mvt */
-void notify_chain_mvt(struct lightningd *ld UNNEEDED, const struct chain_coin_mvt *mvt UNNEEDED)
+void notify_chain_mvt(struct lightningd *ld UNNEEDED,
+		      const struct chain_coin_mvt *chain_mvt UNNEEDED,
+		      u64 id UNNEEDED)
 { fprintf(stderr, "notify_chain_mvt called!\n"); abort(); }
+/* Generated stub for notify_channel_mvt */
+void notify_channel_mvt(struct lightningd *ld UNNEEDED,
+			const struct channel_coin_mvt *chan_mvt UNNEEDED,
+			u64 id UNNEEDED)
+{ fprintf(stderr, "notify_channel_mvt called!\n"); abort(); }
 /* Generated stub for notify_forward_event */
 void notify_forward_event(struct lightningd *ld UNNEEDED,
 			  const struct htlc_in *in UNNEEDED,
@@ -304,9 +313,6 @@ void notify_forward_event(struct lightningd *ld UNNEEDED,
 			  u64 created_index UNNEEDED,
 			  u64 updated_index UNNEEDED)
 { fprintf(stderr, "notify_forward_event called!\n"); abort(); }
-/* Generated stub for onion_wire_name */
-const char *onion_wire_name(int e UNNEEDED)
-{ fprintf(stderr, "onion_wire_name called!\n"); abort(); }
 /* Generated stub for outpointfilter_add */
 void outpointfilter_add(struct outpointfilter *of UNNEEDED,
 			const struct bitcoin_outpoint *outpoint UNNEEDED)
@@ -356,36 +362,35 @@ u64 sendpay_index_update_status(struct lightningd *ld UNNEEDED,
 				u64 groupid UNNEEDED,
 				enum payment_status status UNNEEDED)
 { fprintf(stderr, "sendpay_index_update_status called!\n"); abort(); }
-/* Generated stub for to_canonical_invstr */
-const char *to_canonical_invstr(const tal_t *ctx UNNEEDED, const char *invstring UNNEEDED)
-{ fprintf(stderr, "to_canonical_invstr called!\n"); abort(); }
 /* Generated stub for towire_hsmd_get_channel_basepoints */
 u8 *towire_hsmd_get_channel_basepoints(const tal_t *ctx UNNEEDED, const struct node_id *peerid UNNEEDED, u64 dbid UNNEEDED)
 { fprintf(stderr, "towire_hsmd_get_channel_basepoints called!\n"); abort(); }
 /* Generated stub for towire_hsmd_get_output_scriptpubkey */
 u8 *towire_hsmd_get_output_scriptpubkey(const tal_t *ctx UNNEEDED, u64 channel_id UNNEEDED, const struct node_id *peer_id UNNEEDED, const struct pubkey *commitment_point UNNEEDED)
 { fprintf(stderr, "towire_hsmd_get_output_scriptpubkey called!\n"); abort(); }
-/* Generated stub for towire_temporary_node_failure */
-u8 *towire_temporary_node_failure(const tal_t *ctx UNNEEDED)
-{ fprintf(stderr, "towire_temporary_node_failure called!\n"); abort(); }
 /* Generated stub for txfilter_add_scriptpubkey */
 void txfilter_add_scriptpubkey(struct txfilter *filter UNNEEDED, const u8 *script TAKES UNNEEDED)
 { fprintf(stderr, "txfilter_add_scriptpubkey called!\n"); abort(); }
+/* Generated stub for wait_index_increment */
+u64  wait_index_increment(struct lightningd *ld UNNEEDED,
+				       struct db *db UNNEEDED,
+				       enum wait_subsystem subsystem UNNEEDED,
+				       enum wait_index index UNNEEDED,
+				       ...)
+{ fprintf(stderr, "wait_index_increment called!\n"); abort(); }
 /* Generated stub for wait_index_name */
 const char *wait_index_name(enum wait_index index UNNEEDED)
 { fprintf(stderr, "wait_index_name called!\n"); abort(); }
 /* Generated stub for wait_subsystem_name */
 const char *wait_subsystem_name(enum wait_subsystem subsystem UNNEEDED)
 { fprintf(stderr, "wait_subsystem_name called!\n"); abort(); }
-/* Generated stub for wire_sync_read */
-u8 *wire_sync_read(const tal_t *ctx UNNEEDED, int fd UNNEEDED)
-{ fprintf(stderr, "wire_sync_read called!\n"); abort(); }
-/* Generated stub for wire_sync_write */
-bool wire_sync_write(int fd UNNEEDED, const void *msg TAKES UNNEEDED)
-{ fprintf(stderr, "wire_sync_write called!\n"); abort(); }
 /* AUTOGENERATED MOCKS END */
 
 void plugin_hook_db_sync(struct db *db UNNEEDED)
+{
+}
+
+void migrate_from_account_db(struct lightningd *ld UNNEEDED, struct db *db UNNEEDED)
 {
 }
 
@@ -401,7 +406,7 @@ static struct db *create_test_db(void)
 
 	dsn = tal_fmt(NULL, "sqlite3://%s", filename);
 	tal_free(filename);
-	db = db_open(NULL, dsn, true, db_error, (struct lightningd *)NULL);
+	db = db_open(NULL, dsn, true, true, db_error, (struct lightningd *)NULL);
 	db->data_version = 0;
 	db->report_changes_fn = NULL;
 

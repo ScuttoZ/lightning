@@ -1,14 +1,9 @@
 #include "config.h"
 #include <common/json_channel_type.h>
-#include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/json_stream.h>
 #include <lightningd/channel.h>
 #include <lightningd/closed_channel.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/peer_control.h>
-#include <wallet/wallet.h>
 
 size_t hash_cid(const struct channel_id *cid)
 {
@@ -64,6 +59,9 @@ static void json_add_closed_channel(struct json_stream *response,
 	} else if (!amount_msat_is_zero(channel->push))
 		json_add_amount_msat(response, "funding_pushed_msat",
 				     channel->push);
+	if (channel->funding_psbt)
+		json_add_psbt(response, "funding_psbt", channel->funding_psbt);
+	json_add_bool(response, "funding_withheld", channel->withheld);
 
 	json_add_amount_sat_msat(response, "total_msat", channel->funding_sats);
 	json_add_amount_msat(response, "final_to_us_msat", channel->our_msat);

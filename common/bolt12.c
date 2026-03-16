@@ -1,16 +1,13 @@
 #include "config.h"
-#include <assert.h>
 #include <bitcoin/chainparams.h>
 #include <ccan/tal/str/str.h>
-#include <ccan/time/time.h>
 #include <common/bech32_util.h>
 #include <common/bolt12.h>
 #include <common/bolt12_merkle.h>
-#include <common/configdir.h>
 #include <common/features.h>
 #include <common/overflows.h>
+#include <common/utils.h>
 #include <inttypes.h>
-#include <secp256k1_schnorrsig.h>
 #include <time.h>
 
 /* If chains is NULL, max_num_chains is ignored */
@@ -174,6 +171,7 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 	const u8 *data;
 	size_t dlen;
 	const struct tlv_field *badf;
+	const struct recurrence *recurr;
 
 	data = string_to_data(tmpctx, b12, b12len, "lno", &dlen, fail);
 	if (!data)
@@ -226,6 +224,16 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 
 	/* BOLT #12:
 	 *
+	 *   - if `offer_currency` is set and `offer_amount` is not set:
+	 *     - MUST NOT respond to the offer.
+	 */
+	if (offer->offer_currency && !offer->offer_amount) {
+		*fail = tal_strdup(ctx, "Offer contains a currency with no amount");
+		return tal_free(offer);
+	}
+
+	/* BOLT #12:
+	 *
 	 *   - if neither `offer_issuer_id` nor `offer_paths` are set:
 	 *     - MUST NOT respond to the offer.
 	 */
@@ -241,6 +249,46 @@ struct tlv_offer *offer_decode(const tal_t *ctx,
 	for (size_t i = 0; i < tal_count(offer->offer_paths); i++) {
 		if (tal_count(offer->offer_paths[i]->path) == 0) {
 			*fail = tal_strdup(ctx, "Offer contains an empty offer_path");
+			return tal_free(offer);
+		}
+	}
+
+	/* BOLT-recurrence #12
+	 *   - if `offer_recurrence_optional` or `offer_recurrence_compulsory` are set:
+	 *     - if `time_unit` is not one of 0, 1, or 2:
+	 *        - MUST NOT respond to the offer.
+	 *     - if `period` is 0:
+	 *        - MUST NOT respond to the offer.
+	 *     - if `offer_recurrence_limit` is set and `max_period_index` is 0:
+	 *        - MUST NOT respond to the offer.
+	 */
+	recurr = offer_recurrence(offer);
+	if (recurr) {
+		if (recurr->time_unit != 0
+		    && recurr->time_unit != 1
+		    && recurr->time_unit != 2) {
+			*fail = tal_fmt(ctx, "Offer contains invalid recurrence time_unit %u", recurr->time_unit);
+			return tal_free(offer);
+		}
+		if (recurr->period == 0) {
+			*fail = tal_fmt(ctx, "Offer contains invalid recurrence period %u", recurr->period);
+			return tal_free(offer);
+		}
+		if (offer->offer_recurrence_limit && *offer->offer_recurrence_limit == 0) {
+			*fail = tal_fmt(ctx, "Offer contains invalid recurrence limit %u",
+					*offer->offer_recurrence_limit);
+			return tal_free(offer);
+		}
+	} else {
+		/* BOLT-recurrence #12
+		 *   - otherwise: (no recurrence):
+		 *     - if it `offer_recurrence_paywindow`, `offer_recurrence_limit` or `offer_recurrence_base` are set:
+		 *        - MUST NOT respond to the offer.
+		 */
+		if (offer->offer_recurrence_paywindow
+		    || offer->offer_recurrence_limit
+		    || offer->offer_recurrence_base) {
+			*fail = tal_strdup(ctx, "Offer contains recurrence fields but no recurrence");
 			return tal_free(offer);
 		}
 	}
@@ -377,11 +425,6 @@ static void add_months(struct tm *tm, u32 number)
 	tm->tm_mon += number;
 }
 
-static void add_years(struct tm *tm, u32 number)
-{
-	tm->tm_year += number;
-}
-
 static u64 time_change(u64 prevstart, u32 number,
 		       void (*add_time)(struct tm *tm, u32 number),
 		       bool day_const)
@@ -412,8 +455,7 @@ u64 offer_period_start(u64 basetime, size_t n,
 		       const struct recurrence *recur)
 {
 	/* BOLT-recurrence #12:
-	 * 1. A `time_unit` defining 0 (seconds), 1 (days), 2 (months),
-	 *    3 (years).
+	 * 1. A `time_unit` defining 0 (seconds), 1 (days), 2 (months).
 	 */
 	switch (recur->time_unit) {
 	case 0:
@@ -422,8 +464,6 @@ u64 offer_period_start(u64 basetime, size_t n,
 		return time_change(basetime, recur->period * n, add_days, false);
 	case 2:
 		return time_change(basetime, recur->period * n, add_months, true);
-	case 3:
-		return time_change(basetime, recur->period * n, add_years, true);
 	default:
 		/* This is our offer, how did we get here? */
 		return 0;
@@ -437,17 +477,17 @@ void offer_period_paywindow(const struct recurrence *recurrence,
 			    u64 *start, u64 *end)
 {
 	/* BOLT-recurrence #12:
-	 * - if the offer contains `recurrence_paywindow`:
+	 * - if `offer_recurrence_paywindow` is present:
 	 */
 	if (recurrence_paywindow) {
 		u64 pstart = offer_period_start(basetime, period_idx,
 						recurrence);
 		/* BOLT-recurrence #12:
-		 * - if the offer has a `recurrence_basetime` or the
+		 * - if `recurrence_basetime` is present or
 		 *    `recurrence_counter` is non-zero:
-		 *   - SHOULD NOT send an `invreq` for a period prior to
+		 *   - SHOULD NOT send an `invoice_request` for a period prior to
 		 *     `seconds_before` seconds before that period start.
-		 *   - SHOULD NOT send an `invreq` for a period later
+		 *   - SHOULD NOT send an `invoice_request` for a period later
 		 *     than `seconds_after` seconds past that period start.
 		 */
 		*start = pstart - recurrence_paywindow->seconds_before;
@@ -462,9 +502,9 @@ void offer_period_paywindow(const struct recurrence *recurrence,
 	} else {
 		/* BOLT-recurrence #12:
 		 * - otherwise:
-		 *   - SHOULD NOT send an `invreq` with
-		 *     `recurrence_counter` is non-zero for a period whose
-		 *     immediate predecessor has not yet begun.
+		 *   - SHOULD NOT send an `invoice_request` with
+		 *     non-zero `recurrence_counter` for a period
+		 *     whose immediate predecessor has not yet begun.
 		 */
 		if (period_idx == 0)
 			*start = 0;
@@ -473,7 +513,7 @@ void offer_period_paywindow(const struct recurrence *recurrence,
 						    recurrence);
 
 		/* BOLT-recurrence #12:
-		 *     - SHOULD NOT send an `invreq` for a period which
+		 *     - SHOULD NOT send an `invoice_request` for a period which
 		 *       has already passed.
 		 */
 		*end = offer_period_start(basetime, period_idx+1,
@@ -594,7 +634,7 @@ static bool bolt12_has_request_prefix(const char *str)
 	return strstarts(str, "lnr1") || strstarts(str, "LNR1");
 }
 
-static bool bolt12_has_offer_prefix(const char *str)
+bool bolt12_has_offer_prefix(const char *str)
 {
 	return strstarts(str, "lno1") || strstarts(str, "LNO1");
 }
@@ -814,4 +854,25 @@ bool bolt12_bip353_valid_string(const u8 *str, size_t len)
 		return false;
 	}
 	return true;
+}
+
+const struct recurrence *offer_recurrence(const struct tlv_offer *offer)
+{
+	if (offer->offer_recurrence_compulsory)
+		return offer->offer_recurrence_compulsory;
+	return offer->offer_recurrence_optional;
+}
+
+const struct recurrence *invreq_recurrence(const struct tlv_invoice_request *invreq)
+{
+	if (invreq->offer_recurrence_compulsory)
+		return invreq->offer_recurrence_compulsory;
+	return invreq->offer_recurrence_optional;
+}
+
+const struct recurrence *invoice_recurrence(const struct tlv_invoice *inv)
+{
+	if (inv->offer_recurrence_compulsory)
+		return inv->offer_recurrence_compulsory;
+	return inv->offer_recurrence_optional;
 }

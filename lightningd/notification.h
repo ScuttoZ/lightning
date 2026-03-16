@@ -25,9 +25,13 @@ void notify_connect(struct lightningd *ld,
 		    const struct node_id *nodeid,
 		    bool incoming,
 		    const struct wireaddr_internal *addr);
-void notify_disconnect(struct lightningd *ld, struct node_id *nodeid);
+void notify_disconnect(struct lightningd *ld, const struct node_id *nodeid);
 
-void notify_warning(struct lightningd *ld, struct log_entry *l);
+void notify_warning(struct lightningd *ld,
+		    enum log_level level,
+		    struct timeabs time,
+		    const char *source,
+		    const char *logmsg);
 
 void notify_custommsg(struct lightningd *ld,
 		      const struct node_id *peer_id,
@@ -83,8 +87,13 @@ void notify_sendpay_failure(struct lightningd *ld,
 			    const struct routing_failure *fail,
 			    const char *errmsg);
 
-void notify_coin_mvt(struct lightningd *ld,
-		     const struct coin_mvt *mvt);
+void notify_channel_mvt(struct lightningd *ld,
+			const struct channel_coin_mvt *chan_mvt,
+			u64 id);
+
+void notify_chain_mvt(struct lightningd *ld,
+		      const struct chain_coin_mvt *chain_mvt,
+		      u64 id);
 
 void notify_balance_snapshot(struct lightningd *ld,
 			     const struct balance_snapshot *snap);
@@ -115,7 +124,11 @@ bool notify_deprecated_oneshot(struct lightningd *ld,
 /* Tell this plugin to shutdown: returns true if it was subscribed. */
 bool notify_plugin_shutdown(struct lightningd *ld, struct plugin *p);
 /* Inform the plugin when a log line is emitted */
-void notify_log(struct lightningd *ld, const struct log_entry *l);
+void notify_log(struct lightningd *ld,
+		enum log_level level,
+		struct timeabs time,
+		const char *source,
+		const char *logmsg);
 
 void notify_plugin_started(struct lightningd *ld, struct plugin *plugin);
 void notify_plugin_stopped(struct lightningd *ld, struct plugin *plugin);

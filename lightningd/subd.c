@@ -7,6 +7,7 @@
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/memleak.h>
+#include <common/msg_queue.h>
 #include <common/peer_status_wiregen.h>
 #include <common/status_wiregen.h>
 #include <common/version.h>
@@ -17,7 +18,6 @@
 #include <lightningd/log_status.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/subd.h>
-#include <sys/socket.h>
 #include <sys/wait.h>
 #include <wire/wire_io.h>
 
@@ -438,6 +438,8 @@ static bool handle_peer_error(struct subd *sd, const u8 *msg, int fds[1])
 
 	/* Don't free sd; we may be about to free channel. */
 	sd->channel = NULL;
+	/* While it's cleaning up, this is not a leak! */
+	notleak(sd);
 	sd->errcb(channel, peer_fd, desc, err_for_them, disconnect, warning);
 	return true;
 }
@@ -641,6 +643,8 @@ static void destroy_subd(struct subd *sd)
 
 		/* Clear any transient messages in billboard */
 		sd->billboardcb(channel, false, NULL);
+		/* While it's cleaning up, this is not a leak! */
+		notleak(sd);
 		sd->channel = NULL;
 
 		/* We can be freed both inside msg handling, or spontaneously. */
@@ -928,11 +932,6 @@ void subd_release_channel(struct subd *owner, const void *channel)
 		assert(owner->channel == channel);
 		owner->channel = NULL;
 		tal_free(owner);
-	} else {
-		/* Caller has reassigned channel->owner, so there's no pointer
-		 * to this subd owner while it's freeing itself.  If we
-		 * ask memleak right now, it will complain! */
-		notleak(owner);
 	}
 }
 

@@ -53,6 +53,15 @@ and is usually no greater than the number of channels that the node has
 ever had.
 Specify *password* if the `hsm_secret_path` is encrypted.
 
+**derivetoremote** *node\_id* *channel\_dbid* \[*commitment\_point*\] *hsm\_secret*
+  Derive the private key to our funds from a remote unilateral close of a channel.
+The peer must be the one to close the channel (and the funds will remain
+unrecoverable until the channel is closed).
+*channel\_dbid* is the identifier of the channel in the CLN database.
+If *commitment\_point* is omitted, then the channel is assumed to have been
+negotiated with `option_static_remotekey`;
+otherwise, *commitment\_point* is the remote per-commitment point.
+
 **generatehsm** *hsm\_secret\_path* \[*lang* *seed\_phrase*  \[*passphrase*\]\]
   Generates a new hsm\_secret using BIP39.  If lang, seed\_phrase and optional passphrase are not provided they will be prompted for.  *lang* can be "en" (English), "es" (Spanish), "fr" (French), "it" ("Italian"), "jp" (Japanese), "zhs" (Chinese Simplified) or "zht" ("Chinese Traditional"). Note that the seed phrase consists of multiple words, so should be surrounded by quotes.
 
@@ -79,8 +88,11 @@ the last parameter. By default, mainnet-encoded keys are generated.
 This produces the same results as lightning-commando-rune(7) on a fresh node.
 You will still need to create a rune once the node starts, if you want commando to work (as it is only activated once it has generated one).
 
+**getsecret** *hsm\_secret\_path* [*id*]
+  Extract the secret from the `hsm_secret` file and print it out, for use with `--recover`.  This is usually a 12-word mnemonic, but for pre-v25.12 nodes, a 4-character `id` is needed to generate a BIP-93 formatted HSM secret (e.g. `ad00`): it cannot contain `i`, `o`, or `b`, but can contain digits except `1`.
+
 **getcodexsecret** *hsm\_secret\_path* *id*
-  Print out the BIP-93 formatted HSM secret, for use with `--recover`.  The `id` is any 4 character string you can use to identify this secret (e.g. `ad00`): it cannot contain `i`, `o`, or `b`, but can contain digits except `1`.
+  Deprecated alias for getsecret: only works on older (pre-v25.12) nodes.
 
 **getemergencyrecover** *emergency.recover\_path*
   Print out the bech32 encoded emergency.recover file.
@@ -97,9 +109,8 @@ to gain our eternal gratitude!
 AUTHOR
 ------
 
-ZmnSCPxj <<ZmnSCPxj@protonmail.com>> wrote the initial version of
-this man page, but many others did the hard work of actually implementing
-**lightning-hsmtool**.
+ZmnSCPxj [ZmnSCPxj@protonmail.com](mailto:ZmnSCPxj@protonmail.com) wrote the initial version of
+this man page, but many others did the hard work of actually implementing **lightning-hsmtool**.
 
 SEE ALSO
 --------
@@ -109,11 +120,11 @@ lightningd(8), lightningd-config(5)
 RESOURCES
 ---------
 
-Main web site: <https://github.com/ElementsProject/lightning>
+Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)
 
 COPYING
 -------
 
 Note: the modules in the ccan/ directory have their own licenses, but
 the rest of the code is covered by the BSD-style MIT license.
-Main web site: <https://github.com/ElementsProject/lightning>
+Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)

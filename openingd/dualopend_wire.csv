@@ -1,5 +1,6 @@
 #include <bitcoin/chainparams.h>
 #include <bitcoin/psbt.h>
+#include <bitcoin/signature.h>
 #include <common/cryptomsg.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
@@ -98,6 +99,7 @@ msgdata,dualopend_got_offer,shutdown_scriptpubkey,u8,shutdown_len
 msgdata,dualopend_got_offer,requested_amt,?amount_sat,
 msgdata,dualopend_got_offer,lease_blockheight_start,u32,
 msgdata,dualopend_got_offer,require_confirmed_inputs,bool,
+msgdata,dualopend_got_offer,ctype,channel_type,
 
 # master->dualopend: reply back with our first funding info/contribs
 msgtype,dualopend_got_offer_reply,7105
@@ -211,7 +213,7 @@ msgdata,dualopend_opener_init,channel_flags,u8,
 msgdata,dualopend_opener_init,requested_sats,?amount_sat,
 msgdata,dualopend_opener_init,blockheight,u32,
 msgdata,dualopend_opener_init,dry_run,bool,
-msgdata,dualopend_opener_init,channel_type,?channel_type,
+msgdata,dualopend_opener_init,channel_type,channel_type,
 # must go last because embedded tu32
 msgdata,dualopend_opener_init,expected_rates,?lease_rates,
 
@@ -287,3 +289,8 @@ msgdata,dualopend_validate_lease,their_pubkey,pubkey,
 
 msgtype,dualopend_validate_lease_reply,7127
 msgdata,dualopend_validate_lease_reply,err_msg,?wirestring,
+
+msgtype,dualopend_got_announcement,7031
+msgdata,dualopend_got_announcement,scid,short_channel_id,
+msgdata,dualopend_got_announcement,remote_ann_node_sig,secp256k1_ecdsa_signature,
+msgdata,dualopend_got_announcement,remote_ann_bitcoin_sig,secp256k1_ecdsa_signature,

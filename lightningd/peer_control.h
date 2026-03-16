@@ -87,9 +87,9 @@ struct peer *peer_from_json(struct lightningd *ld,
 			    const jsmntok_t *peeridtok);
 
 /* connectd tells us what peer is doing */
-void peer_connected(struct lightningd *ld, const u8 *msg);
-void peer_disconnect_done(struct lightningd *ld, const u8 *msg);
-void peer_spoke(struct lightningd *ld, const u8 *msg);
+void handle_peer_connected(struct lightningd *ld, const u8 *msg);
+void handle_peer_disconnected(struct lightningd *ld, const u8 *msg);
+void handle_peer_spoke(struct lightningd *ld, const u8 *msg);
 
 /* Could be configurable. */
 #define OUR_CHANNEL_FLAGS CHANNEL_FLAGS_ANNOUNCE_CHANNEL
@@ -119,6 +119,9 @@ void peer_set_dbid(struct peer *peer, u64 dbid);
 /* At startup, re-send any transactions we want bitcoind to have */
 void resend_closing_transactions(struct lightningd *ld);
 
+/* At startup, re-send any funding transactions we want bitcoind to have */
+void resend_opening_transactions(struct lightningd *ld);
+
 /* Initiate the close of a channel, maybe broadcast.  If we've seen a
  * unilateral close, pass it here (means we don't need to broadcast
  * our own, or any anchors). */
@@ -131,6 +134,7 @@ void update_channel_from_inflight(struct lightningd *ld,
 				  const struct channel_inflight *inflight,
 				  bool is_splice);
 
+void channel_unwatch_funding(struct lightningd *ld, struct channel *channel);
 void channel_watch_funding(struct lightningd *ld, struct channel *channel);
 
 /* If this channel has a "wrong funding" shutdown, watch that too. */

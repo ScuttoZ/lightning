@@ -1,16 +1,12 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/base58.h>
-#include <bitcoin/pubkey.h>
 #include <ccan/mem/mem.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
-#include <common/amount.h>
 #include <common/bech32.h>
 #include <common/json_parse.h>
-#include <common/json_parse_simple.h>
 #include <common/splice_script.h>
-#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 
@@ -503,7 +499,7 @@ char *fmt_splice_script_compiler_error(const tal_t *ctx,
 
 static bool is_whitespace(char c)
 {
-	return isspace(c);
+	return cisspace(c);
 }
 
 static struct splice_script_error *clean_whitespace(const tal_t *ctx,

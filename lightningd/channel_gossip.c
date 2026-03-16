@@ -1,7 +1,7 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
-#include <ccan/mem/mem.h>
+#include <common/clock_time.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/wire_error.h>
@@ -13,7 +13,6 @@
 #include <lightningd/gossip_generation.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/lightningd.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/subd.h>
 
 enum channel_gossip_state {
@@ -95,6 +94,8 @@ static struct state_transition allowed_transitions[] = {
 	  "Channel usable (zeroconf) but no scid yet" },
 	{ CGOSSIP_WAITING_FOR_SCID, CGOSSIP_CHANNEL_DEAD,
 	  "Zeroconf channel closed before funding tx mined" },
+	{ CGOSSIP_WAITING_FOR_SCID, CGOSSIP_CHANNEL_UNANNOUNCED_DYING,
+	  "Zeroconf channel closing mutually before funding tx" },
 	{ CGOSSIP_WAITING_FOR_USABLE, CGOSSIP_WAITING_FOR_MATCHING_PEER_SIGS,
 	  "Channel mined, but we haven't got matching announcment sigs from peer" },
 	{ CGOSSIP_WAITING_FOR_USABLE, CGOSSIP_WAITING_FOR_ANNOUNCE_DEPTH,
@@ -117,6 +118,8 @@ static struct state_transition allowed_transitions[] = {
 	  "Unannounced channel closed onchain." },
 	{ CGOSSIP_CHANNEL_UNANNOUNCED_DYING, CGOSSIP_CHANNEL_ANNOUNCED_DYING,
 	  "Unannounced closing channel reached announce depth." },
+	{ CGOSSIP_CHANNEL_UNANNOUNCED_DYING, CGOSSIP_CHANNEL_ANNOUNCED_DEAD,
+	  "Unannounced closing channel reached announce depth and was closed in same block." },
 	{ CGOSSIP_WAITING_FOR_ANNOUNCE_DEPTH, CGOSSIP_ANNOUNCED,
 	  "Channel fully announced" },
 	{ CGOSSIP_WAITING_FOR_MATCHING_PEER_SIGS, CGOSSIP_ANNOUNCED,
@@ -582,7 +585,7 @@ static void arm_refresh_timer(struct channel *channel)
 {
 	struct lightningd *ld = channel->peer->ld;
 	struct channel_gossip *cg = channel->channel_gossip;
-	struct timeabs now = time_now(), due;
+	struct timeabs now = clock_time(), due;
 	u32 timestamp;
 
 	if (!channel_update_details(cg->cupdate, &timestamp, NULL)) {
@@ -1093,13 +1096,16 @@ void channel_gossip_update_from_gossipd(struct channel *channel,
 	case CGOSSIP_WAITING_FOR_USABLE:
 	case CGOSSIP_CHANNEL_DEAD:
 	case CGOSSIP_CHANNEL_UNANNOUNCED_DYING:
-	case CGOSSIP_CHANNEL_ANNOUNCED_DYING:
-	case CGOSSIP_CHANNEL_ANNOUNCED_DEAD:
 		/* Shouldn't happen. */
 		log_broken(channel->log,
 			   "gossipd gave channel_update in %s? update=%s",
 			   channel_gossip_state_str(channel->channel_gossip->state),
 			   tal_hex(tmpctx, channel_update));
+	/* fall thru */
+	/* ANNOUNCED_DEAD can happen is gossipd hadn't processed block
+	 * when we restarted; ignore, as it will catch up soon. */
+	case CGOSSIP_CHANNEL_ANNOUNCED_DEAD:
+	case CGOSSIP_CHANNEL_ANNOUNCED_DYING:
 		if (taken(channel_update))
 			tal_free(channel_update);
 		return;
@@ -1187,7 +1193,7 @@ void channel_gossip_init_done(struct lightningd *ld)
 static void channel_reestablished_stable(struct channel *channel)
 {
 	channel->stable_conn_timer = NULL;
-	channel->last_stable_connection = time_now().ts.tv_sec;
+	channel->last_stable_connection = clock_time().ts.tv_sec;
 	wallet_channel_save(channel->peer->ld->wallet, channel);
 }
 

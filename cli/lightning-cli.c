@@ -13,14 +13,12 @@
 #include <common/configdir.h>
 #include <common/json_command.h>
 #include <common/node_id.h>
-#include <common/status_levels.h>
 #include <common/utils.h>
-#include <common/version.h>
 #include <libgen.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 #define NO_ERROR 0
 #define ERROR_FROM_LIGHTNINGD 1
@@ -260,6 +258,13 @@ static bool is_literal(const char *arg)
 {
 	size_t arglen = strlen(arg);
 	if (arglen == 0) {
+		return false;
+	}
+	/* A string of digits with a leading zero cannot be a literal unless it
+	 * is "0". It should be passed with quotes as it might encode a hex
+	 * data. */
+	if (strspn(arg, "0123456789") == arglen && arglen > 1 &&
+	    arg[0] == '0') {
 		return false;
 	}
 	return strspn(arg, "0123456789.") == arglen

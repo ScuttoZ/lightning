@@ -1,4 +1,5 @@
 headerversions
 check-bolt
-hsmtool
 lightning-hsmtool
+hsmtool
+lightning-downgrade

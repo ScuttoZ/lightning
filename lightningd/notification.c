@@ -1,9 +1,7 @@
 #include "config.h"
 #include <ccan/cast/cast.h>
-#include <common/configdir.h>
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
-#include <lightningd/log.h>
 #include <lightningd/notification.h>
 
 bool notifications_topic_is_native(const char *topic)
@@ -90,7 +88,7 @@ static void disconnect_notification_serialize(struct json_stream *stream,
 }
 REGISTER_NOTIFICATION(disconnect);
 
-void notify_disconnect(struct lightningd *ld, struct node_id *nodeid)
+void notify_disconnect(struct lightningd *ld, const struct node_id *nodeid)
 {
 	struct jsonrpc_notification *n = notify_start(ld, "disconnect");
 	if (!n)
@@ -102,31 +100,38 @@ void notify_disconnect(struct lightningd *ld, struct node_id *nodeid)
 /*'warning' is based on LOG_UNUSUAL/LOG_BROKEN level log
  *(in plugin module, they're 'warn'/'error' level). */
 static void warning_notification_serialize(struct json_stream *stream,
-					   struct log_entry *l)
+					   enum log_level level,
+					   struct timeabs time,
+					   const char *source,
+					   const char *logmsg)
 {
 	/* Choose "BROKEN"/"UNUSUAL" to keep consistent with the habit
 	 * of plugin. But this may confuses the users who want to 'getlog'
 	 * with the level indicated by notifications. It is the duty of a
 	 * plugin to eliminate this misunderstanding. */
 	json_add_string(stream, "level",
-			l->level == LOG_BROKEN ? "error"
+			level == LOG_BROKEN ? "error"
 			: "warn");
 	/* unsuaul/broken event is rare, plugin pay more attentions on
 	 * the absolute time, like when channels failed. */
-	json_add_timestr(stream, "time", l->time.ts);
-	json_add_timeiso(stream, "timestamp", l->time);
-	json_add_string(stream, "source", l->prefix->prefix);
-	json_add_string(stream, "log", l->log);
+	json_add_timestr(stream, "time", time.ts);
+	json_add_timeiso(stream, "timestamp", time);
+	json_add_string(stream, "source", source);
+	json_add_string(stream, "log", logmsg);
 }
 
 REGISTER_NOTIFICATION(warning);
 
-void notify_warning(struct lightningd *ld, struct log_entry *l)
+void notify_warning(struct lightningd *ld,
+		    enum log_level level,
+		    struct timeabs time,
+		    const char *source,
+		    const char *logmsg)
 {
 	struct jsonrpc_notification *n = notify_start(ld, "warning");
 	if (!n)
 		return;
-	warning_notification_serialize(n->stream, l);
+	warning_notification_serialize(n->stream, level, time, source, logmsg);
 	notify_send(ld, n);
 }
 
@@ -275,6 +280,12 @@ void notify_channel_opened(struct lightningd *ld,
 	notify_send(ld, n);
 }
 
+/* Don't use this: omit fields instead! */
+static void json_add_null(struct json_stream *stream, const char *fieldname)
+{
+	json_add_primitive(stream, fieldname, "null");
+}
+
 static void channel_state_changed_notification_serialize(struct json_stream *stream,
 							 struct lightningd *ld,
 							 const struct node_id *peer_id,
@@ -290,19 +301,26 @@ static void channel_state_changed_notification_serialize(struct json_stream *str
 	json_add_channel_id(stream, "channel_id", cid);
 	if (scid)
 		json_add_short_channel_id(stream, "short_channel_id", *scid);
-	else
+	else if (lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+					      "channel_state_changed",
+					      "null_scid",
+					      "v25.09", "v26.09"))
 		json_add_null(stream, "short_channel_id");
 	json_add_timeiso(stream, "timestamp", timestamp);
 	if (old_state != 0 || lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
 							   "channel_state_changed", "old_state.unknown",
-							   "v25.05", "v26.02"))
+							   "v25.05", "v26.03"))
 		json_add_string(stream, "old_state", channel_state_str(old_state));
 	json_add_string(stream, "new_state", channel_state_str(new_state));
 	json_add_string(stream, "cause", channel_change_state_reason_str(cause));
 	if (message != NULL)
 		json_add_string(stream, "message", message);
-	else
+	else if (lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+					      "channel_state_changed",
+					      "null_message",
+					      "v25.12", "v26.12")) {
 		json_add_null(stream, "message");
+	}
 }
 
 REGISTER_NOTIFICATION(channel_state_changed)
@@ -445,90 +463,61 @@ void notify_sendpay_failure(struct lightningd *ld,
 	notify_send(ld, n);
 }
 
-static void json_mvt_id(struct json_stream *stream, enum mvt_type mvt_type,
-			const struct mvt_id *id)
+static void json_add_standard_notify_mvt_fields(struct json_stream *stream,
+						struct lightningd *ld,
+						const char *type)
 {
-	switch (mvt_type) {
-		case CHAIN_MVT:
-			/* some 'journal entries' don't have a txid */
-			if (id->tx_txid)
-				json_add_string(stream, "txid",
-						fmt_bitcoin_txid(tmpctx,
-								 id->tx_txid));
-			/* some chain ledger entries aren't associated with a utxo
-			 * e.g. journal updates (due to penalty/state loss) and
-			 * chain_fee entries */
-			if (id->outpoint) {
-				json_add_string(stream, "utxo_txid",
-						fmt_bitcoin_txid(tmpctx,
-								 &id->outpoint->txid));
-				json_add_u32(stream, "vout", id->outpoint->n);
-			}
-
-			/* on-chain htlcs include a payment hash */
-			if (id->payment_hash)
-				json_add_sha256(stream, "payment_hash", id->payment_hash);
-			return;
-	case CHANNEL_MVT:
-		/* push funding / leases don't have a payment_hash */
-		if (id->payment_hash)
-			json_add_sha256(stream, "payment_hash", id->payment_hash);
-		if (id->part_id)
-			json_add_u64(stream, "part_id", *id->part_id);
-		return;
-	}
-	abort();
-}
-
-static void coin_movement_notification_serialize(struct json_stream *stream,
-						 const struct coin_mvt *mvt)
-{
-	json_add_num(stream, "version", mvt->version);
-	json_add_node_id(stream, "node_id", mvt->node_id);
-	if (mvt->peer_id)
-		json_add_node_id(stream, "peer_id", mvt->peer_id);
-	json_add_string(stream, "type", mvt_type_str(mvt->type));
-	json_add_string(stream, "account_id", mvt->account_id);
-	if (mvt->originating_acct)
-		json_add_string(stream, "originating_account",
-				mvt->originating_acct);
-	json_mvt_id(stream, mvt->type, &mvt->id);
-	json_add_amount_msat(stream, "credit_msat", mvt->credit);
-	json_add_amount_msat(stream, "debit_msat", mvt->debit);
-
-	/* Only chain movements */
-	if (mvt->output_val)
-		json_add_amount_sat_msat(stream,
-					 "output_msat", *mvt->output_val);
-	if (mvt->output_count > 0)
-		json_add_num(stream, "output_count",
-			     mvt->output_count);
-
-	if (mvt->fees) {
-		json_add_amount_msat(stream, "fees_msat", *mvt->fees);
-	}
-
-	json_array_start(stream, "tags");
-	for (size_t i = 0; i < tal_count(mvt->tags); i++)
-		json_add_string(stream, NULL, mvt_tag_str(mvt->tags[i]));
-	json_array_end(stream);
-
-	if (mvt->type == CHAIN_MVT)
-		json_add_u32(stream, "blockheight", mvt->blockheight);
-
-	json_add_u32(stream, "timestamp", mvt->timestamp);
-	json_add_string(stream, "coin_type", mvt->hrp_name);
+	json_add_num(stream, "version", COIN_MVT_VERSION);
+ 	json_add_string(stream, "coin_type", chainparams->lightning_hrp);
+ 	json_add_node_id(stream, "node_id", &ld->our_nodeid);
+	json_add_string(stream, "type", type);
 }
 
 REGISTER_NOTIFICATION(coin_movement);
 
-void notify_coin_mvt(struct lightningd *ld,
-		     const struct coin_mvt *mvt)
+void notify_channel_mvt(struct lightningd *ld,
+			const struct channel_coin_mvt *chan_mvt,
+			u64 id)
 {
+	bool include_tags_arr;
 	struct jsonrpc_notification *n = notify_start(ld, "coin_movement");
 	if (!n)
 		return;
-	coin_movement_notification_serialize(n->stream, mvt);
+	include_tags_arr = lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+							"coin_movement", "tags",
+							"v25.09", "v26.09");
+
+	json_add_standard_notify_mvt_fields(n->stream, ld, "channel_mvt");
+	/* Adding (empty) extra_tags field unifies this with notify_chain_mvt */
+	json_add_channel_mvt_fields(n->stream, include_tags_arr, chan_mvt, id, true);
+	notify_send(ld, n);
+}
+
+void notify_chain_mvt(struct lightningd *ld,
+		      const struct chain_coin_mvt *chain_mvt,
+		      u64 id)
+{
+	bool include_tags_arr, include_old_utxo_fields, include_old_txid_field;
+	struct jsonrpc_notification *n = notify_start(ld, "coin_movement");
+	if (!n)
+		return;
+
+	include_tags_arr = lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+							"coin_movement", "tags",
+							"v25.09", "v26.09");
+	include_old_utxo_fields = lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+							"coin_movement", "utxo_txid",
+							"v25.09", "v26.09");
+	include_old_txid_field = lightningd_deprecated_out_ok(ld, ld->deprecated_ok,
+							"coin_movement", "txid",
+							"v25.09", "v26.09");
+
+	json_add_standard_notify_mvt_fields(n->stream, ld, "chain_mvt");
+	json_add_chain_mvt_fields(n->stream,
+				  include_tags_arr,
+				  include_old_utxo_fields,
+				  include_old_txid_field,
+				  chain_mvt, id);
 	notify_send(ld, n);
 }
 
@@ -649,26 +638,33 @@ bool notify_deprecated_oneshot(struct lightningd *ld,
 REGISTER_NOTIFICATION(deprecated_oneshot);
 
 static void log_notification_serialize(struct json_stream *stream,
-				       const struct log_entry *l)
+				       enum log_level level,
+				       struct timeabs time,
+				       const char *source,
+				       const char *logmsg)
 {
-	json_add_string(stream, "level", log_level_name(l->level));
-	json_add_timestr(stream, "time", l->time.ts);
-	json_add_timeiso(stream, "timestamp", l->time);
-	json_add_string(stream, "source", l->prefix->prefix);
-	json_add_string(stream, "log", l->log);
+	json_add_string(stream, "level", log_level_name(level));
+	json_add_timestr(stream, "time", time.ts);
+	json_add_timeiso(stream, "timestamp", time);
+	json_add_string(stream, "source", source);
+	json_add_string(stream, "log", logmsg);
 }
 
 
 REGISTER_NOTIFICATION(log);
 
-void notify_log(struct lightningd *ld, const struct log_entry *l)
+void notify_log(struct lightningd *ld,
+		enum log_level level,
+		struct timeabs time,
+		const char *source,
+		const char *logmsg)
 {
 	struct jsonrpc_notification *n;
 
 	n = notify_start(ld, "log");
 	if (!n)
 		return;
-	log_notification_serialize(n->stream, l);
+	log_notification_serialize(n->stream, level, time, source, logmsg);
 	notify_send(ld, n);
 }
 

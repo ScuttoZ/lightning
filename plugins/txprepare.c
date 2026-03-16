@@ -1,15 +1,11 @@
 #include "config.h"
 #include <bitcoin/psbt.h>
-#include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
-#include <common/addr.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
 #include <common/psbt_open.h>
-#include <common/pseudorand.h>
 #include <plugins/libplugin.h>
-#include <wally_psbt.h>
 
 struct tx_output {
 	struct amount_sat amount;
@@ -526,7 +522,7 @@ static struct command_result *listfunds_done(struct command *cmd,
 	txp->output_total = AMOUNT_SAT(0);
 	if (!outputs_tok)
 		plugin_err(cmd->plugin,
-			   "`listfunds` payload has no outputs token: %*.s",
+			   "`listfunds` payload has no outputs token: %.*s",
 			   json_tok_full_len(result),
 			   json_tok_full(buf, result));
 
@@ -551,7 +547,7 @@ static struct command_result *listfunds_done(struct command *cmd,
 				JSON_SCAN(json_to_number, &prev_out.n));
 		if (err)
 			plugin_err(cmd->plugin,
-				   "`listfunds` payload did not scan. %s: %*.s",
+				   "`listfunds` payload did not scan. %s: %.*s",
 				   err, json_tok_full_len(result),
 				   json_tok_full(buf, result));
 

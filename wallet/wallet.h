@@ -18,6 +18,7 @@
 #include <lightningd/wait.h>
 
 struct amount_msat;
+struct bitcoin_signature;
 struct invoices;
 struct channel;
 struct channel_inflight;
@@ -613,6 +614,7 @@ bool wallet_can_spend(struct wallet *w,
  */
 s64 wallet_get_newindex(struct lightningd *ld, enum addrtype addrtype);
 
+
 /**
  * wallet_get_addrtype - get the address types for this key.
  * @wallet: (in) wallet
@@ -726,6 +728,14 @@ void wallet_state_change_add(struct wallet *w,
 void wallet_delete_peer_if_unused(struct wallet *w, u64 peer_dbid);
 
 /**
+ * wallet_delete_old_htlcs -- delete htlcs associated with CLOSED channels.
+ *
+ * We do this at startup, instead of when we finally CLOSED a channel, to
+ * avoid a significant pause.
+ */
+void wallet_delete_old_htlcs(struct wallet *w);
+
+/**
  * wallet_init_channels -- Loads active channels into peers
  *    and inits the dbid counter for next channel.
  *
@@ -778,6 +788,16 @@ void wallet_channel_stats_incr_out_fulfilled(struct wallet *w, u64 cdbid, struct
  * @w: wallet to load from.
  */
 u32 wallet_blocks_maxheight(struct wallet *w);
+
+/**
+ * Retrieve the blockheight of the first block processed by lightningd (ignoring
+ * backfilled blocks for gossip).
+ *
+ * Will return the 0 if the wallet was never used before.
+ *
+ * @w: wallet to load from.
+ */
+u32 wallet_blocks_contig_minheight(struct wallet *w);
 
 /**
  * wallet_extract_owned_outputs - given a tx, extract all of our outputs
@@ -1866,6 +1886,84 @@ struct issued_address_type *wallet_list_addresses(const tal_t *ctx, struct walle
 					 u64 liststart, const u32 *listlimit);
 
 
+enum network_event {
+	NETWORK_EVENT_CONNECT = 1,
+	NETWORK_EVENT_CONNECTFAIL = 2,
+	NETWORK_EVENT_PING = 3,
+	NETWORK_EVENT_DISCONNECT = 4,
+};
+
+static inline enum network_event network_event_in_db(enum network_event n)
+{
+	switch (n) {
+	case NETWORK_EVENT_CONNECT:
+		BUILD_ASSERT(NETWORK_EVENT_CONNECT == 1);
+		return n;
+	case NETWORK_EVENT_CONNECTFAIL:
+		BUILD_ASSERT(NETWORK_EVENT_CONNECTFAIL == 2);
+		return n;
+	case NETWORK_EVENT_PING:
+		BUILD_ASSERT(NETWORK_EVENT_PING == 3);
+		return n;
+	case NETWORK_EVENT_DISCONNECT:
+		BUILD_ASSERT(NETWORK_EVENT_DISCONNECT == 4);
+		return n;
+	}
+	fatal("%s: %u is invalid", __func__, n);
+}
+
+const char *network_event_name(enum network_event n);
+
+/**
+ * Iterate through the network events.
+ * @w: the wallet
+ * @specific_id: filter by peer_id if non-NULL.
+ * @liststart: first index to return (0 == all).
+ * @listlimit: limit on number of entries to return (NULL == no limit).
+ *
+ * Returns pointer to hand as @stmt to wallet_network_events_next(), or NULL.
+ * If you choose not to call wallet_network_events_next() you must free it!
+ */
+struct db_stmt *wallet_network_events_first(struct wallet *w,
+					    const struct node_id *specific_id,
+					    u64 liststart,
+					    u32 *listlimit);
+struct db_stmt *wallet_network_events_next(struct wallet *w,
+					   struct db_stmt *stmt);
+
+/* Delete one entry.  Returns false if it doesn't exist. */
+bool wallet_network_event_delete(struct wallet *w, u64 created_index);
+
+/**
+ * Extract a network event from the db.
+ * @ctx: the tal ctx to allocate off
+ * @stmt: the db_stmt from wallet_network_events_first/next
+ * @id: the creation key
+ * @peer_id: the peer we're talking to
+ * @timestamp: the time the event was recorded
+ * @etype: the network_event type
+ * @reason: the optional reason (or set to NULL)
+ * @duration_nsec: the time it took (if applicable).
+ * @connect_attempted: whether we attempted at least one address (for NETWORK_EVENT_CONNECTFAIL)
+ */
+void wallet_network_events_extract(const tal_t *ctx,
+				   struct db_stmt *stmt,
+				   u64 *id,
+				   struct node_id *peer_id,
+				   u64 *timestamp,
+				   enum network_event *etype,
+				   const char **reason,
+				   u64 *duration_nsec,
+				   bool *connect_attempted);
+
+/* Put the next network event into the db */
+void wallet_save_network_event(struct lightningd *ld,
+			       const struct node_id *peer_id,
+			       enum network_event etype,
+			       const char *reason,
+			       u64 duration_nsec,
+			       bool connect_attempted);
+
 /**
  * wallet_begin_old_close_rescan: rescan for missing mutual close p2wpkh outputs.
  *
@@ -1873,8 +1971,50 @@ struct issued_address_type *wallet_list_addresses(const tal_t *ctx, struct walle
  */
 void wallet_begin_old_close_rescan(struct lightningd *ld);
 
-/**
- * wallet_memleak_scan - Check for memleaks in wallet.
- */
-void wallet_memleak_scan(struct htable *memtable, const struct wallet *w);
+/* Coin movement storage: also calls notifications */
+void wallet_save_channel_mvt(struct lightningd *ld,
+			     const struct channel_coin_mvt *chan_mvt);
+
+void wallet_save_chain_mvt(struct lightningd *ld,
+			   const struct chain_coin_mvt *chain_mvt);
+
+/* coin movement table iterators */
+struct db_stmt *wallet_chain_moves_first(struct wallet *wallet,
+					 u64 liststart,
+					 u32 *listlimit);
+struct db_stmt *wallet_chain_moves_next(struct wallet *wallet,
+					struct db_stmt *stmt);
+
+struct chain_coin_mvt *wallet_chain_move_extract(const tal_t *ctx,
+						 struct db_stmt *stmt,
+						 struct lightningd *ld,
+						 u64 *id);
+
+struct db_stmt *wallet_channel_moves_first(struct wallet *wallet,
+					   u64 liststart,
+					   u32 *listlimit);
+struct db_stmt *wallet_channel_moves_next(struct wallet *wallet,
+					  struct db_stmt *stmt);
+
+struct channel_coin_mvt *wallet_channel_move_extract(const tal_t *ctx,
+						     struct db_stmt *stmt,
+						     struct lightningd *ld,
+						     u64 *id);
+
+/* For bookkeeper migration */
+void db_bind_mvt_tags(struct db_stmt *stmt, struct mvt_tags tags);
+void db_bind_mvt_account_id(struct db_stmt *stmt,
+			    struct db *db,
+			    const struct mvt_account_id *account);
+void db_bind_credit_debit(struct db_stmt *stmt,
+			  struct amount_msat credit,
+			  struct amount_msat debit);
+void wallet_datastore_save_utxo_description(struct db *db,
+					    const struct bitcoin_outpoint *outpoint,
+					    const char *desc);
+void wallet_datastore_save_payment_description(struct db *db,
+					       const struct sha256 *payment_hash,
+					       const char *desc);
+void migrate_setup_coinmoves(struct lightningd *ld, struct db *db);
+
 #endif /* LIGHTNING_WALLET_WALLET_H */

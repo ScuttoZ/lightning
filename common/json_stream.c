@@ -1,25 +1,15 @@
 #include "config.h"
 #include <arpa/inet.h>
-#include <bitcoin/preimage.h>
-#include <bitcoin/privkey.h>
 #include <bitcoin/psbt.h>
 #include <bitcoin/signature.h>
-#include <bitcoin/tx.h>
 #include <ccan/io/io.h>
   /* To reach into io_plan: not a public header! */
   #include <ccan/io/backend.h>
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/json_out/json_out.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/strmap/strmap.h>
-#include <ccan/tal/str/str.h>
-#include <common/channel_id.h>
-#include <common/configdir.h>
 #include <common/json_filter.h>
-#include <common/json_parse.h>
 #include <common/json_stream.h>
-#include <common/node_id.h>
-#include <common/wireaddr.h>
 #include <inttypes.h>
 #include <stdio.h>
 #include <wire/peer_wire.h>
@@ -323,11 +313,6 @@ void json_add_bool(struct json_stream *result, const char *fieldname, bool value
 	json_add_primitive(result, fieldname, value ? "true" : "false");
 }
 
-void json_add_null(struct json_stream *stream, const char *fieldname)
-{
-	json_add_primitive(stream, fieldname, "null");
-}
-
 void json_add_hex(struct json_stream *js, const char *fieldname,
 		  const void *data, size_t len)
 {
@@ -366,6 +351,14 @@ void json_add_escaped_string(struct json_stream *result, const char *fieldname,
 
 void json_add_timeabs(struct json_stream *result, const char *fieldname,
 		      struct timeabs t)
+{
+	json_add_primitive_fmt(result, fieldname,
+			       "%" PRIu64 ".%09" PRIu64,
+			       (u64)t.ts.tv_sec, (u64)t.ts.tv_nsec);
+}
+
+void json_add_timerel(struct json_stream *result, const char *fieldname,
+		      struct timerel t)
 {
 	json_add_primitive_fmt(result, fieldname,
 			       "%" PRIu64 ".%09" PRIu64,

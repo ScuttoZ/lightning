@@ -3,36 +3,35 @@
  * saves and funding tx watching for a channel open */
 
 #include "config.h"
-#include <bitcoin/short_channel_id.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/blockheight_states.h>
+#include <common/clock_time.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
 #include <common/psbt_open.h>
 #include <common/shutdown_scriptpubkey.h>
 #include <common/wire_error.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
 #include <hsmd/permissions.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/channel_gossip.h>
 #include <lightningd/closing_control.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
-#include <lightningd/gossip_control.h>
+#include <lightningd/feerate.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/notification.h>
 #include <lightningd/opening_common.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/plugin_hook.h>
 #include <openingd/dualopend_wiregen.h>
+#include <stdio.h>
+#include <unistd.h>
 
 struct commit_rcvd {
 	struct channel *channel;
@@ -163,11 +162,8 @@ void json_add_unsaved_channel(struct command *cmd,
 
 	if (feature_negotiated(channel->peer->ld->our_features,
 			       channel->peer->their_features,
-			       OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
-		if (command_deprecated_out_ok(cmd, "features", "v24.08", "v25.08"))
-			json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+			       OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		json_add_string(response, NULL, "option_anchors");
-	}
 
 	json_array_end(response);
 	json_object_end(response);
@@ -274,6 +270,7 @@ struct openchannel2_payload {
 	u32 lease_blockheight_start;
 	u32 node_blockheight;
 	bool req_confirmed_ins_remote;
+	struct channel_type *channel_type;
 
 	struct amount_sat accepter_funding;
 	struct wally_psbt *psbt;
@@ -325,6 +322,7 @@ static void openchannel2_hook_serialize(struct openchannel2_payload *payload,
 	}
 	json_add_bool(stream, "require_confirmed_inputs",
 		      payload->req_confirmed_ins_remote);
+	json_add_channel_type(stream, "channel_type", payload->channel_type);
 	json_object_end(stream);
 }
 
@@ -1038,7 +1036,7 @@ static enum watch_result opening_depth_cb(struct lightningd *ld,
 	if (!inflight->channel->scid) {
 		wallet_annotate_txout(ld->wallet, &inflight->funding->outpoint,
 				      TX_CHANNEL_FUNDING, inflight->channel->dbid);
-		inflight->channel->scid = tal_dup(inflight->channel, struct short_channel_id, &scid);
+		channel_set_scid(inflight->channel, &scid);
 		wallet_channel_save(ld->wallet, inflight->channel);
 	} else if (!short_channel_id_eq(*inflight->channel->scid, scid)) {
 		/* We freaked out if required when original was
@@ -1046,7 +1044,7 @@ static enum watch_result opening_depth_cb(struct lightningd *ld,
 		log_info(inflight->channel->log, "Short channel id changed from %s->%s",
 			 fmt_short_channel_id(tmpctx, *inflight->channel->scid),
 			 fmt_short_channel_id(tmpctx, scid));
-		*inflight->channel->scid = scid;
+		channel_set_scid(inflight->channel, &scid);
 		wallet_channel_save(ld->wallet, inflight->channel);
 	}
 
@@ -1300,6 +1298,7 @@ wallet_update_channel(struct lightningd *ld,
 				lease_amt,
 				0,
 				false,
+				false,
 				false);
 	wallet_inflight_add(ld->wallet, inflight);
 
@@ -1333,7 +1332,7 @@ wallet_update_channel_commit(struct lightningd *ld,
 					     &channel->peer->id,
 					     &channel->cid,
 					     channel->scid,
-					     time_now(),
+					     clock_time(),
 					     DUALOPEND_OPEN_COMMIT_READY,
 					     DUALOPEND_OPEN_COMMITTED,
 					     REASON_REMOTE,
@@ -1431,7 +1430,7 @@ wallet_commit_channel(struct lightningd *ld,
 				     &channel->peer->id,
 				     &channel->cid,
 				     channel->scid,
-				     time_now(),
+				     clock_time(),
 				     DUALOPEND_OPEN_INIT,
 				     DUALOPEND_OPEN_COMMIT_READY,
 				     REASON_REMOTE,
@@ -1443,6 +1442,7 @@ wallet_commit_channel(struct lightningd *ld,
 	channel_info->old_remote_per_commit = channel_info->remote_per_commit;
 
 	/* Promote the unsaved_dbid to the dbid */
+	assert(channel->dbid == 0);
 	assert(channel->unsaved_dbid != 0);
 	channel->dbid = channel->unsaved_dbid;
 	channel->unsaved_dbid = 0;
@@ -1463,28 +1463,9 @@ wallet_commit_channel(struct lightningd *ld,
 					     &commitment_feerate);
 	channel->min_possible_feerate = commitment_feerate;
 	channel->max_possible_feerate = commitment_feerate;
-	if (channel->peer->addr.itype == ADDR_INTERNAL_WIREADDR) {
-		channel->scb = tal(channel, struct modern_scb_chan);
-		channel->scb->id = channel->dbid;
-		channel->scb->addr = channel->peer->addr.u.wireaddr.wireaddr;
-		channel->scb->node_id = channel->peer->id;
-		channel->scb->funding = *funding;
-		channel->scb->cid = channel->cid;
-		channel->scb->funding_sats = total_funding;
-
-		struct tlv_scb_tlvs *scb_tlvs = tlv_scb_tlvs_new(channel);
-		scb_tlvs->shachain = &channel->their_shachain.chain;
-		scb_tlvs->basepoints = &channel_info->theirbase;
-		scb_tlvs->opener = &channel->opener;
-		scb_tlvs->remote_to_self_delay = &channel_info->their_config.to_self_delay;
-
-		channel->scb->tlvs = scb_tlvs;
-	} else
-		channel->scb = NULL;
 
 	tal_free(channel->type);
 	channel->type = channel_type_dup(channel, type);
-	channel->scb->type = channel_type_dup(channel->scb, type);
 
 	if (our_upfront_shutdown_script)
 		channel->shutdown_scriptpubkey[LOCAL]
@@ -1517,9 +1498,14 @@ wallet_commit_channel(struct lightningd *ld,
 	channel->lease_chan_max_ppt = lease_chan_max_ppt;
 	channel->htlc_minimum_msat = channel_info->their_config.htlc_minimum;
 	channel->htlc_maximum_msat = htlc_max_possible_send(channel);
+	/* Filled in when we have PSBT for inflight */
+	channel->funding_psbt = NULL;
 
 	/* Now we finally put it in the database. */
 	wallet_channel_insert(ld->wallet, channel);
+
+	/* So we can find it by the newly-assigned dbid */
+	add_channel_to_dbid_map(ld, channel);
 
 	/* Open attempt to channel's inflights */
 	inflight = new_inflight(channel,
@@ -1537,6 +1523,7 @@ wallet_commit_channel(struct lightningd *ld,
 				channel->push,
 				lease_amt,
 				0,
+				false,
 				false,
 				false);
 	wallet_inflight_add(ld->wallet, inflight);
@@ -2096,7 +2083,8 @@ static void accepter_got_offer(struct subd *dualopend,
 					  &payload->shutdown_scriptpubkey,
 					  &payload->requested_lease_amt,
 					  &payload->lease_blockheight_start,
-					  &payload->req_confirmed_ins_remote)) {
+					  &payload->req_confirmed_ins_remote,
+					  &payload->channel_type)) {
 		channel_internal_error(channel, "Bad DUALOPEND_GOT_OFFER: %s",
 				       tal_hex(tmpctx, msg));
 		return;
@@ -2263,7 +2251,7 @@ static bool verify_option_will_fund_signature(struct peer *peer,
 static void handle_validate_lease(struct subd *dualopend,
 				  const u8 *msg)
 {
-	const secp256k1_ecdsa_signature sig;
+	secp256k1_ecdsa_signature sig = {{0}};
 	u16 chan_fee_max_ppt;
 	u32 chan_fee_max_base_msat, lease_expiry;
 	struct pubkey their_pubkey;
@@ -2784,6 +2772,11 @@ json_openchannel_signed(struct command *cmd,
 	wallet_inflight_save(cmd->ld->wallet, inflight);
 	watch_opening_inflight(cmd->ld, inflight);
 
+	/* Channel's funding psbt also updated now */
+	tal_free(channel->funding_psbt);
+	channel->funding_psbt = clone_psbt(channel, inflight->funding_psbt);
+	wallet_channel_save(cmd->ld->wallet, channel);
+
 	/* Only after we've updated/saved our psbt do we check
 	 * for peer connected */
 	if (!channel->owner)
@@ -3249,8 +3242,11 @@ static struct command_result *json_openchannel_init(struct command *cmd,
 				    "by peer");
 	}
 
-	if (info->ctype &&
-	    !cmd->ld->dev_any_channel_type &&
+	if (!info->ctype)
+		info->ctype = desired_channel_type(info, cmd->ld->our_features,
+						   peer->their_features);
+
+	if (!cmd->ld->dev_any_channel_type &&
 	    !channel_type_accept(tmpctx,
 				 info->ctype->features,
 				 cmd->ld->our_features)) {
@@ -3684,6 +3680,28 @@ static void handle_commit_received(struct subd *dualopend,
 	abort();
 }
 
+static void handle_dualopend_got_announcement(struct subd *dualopend, const u8 *msg)
+{
+	struct channel *channel = dualopend->channel;
+	secp256k1_ecdsa_signature remote_ann_node_sig;
+	secp256k1_ecdsa_signature remote_ann_bitcoin_sig;
+	struct short_channel_id scid;
+
+	if (!fromwire_dualopend_got_announcement(msg,
+						 &scid,
+						 &remote_ann_node_sig,
+						 &remote_ann_bitcoin_sig)) {
+		channel_internal_error(channel,
+				       "bad dualopend_got_announcement %s",
+				       tal_hex(tmpctx, msg));
+		return;
+	}
+
+	channel_gossip_got_announcement_sigs(channel, scid,
+					     &remote_ann_node_sig,
+					     &remote_ann_bitcoin_sig);
+}
+
 static unsigned int dual_opend_msg(struct subd *dualopend,
 				   const u8 *msg, const int *fds)
 {
@@ -3745,6 +3763,9 @@ static unsigned int dual_opend_msg(struct subd *dualopend,
 			return 0;
 		case WIRE_DUALOPEND_UPDATE_REQUIRE_CONFIRMED:
 			handle_update_require_confirmed(dualopend, msg);
+			return 0;
+		case WIRE_DUALOPEND_GOT_ANNOUNCEMENT:
+			handle_dualopend_got_announcement(dualopend, msg);
 			return 0;
 		/* Messages we send */
 		case WIRE_DUALOPEND_INIT:
@@ -3882,7 +3903,9 @@ static struct command_result *json_queryrates(struct command *cmd,
 						NULL : request_amt,
 					   get_block_height(cmd->ld->topology),
 					   true,
-					   NULL, NULL);
+					   desired_channel_type(tmpctx, cmd->ld->our_features,
+								peer->their_features),
+					   NULL);
 
 	if (socketpair(AF_LOCAL, SOCK_STREAM, 0, fds) != 0) {
 		return command_fail(cmd, FUND_MAX_EXCEEDED,
@@ -4069,6 +4092,35 @@ static void dualopen_errmsg(struct channel *channel,
 				       err_for_them ? "sent" : "received", desc);
 }
 
+/* This is a hack for CLN_DEV_ENTROPY_SEED.  We cannot actually use
+ * the same seed for each dualopend, or they choose the same ids, and we
+ * clash when combining the PSBTs (this is phenomenally unlikey normally).
+ * So we set it (for the child) to an incrementing value. */
+static const char *dev_setup_dualopend_seed(const tal_t *ctx, struct lightningd *ld)
+{
+	static u64 seed_incr = 0;
+	char seedstr[STR_MAX_CHARS(u64)];
+	const char *old_seed;
+
+	if (!ld->developer)
+		return NULL;
+
+	old_seed = getenv("CLN_DEV_ENTROPY_SEED");
+	if (!old_seed)
+		return NULL;
+
+	old_seed = tal_strdup(tmpctx, old_seed);
+	seed_incr++;
+	snprintf(seedstr, sizeof(seedstr), "%"PRIu64, atol(old_seed) + seed_incr);
+	setenv("CLN_DEV_ENTROPY_SEED", seedstr, 1);
+	return old_seed;
+}
+
+static void dev_restore_seed(const char *old_seed)
+{
+	if (old_seed)
+		setenv("CLN_DEV_ENTROPY_SEED", old_seed, 1);
+}
 
 bool peer_start_dualopend(struct peer *peer,
 			  struct peer_fd *peer_fd,
@@ -4078,6 +4130,7 @@ bool peer_start_dualopend(struct peer *peer,
 	u32 max_to_self_delay;
 	struct amount_msat min_effective_htlc_capacity;
 	const u8 *msg;
+	const char *dev_old_seed;
 
 	hsmfd = hsm_get_client_fd(peer->ld, &peer->id, channel->unsaved_dbid,
 				  HSM_PERM_COMMITMENT_POINT
@@ -4091,6 +4144,7 @@ bool peer_start_dualopend(struct peer *peer,
 		return false;
 	}
 
+	dev_old_seed = dev_setup_dualopend_seed(tmpctx, peer->ld);
 	channel->owner = new_channel_subd(channel,
 					  peer->ld,
 					  "lightning_dualopend",
@@ -4103,6 +4157,7 @@ bool peer_start_dualopend(struct peer *peer,
 					  channel_set_billboard,
 					  take(&peer_fd->fd),
 					  take(&hsmfd), NULL);
+	dev_restore_seed(dev_old_seed);
 
 	if (!channel->owner) {
 		channel_internal_error(channel,
@@ -4156,6 +4211,7 @@ bool peer_restart_dualopend(struct peer *peer,
         int hsmfd;
 	u32 *local_shutdown_script_wallet_index;
 	u8 *msg;
+	const char *dev_old_seed;
 
 	if (channel_state_uncommitted(channel->state))
 		return peer_start_dualopend(peer, peer_fd, channel);
@@ -4175,6 +4231,7 @@ bool peer_restart_dualopend(struct peer *peer,
 		return false;
 	}
 
+	dev_old_seed = dev_setup_dualopend_seed(tmpctx, peer->ld);
 	channel_set_owner(channel,
 			  new_channel_subd(channel, peer->ld,
 					   "lightning_dualopend",
@@ -4187,6 +4244,8 @@ bool peer_restart_dualopend(struct peer *peer,
 					   channel_set_billboard,
 					   take(&peer_fd->fd),
 					   take(&hsmfd), NULL));
+	dev_restore_seed(dev_old_seed);
+
 	if (!channel->owner) {
 		log_broken(channel->log, "Could not subdaemon channel: %s",
 			   strerror(errno));

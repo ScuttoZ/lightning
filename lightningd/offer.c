@@ -1,20 +1,14 @@
 #include "config.h"
 #include <ccan/cast/cast.h>
-#include <ccan/json_escape/json_escape.h>
-#include <ccan/take/take.h>
+#include <ccan/json_escape/json_escape.h> /* Ubuntu focal's gcc needs json_escape defined */
 #include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/configdir.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/json_stream.h>
-#include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <inttypes.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
-#include <secp256k1_schnorrsig.h>
 
 static void json_populate_offer(struct json_stream *response,
 				const struct sha256 *offer_id,
@@ -29,6 +23,26 @@ static void json_populate_offer(struct json_stream *response,
 	json_add_bool(response, "used", offer_status_used(status));
 	if (label)
 		json_add_escaped_string(response, "label", label);
+}
+
+static const char *offer_description_from_b12(const tal_t *ctx,
+					struct lightningd *ld,
+					const char *b12)
+{
+    struct tlv_offer *offer;
+    char *fail;
+
+	offer = offer_decode(ctx, b12, strlen(b12),
+                         NULL, NULL, &fail);
+    if (!offer) {
+        log_debug(ld->log, "Failed to decode BOLT12: %s", fail);
+        return NULL;
+    }
+
+    if (!offer->offer_description)
+        return NULL;
+
+    return offer->offer_description;
 }
 
 static struct command_result *param_b12_offer(struct command *cmd,
@@ -140,6 +154,7 @@ static struct command_result *json_listoffers(struct command *cmd,
 	struct json_stream *response;
 	struct wallet *wallet = cmd->ld->wallet;
 	const char *b12;
+	const char *description;
 	const struct json_escape *label;
 	bool *active_only;
 	enum offer_status status;
@@ -160,6 +175,9 @@ static struct command_result *json_listoffers(struct command *cmd,
 			json_populate_offer(response,
 					    offer_id, b12,
 					    label, status);
+			description = offer_description_from_b12(tmpctx, cmd->ld, b12);
+			if (description)
+				json_add_stringn(response, "description", description, tal_bytelen(description));
 			json_object_end(response);
 		}
 	} else {
@@ -176,6 +194,9 @@ static struct command_result *json_listoffers(struct command *cmd,
 				json_populate_offer(response,
 						    &id, b12,
 						    label, status);
+				description = offer_description_from_b12(tmpctx, cmd->ld, b12);
+				if (description)
+					json_add_stringn(response, "description", description, tal_bytelen(description));
 				json_object_end(response);
 			}
 		}
@@ -199,6 +220,7 @@ static struct command_result *json_disableoffer(struct command *cmd,
 	struct sha256 *offer_id;
 	struct wallet *wallet = cmd->ld->wallet;
 	const char *b12;
+	const char *description;
 	const struct json_escape *label;
 	enum offer_status status;
 
@@ -222,6 +244,9 @@ static struct command_result *json_disableoffer(struct command *cmd,
 
 	response = json_stream_success(cmd);
 	json_populate_offer(response, offer_id, b12, label, status);
+	description = offer_description_from_b12(tmpctx, cmd->ld, b12);
+	if (description)
+		json_add_stringn(response, "description", description, tal_bytelen(description));
 	return command_success(cmd, response);
 }
 
@@ -240,6 +265,7 @@ static struct command_result *json_enableoffer(struct command *cmd,
 	struct sha256 *offer_id;
 	struct wallet *wallet = cmd->ld->wallet;
 	const char *b12;
+	const char *description;
 	const struct json_escape *label;
 	enum offer_status status;
 
@@ -256,6 +282,10 @@ static struct command_result *json_enableoffer(struct command *cmd,
 		return command_fail(cmd, OFFER_ALREADY_ENABLED,
 				    "offer already active");
 
+	if (offer_status_single(status) && offer_status_used(status))
+		return command_fail(cmd, OFFER_USED_SINGLE_USE,
+				    "cannot activate an used single use offer");
+
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
 
@@ -263,6 +293,9 @@ static struct command_result *json_enableoffer(struct command *cmd,
 
 	response = json_stream_success(cmd);
 	json_populate_offer(response, offer_id, b12, label, status);
+	description = offer_description_from_b12(tmpctx, cmd->ld, b12);
+	if (description)
+		json_add_stringn(response, "description", description, tal_bytelen(description));
 	return command_success(cmd, response);
 }
 
@@ -315,29 +348,20 @@ static struct command_result *prev_payment(struct command *cmd,
 			continue;
 
 		/* BOLT-recurrence #12:
-		 * - if the offer contained `recurrence_base` with
-		 *   `start_any_period` non-zero:
-		 *   - MUST include `recurrence_start`
-		 *   - MUST set `period_offset` to the period the sender wants
-		 *     for the initial request
-		 *   - MUST set `period_offset` to the same value on all
-		 *     following requests.
+		 * - if `offer_recurrence_base` is present:
+		 *   - MUST include `invreq_recurrence_start`
+		 *   - MUST set `period_offset` to the period the sender wants for the
+		 *     initial request
+		 *   - MUST set `period_offset` to the same value on all following requests.
 		 */
-		if (invreq->invreq_recurrence_start) {
-			if (!inv->invreq_recurrence_start)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "unexpected"
-						    " recurrence_start");
-			if (*inv->invreq_recurrence_start != *invreq->invreq_recurrence_start)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "recurrence_start was"
-						    " previously %u",
-						    *inv->invreq_recurrence_start);
-		} else {
-			if (inv->invreq_recurrence_start)
-				return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-						    "missing"
-						    " recurrence_start");
+		if (inv->invreq_recurrence_start
+		    && invreq->invreq_recurrence_start
+		    && *inv->invreq_recurrence_start != *invreq->invreq_recurrence_start) {
+			tal_free(stmt);
+			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+					    "recurrence_start was"
+					    " previously %u",
+					    *inv->invreq_recurrence_start);
 		}
 
 		/* They should all have the same basetime */

@@ -1,18 +1,12 @@
 #include "config.h"
-#include <ccan/mem/mem.h>
 #include <common/blindedpath.h>
 #include <common/blinding.h>
-#include <common/configdir.h>
 #include <common/ecdh.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
 #include <connectd/connectd_wiregen.h>
-#include <lightningd/channel.h>
 #include <lightningd/onion_message.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/subd.h>
-#include <sodium/randombytes.h>
 
 struct onion_message_hook_payload {
 	/* Optional */
@@ -32,12 +26,6 @@ static void json_add_blindedpath(struct plugin *plugin,
 	} else {
 		json_add_short_channel_id(stream, "first_scid", path->first_node_id.scidd.scid);
 		json_add_u32(stream, "first_scid_dir", path->first_node_id.scidd.dir);
-	}
-	if (lightningd_deprecated_out_ok(plugin->plugins->ld,
-					 plugin->plugins->ld->deprecated_ok,
-					 "onion_message_recv", "blinding",
-					 "v24.11", "v25.05")) {
-		json_add_pubkey(stream, "blinding", &path->first_path_key);
 	}
 	json_add_pubkey(stream, "first_path_key", &path->first_path_key);
 	json_array_start(stream, "hops");

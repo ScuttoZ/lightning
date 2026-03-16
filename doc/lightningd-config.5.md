@@ -293,26 +293,29 @@ authenticate with username `user` and password `pass`, and then use the
 database `db_name`. The database must exist, but the schema will be managed
 automatically by `lightningd`.
 
-* **bookkeeper-dir**=*DIR* [plugin `bookkeeper`]
+* **hsm-passphrase**
 
-  Directory to keep the accounts.sqlite3 database file in.
-Defaults to lightning-dir.
+  If set, you will be prompted to enter a passphrase for your HSM secret.
+  This option supports both legacy 32-byte `hsm_secret` files (where the passphrase
+  encrypts the secret) and new BIP39 mnemonic-based secrets (where the passphrase
+  is used as additional entropy during seed derivation according to the BIP39 standard).
+  
+  Note that once you set a passphrase, this option will be mandatory for
+  `lightningd` to start. If there is no HSM secret yet, `lightningd` will create 
+  a new mnemonic-based secret that will be secured with your passphrase following
+  BIP39 specifications.
+  
+  For legacy users: If you have an existing encrypted `hsm_secret` that was created
+  with the deprecated `encrypted-hsm` option, this will continue to work seamlessly.
+  
+  For new mnemonic-based secrets: The passphrase becomes part of the seed derivation
+  process as specified in BIP39, providing an additional factor of security. The 
+  mnemonic words alone are not sufficient to derive the seed without the passphrase.
+  
+  If you have an unencrypted legacy `hsm_secret` you want to encrypt, or need to
+  manage your HSM secrets, see lightning-hsmtool(8).
 
-* **bookkeeper-db**=*DSN* [plugin `bookkeeper`]
-
-  Identify the location of the bookkeeper data. This is a fully qualified data source
-name, including a scheme such as `sqlite3` or `postgres` followed by the
-connection parameters.
-Defaults to `sqlite3://accounts.sqlite3` in the `bookkeeper-dir`.
-
-* **encrypted-hsm**
-
- If set, you will be prompted to enter a password used to encrypt the `hsm_secret`.
-Note that once you encrypt the `hsm_secret` this option will be mandatory for
-`lightningd` to start.
-If there is no `hsm_secret` yet, `lightningd` will create a new encrypted secret.
-If you have an unencrypted `hsm_secret` you want to encrypt on-disk, or vice versa,
-see lightning-hsmtool(8).
+  (Note: This option replaces the deprecated `encrypted-hsm` option.)
 
 
 * **grpc-host**=*HOST* [plugin `cln-grpc`]
@@ -333,9 +336,11 @@ connections. Default is 9736.
 
 ### Lightning node customization options
 
-* **recover**=*hsmsecret*
+* **recover**=*mnemonic*
 
-  Restore the node from a 32-byte secret encoded as either a codex32 secret string or a 64-character hex string: this will fail if the `hsm_secret` file exists.  Your node will start the node in offline mode, for manual recovery.  The secret can be extracted from the `hsm_secret` using hsmtool(8).
+  Restore the node from a mnemonic.  For pre-25.12 nodes (which didn't have a mnemonic), use a 32-byte secret encoded as either a codex32 secret string or a 64-character hex string.
+  
+  This will fail if the `hsm_secret` file exists.  Your node will start the node in offline mode, for manual recovery.  The secret can be extracted from the `hsm_secret` using lightning-hsmtool(8)'s `getsecret`.
 
 * **alias**=*NAME*
 
@@ -499,6 +504,10 @@ specified multuple times. (Added in v23.08).
   Perform search for things to clean every *SECONDS* seconds (default
 3600, or 1 hour, which is usually sufficient).
 
+* **autoclean-networkevents-age**=*SECONDS* [plugin `autoclean`, *dynamic*]
+
+How old network events (in `listnetworkevents`) have to be before deletion (default 30 days, i.e. 2592000 seconds)
+
 * **autoclean-succeededforwards-age**=*SECONDS* [plugin `autoclean`, *dynamic*]
 
   How old successful forwards (`settled` in listforwards `status`) have to be before deletion (default 0, meaning never).
@@ -530,6 +539,10 @@ delete the others.
 
 ### Payment and invoice control options:
 
+* **payment-fronting-node**=*nodeid*
+
+  Always use this *nodeid* as the entry point when we generate invoices or offers: currently, the node must be a neighbor we have a channel with.  For BOLT11 invoices we will use a routehint with the alias for the short channel id to provide limited privacy (we still reveal our node id).  For BOLT12 invoices and offers, we provide a blinded path from the node to us which provides better privacy.  This can be specified multiple times for multiple fronting nodes.
+
 * **disable-mpp** [plugin `pay`]
 
   Disable the multi-part payment sending support in the `pay` plugin. By default
@@ -549,6 +562,14 @@ command, so they invoices can also be paid onchain.
 * **xpay-slow-mode**=*BOOL* [plugin `xpay`, *dynamic*]
 
   Setting this makes `xpay` wait until all parts have failed/succeeded before returning.  Usually this is unnecessary, as xpay will return on the first success (we have the preimage, if they don't take all the parts that's their problem) or failure (the destination could succeed another part, but it would mean it was only partially paid).  The default is `false`.
+
+* **askrene-timeout**=*SECONDS* [plugin `askrene`, *dynamic*]
+
+  This option makes the `getroutes` call fail if it takes more than this many seconds.  Setting it to zero is a fun way to ensure your node never makes payments.
+
+* **askrene-max-threads**=*NUMBER* [plugin `askrene`, *dynamic*]
+
+  This option controls how many routes askrene will calculate at once: this is only useful on nodes which make multiple payments at once, and setting the number higher than your number of cores/CPUS will not help.  The default is 4.
 
 ### Networking options
 
@@ -587,7 +608,7 @@ the address is announced.
 IPv4 or IPv6 address of the Tor control port (default port 9051),
 and this will be used to configure a Tor hidden service for port 9735
 in case of mainnet (bitcoin) network whereas other networks (testnet,
-testnet4, signet, regtest) will set the same default ports they use for 
+testnet4, signet, regtest) will set the same default ports they use for
 non-Tor addresses (see above).
 The Tor hidden service will be configured to point to the
 first IPv4 or IPv6 address we bind to and is by default unique to
@@ -610,7 +631,7 @@ is not specified, a DNS lookup may be done to resolve `HOSTNAME` or `TORIPADDRES
   If `HOSTNAME` was given that resolves to a local interface, the daemon
 will bind to that interface.
 
-* **bind-addr**=*\[IPADDRESS\[:PORT\]\]|SOCKETPATH|HOSTNAME\[:PORT\]*
+* **bind-addr**=*\[ws:\]\[IPADDRESS\[:PORT\]\]|SOCKETPATH|HOSTNAME\[:PORT\]*
 
   Set an IP address or UNIX domain socket to listen to, but do not
 announce. A UNIX domain socket is distinguished from an IP address by
@@ -620,6 +641,11 @@ beginning with a */*.
 IPv6 on all interfaces, '0.0.0.0' means bind to all IPv4
 interfaces, '::' means 'bind to all IPv6 interfaces'.  'PORT' is
 not specified, 9735 is used.
+
+   The `ws:` prefix indicates to expect connections to use the
+RFC-6455 WebSocket protocol instead of raw TCP/IP.  This is more
+usable by web browsers directly, but often requires a reverse proxy
+to speak TLS ("wss").
 
   This option can be used multiple times to add more addresses, and
 its use disables autolisten.  If necessary, and 'always-use-proxy'
@@ -710,17 +736,38 @@ authenticate to the Tor control port.
 
   Root url for Swagger UI. Default is `/`.
 
-* **wss-bind-addr**=*\[IPADDRESS\[:PORT\]\]|SOCKETPATH|HOSTNAME\[:PORT\]* [plugin `wss-proxy.py`]
+* **wss-bind-addr**=*\[IPADDRESS\[:PORT\]\]|SOCKETPATH|HOSTNAME\[:PORT\]* [plugin `wss-proxy`]
 
-  Sets the WSS address.
+  Sets the WSS address. This option can be used multiple times to add more addresses.
 
-* **wss-certs**=*PATH*  [plugin `wss-proxy.py`]
+* **wss-certs**=*PATH*  [plugin `wss-proxy`]
 
   Defines the path for WSS cert & key. Default path is same as RPC file path to utilize gRPC/clnrest's client certificate. If it is missing at the configured location, new identity (`client.pem` and `client-key.pem`) will be generated.
 
 * **exposesecret-passphrase**=*passphrase*  [plugin `exposesecret`]
 
   Defines a passphrase which will let users extract the `hsm_secret` using the `exposesecret` command.  If this is not set, the `exposesecret` command always fails.
+
+* **currencyrate-add-source**=*NAME,URL,MEMBER* [plugin `cln-currencyrate`]
+
+  Add a price source for the `cln-currencyrate` plugin, of form `NAME,URL,MEMBERS` where `URL` and `MEMBERS`
+  can have `{currency}` and `{currency_lc}` to substitute for upper-case and
+  lower-case currency names. `MEMBERS` is how to deconstruct the result, for
+  example if the result is `{"USD": {"last_trade": 12456.79}}` then `MEMBERS`
+  would be `USD,last_trade`. If you need to deconstruct an array specify it's position with it's index, starting at 0. (added in v26.04)
+
+  The default sources are:
+  * coingecko: https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs\_currencies={currency\_lc}
+  * kraken: https://api.kraken.com/0/public/Ticker?pair=XXBTZ{currency}
+  * blockchain: https://blockchain.info/ticker
+  * bitstamp: https://www.bitstamp.net/api/v2/ticker/btc{currency\_lc}
+  * coindesk: https://data-api.coindesk.com/index/cc/v1/latest/tic
+  * coinbase: https://api.coinbase.com/v2/prices/BTC-{currency}/spot
+  * binance: https://data-api.binance.vision/api/v3/ticker/price?symbol=BTC{currency}
+
+* **currencyrate-disable-source**=*NAME* [plugin `cln-currencyrate`]
+
+  Disable the `cln-currencyrate` source with this name. (added in v26.04)
 
 
 ### Lightning Plugins
@@ -811,19 +858,24 @@ The operations will be bundled into a single transaction. The channel will remai
 active while awaiting splice confirmation, however you can only spend the smaller
 of the prior channel balance and the new one.
 
-* **experimental-quiesce**
+* **experimental-lsps-client**
 
-  Specifying this option advertizes `option_quiesce`.  Not very useful
-by itself, except for testing.
+  Specifying this enables client side support for the lsps protocol
+([blip][blip] #50). Core-Lightning only supports the lsps2 ([blip][blip] #52)
+subprotocol describing the creation of just-in-time-channel (JIT-channels)
+between a LSP and this client.
 
-* **experimental-upgrade-protocol**
+* **experimental-lsps2-service**
 
-  Specifying this option means we send (and allow receipt of) a simple
-protocol to update channel types.  At the moment, we only support setting
-`option_static_remotekey` to ancient channels.  The peer must also support
-this option.
+  Specifying this enables a LSP JIT-Channel service according to the lsps
+protocol ([blip][blip] #52). It requires a LSP-Policy plugin to be available and
+a *experimental-lsps2-promise-secret* to be set.
 
+* **experimental-lsps2-promise-secret**=*promisesecret*
 
+  Sets a `promisesecret` for the LSP JIT-Channel service. Is a 64-character hex
+ string that acts as the secret for promises according to ([blip][blip] #52).
+ Is required if *experimental-lsps2-service* is set.
 
 BUGS
 ----
@@ -834,7 +886,7 @@ to gain our eternal gratitude!
 AUTHOR
 ------
 
-Rusty Russell <<rusty@rustcorp.com.au>> wrote this man page, and
+Rusty Russell [rusty@rustcorp.com.au](mailto:rusty@rustcorp.com.au) wrote this man page, and
 much of the configuration language, but many others did the hard work of
 actually implementing these options.
 
@@ -847,7 +899,7 @@ lightning-hsmtool(8)
 RESOURCES
 ---------
 
-Main web site: <https://github.com/ElementsProject/lightning>
+Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)
 
 COPYING
 -------
@@ -858,3 +910,4 @@ the rest of the code is covered by the BSD-style MIT license.
 [bolt]: https://github.com/lightning/bolts
 [bolt12]: https://github.com/rustyrussell/lightning-rfc/blob/guilt/offers/12-offer-encoding.md
 [pr4421]: https://github.com/ElementsProject/lightning/pull/4421
+[blip]: https://github.com/lightning/blips

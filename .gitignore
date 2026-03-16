@@ -24,6 +24,11 @@ gen_*.h
 wire/gen_*_csv
 cli/lightning-cli
 coverage
+# Coverage profiling data files
+*.profraw
+*.profdata
+# Generated Python API documentation
+docs/python
 ccan/config.h
 __pycache__
 config.vars
@@ -36,6 +41,8 @@ monkeytype.sqlite3
 !*/test/exp-run-*.c
 */*/test/run-*
 !*/*/test/run-*.c
+devtools/check-bolt
+tools/lightning-downgrade
 test/test_protocol
 test/test_sphinx
 tests/.pytest.restart
@@ -56,7 +63,6 @@ contrib/pyln-*/pyln/*/__version__.py
 tests/plugins/test_selfdisable_after_getmanifest
 
 # Ignore generated files
-devtools/features
 doc/schemas/sql.json
 doc/*.7.md
 doc/*.[1578]
@@ -72,6 +78,7 @@ tests/primitives_pb2_grpc.py
 tests/autogenerate-examples-status.log
 tests/autogenerate-examples.json
 tests/autogenerate-examples-repeat.log
+libcommon.a
 
 # Ignore unrelated stuff
 .DS_Store
@@ -83,6 +90,11 @@ compile_commands.json
 target
 plugins/cln-grpc
 plugins/clnrest
+plugins/wss-proxy
+plugins/cln-bip353
+plugins/cln-currencyrate
+.clangd
+.cargo/
 
 # Build directories
 bionic/

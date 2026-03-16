@@ -4,7 +4,6 @@
 #include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
 #include <common/htlc_tx.h>
-#include <common/key_derive.h>
 #include <common/memleak.h>
 #include <common/psbt_keypath.h>
 #include <db/exec.h>
@@ -18,14 +17,10 @@
 #include <lightningd/coin_mvts.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/onchain_control.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/subd.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <wallet/txfilter.h>
-#include <wally_bip32.h>
-#include <wally_psbt.h>
-#include <wire/wire_sync.h>
 
 /* If we're restarting, we keep a per-channel copy of watches, and replay */
 struct replay_tx {
@@ -47,13 +42,6 @@ static bool replay_tx_eq_txid(const struct replay_tx *rtx,
 
 HTABLE_DEFINE_NODUPS_TYPE(struct replay_tx, replay_tx_keyof, txid_hash, replay_tx_eq_txid,
 			  replay_tx_hash);
-
-/* Helper for memleak detection */
-static void memleak_replay_tx_hash(struct htable *memtable,
-				   struct replay_tx_hash *replay_tx_hash)
-{
-	memleak_scan_htable(memtable, &replay_tx_hash->raw);
-}
 
 /* We dump all the known preimages when onchaind starts up. */
 static void onchaind_tell_fulfill(struct channel *channel)
@@ -120,11 +108,14 @@ static bool tell_if_missing(const struct channel *channel,
 	 *
 	 *   - for any committed HTLC that does NOT have an output in this
 	 *     commitment transaction:
-	 *     - once the commitment transaction has reached reasonable depth:
-	 *       - MUST fail the corresponding incoming HTLC (if any).
-	 *     - if no *valid* commitment transaction contains an output
-	 *       corresponding to the HTLC.
-	 *       - MAY fail the corresponding incoming HTLC sooner.
+	 *     - if the payment preimage is known:
+	 *       - MUST fulfill the corresponding incoming HTLC (if any).
+	 *     - otherwise:
+	 *       - once the commitment transaction has reached reasonable depth:
+	 *         - MUST fail the corresponding incoming HTLC (if any).
+	 *       - if no *valid* commitment transaction contains an output
+	 *         corresponding to the HTLC:
+	 *         - MAY fail the corresponding incoming HTLC sooner.
 	 */
 	if (hout->hstate >= RCVD_ADD_REVOCATION
 	    && hout->hstate < SENT_REMOVE_REVOCATION)
@@ -342,15 +333,31 @@ static void handle_onchain_log_coin_move(struct channel *channel, const u8 *msg)
 		return;
 	}
 
-	/* Any 'ignored' payments get registered to the wallet */
-	if (!mvt->account_name)
-		mvt->account_name = fmt_channel_id(mvt,
-						   &channel->cid);
-	else
-		mvt->originating_acct = fmt_channel_id(mvt,
-						       &channel->cid);
-	notify_chain_mvt(channel->peer->ld, mvt);
-	tal_free(mvt);
+	/* onchaind uses an empty string to mean "this channel" */
+	if (streq(mvt->account.alt_account, "")) {
+		tal_free(mvt->account.alt_account);
+		set_mvt_account_id(&mvt->account, channel, NULL);
+	} else {
+		mvt->originating_acct = new_mvt_account_id(mvt, channel, NULL);
+	}
+
+	wallet_save_chain_mvt(channel->peer->ld, take(mvt));
+}
+
+static void handle_onchain_log_penalty_adj(struct channel *channel, const u8 *msg)
+{
+	struct amount_msat msat;
+	struct channel_coin_mvt *mvt;
+
+	if (!fromwire_onchaind_notify_penalty_adj(msg, &msat)) {
+		channel_internal_error(channel, "Invalid onchain notify_penalty_adj");
+		return;
+	}
+
+	mvt = new_channel_mvt_penalty_adj(tmpctx, channel, msat, COIN_CREDIT);
+	wallet_save_channel_mvt(channel->peer->ld, mvt);
+	mvt = new_channel_mvt_penalty_adj(tmpctx, channel, msat, COIN_DEBIT);
+	wallet_save_channel_mvt(channel->peer->ld, mvt);
 }
 
 static void replay_watch_tx(struct channel *channel,
@@ -484,12 +491,16 @@ static void handle_missing_htlc_output(struct channel *channel, const u8 *msg)
 	 *
 	 *   - for any committed HTLC that does NOT have an output in this
 	 *     commitment transaction:
-	 *     - once the commitment transaction has reached reasonable depth:
-	 *       - MUST fail the corresponding incoming HTLC (if any).
-	 *     - if no *valid* commitment transaction contains an output
-	 *       corresponding to the HTLC.
-	 *       - MAY fail the corresponding incoming HTLC sooner.
+	 *     - if the payment preimage is known:
+	 *       - MUST fulfill the corresponding incoming HTLC (if any).
+	 *     - otherwise:
+	 *       - once the commitment transaction has reached reasonable depth:
+	 *         - MUST fail the corresponding incoming HTLC (if any).
+	 *       - if no *valid* commitment transaction contains an output
+	 *         corresponding to the HTLC:
+	 *         - MAY fail the corresponding incoming HTLC sooner.
 	 */
+	/* Note: we already succeeded any incoming which we preimage for */
 	onchain_failed_our_htlc(channel, &htlc, "missing in commitment tx", false);
 }
 
@@ -569,11 +580,10 @@ static void onchain_add_utxo(struct channel *channel, const u8 *msg)
 				 csv_lock);
 
 	mvt = new_coin_wallet_deposit(msg, &outpoint, blockheight,
-			              amount, DEPOSIT);
-	mvt->originating_acct = fmt_channel_id(mvt,
-					       &channel->cid);
+			              amount, mk_mvt_tags(MVT_DEPOSIT));
+	mvt->originating_acct = new_mvt_account_id(mvt, channel, NULL);
 
-	notify_chain_mvt(channel->peer->ld, mvt);
+	wallet_save_chain_mvt(channel->peer->ld, mvt);
 }
 
 static void onchain_annotate_txout(struct channel *channel, const u8 *msg)
@@ -870,16 +880,31 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	struct ext_key final_wallet_ext_key;
 	u64 block_target;
 	struct lightningd *ld = channel->peer->ld;
+	bool keypath_ok;
 
-	bip32_pubkey(ld, &final_key, channel->final_key_idx);
-	if (bip32_key_from_parent(ld->bip32_base,
-				  channel->final_key_idx,
-				  BIP32_FLAG_KEY_PUBLIC,
-				  &final_wallet_ext_key) != WALLY_OK) {
- 		channel_internal_error(channel,
-				       "Could not derive final_wallet_ext_key %"PRIu64,
-				       channel->final_key_idx);
-		return NULL;
+	/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
+	if (ld->bip86_base) {
+		bip86_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip86_base,
+					  channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC,
+					  &final_wallet_ext_key) != WALLY_OK) {
+			channel_internal_error(channel,
+					       "Could not derive final_wallet_ext_key (bip86) %"PRIu64,
+					       channel->final_key_idx);
+			return NULL;
+		}
+	} else {
+		bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		if (bip32_key_from_parent(ld->bip32_base,
+					  channel->final_key_idx,
+					  BIP32_FLAG_KEY_PUBLIC,
+					  &final_wallet_ext_key) != WALLY_OK) {
+			channel_internal_error(channel,
+					       "Could not derive final_wallet_ext_key %"PRIu64,
+					       channel->final_key_idx);
+			return NULL;
+		}
 	}
 
 	tx = bitcoin_tx(ctx, chainparams, 1, 1, info->locktime);
@@ -889,13 +914,16 @@ static struct bitcoin_tx *onchaind_tx_unsigned(const tal_t *ctx,
 	if (chainparams->is_elements) {
 		bitcoin_tx_add_output(
 			tx, scriptpubkey_p2wpkh(tmpctx, &final_key), NULL, info->out_sats);
-		psbt_add_keypath_to_last_output(tx, channel->final_key_idx, &final_wallet_ext_key, false /* is_taproot */);
+		keypath_ok = psbt_add_keypath_to_last_output(tx, channel->final_key_idx, &final_wallet_ext_key, false /* is_taproot */);
 	} else {
 		bitcoin_tx_add_output(
 			tx, scriptpubkey_p2tr(tmpctx, &final_key), NULL, info->out_sats);
-		psbt_add_keypath_to_last_output(tx, channel->final_key_idx, &final_wallet_ext_key, true /* is_taproot */);
+		keypath_ok = psbt_add_keypath_to_last_output(tx, channel->final_key_idx, &final_wallet_ext_key, true /* is_taproot */);
 	}
-
+	if (!keypath_ok) {
+ 		channel_internal_error(channel, "Could not add keypath?");
+		return tal_free(tx);
+	}
 	/* Worst-case sig is 73 bytes */
 	weight = bitcoin_tx_weight(tx) + 1 + 3 + 73 + 0 + tal_count(info->wscript);
 	weight += elements_tx_overhead(chainparams, 1, 1);
@@ -1126,7 +1154,12 @@ static bool consider_onchain_htlc_tx_rebroadcast(struct channel *channel,
 	if (!amount_sat_eq(change, AMOUNT_SAT(0))) {
 		/* Append change output. */
 		struct pubkey final_key;
-		bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		/* Use BIP86 derivation for P2TR if available, otherwise BIP32 */
+		if (ld->bip86_base) {
+			bip86_pubkey(ld, &final_key, channel->final_key_idx);
+		} else {
+			bip32_pubkey(ld, &final_key, channel->final_key_idx);
+		}
 		psbt_append_output(psbt,
 				   scriptpubkey_p2tr(tmpctx, &final_key),
 				   change);
@@ -1643,6 +1676,10 @@ static unsigned int onchain_msg(struct subd *sd, const u8 *msg, const int *fds U
 		handle_onchain_log_coin_move(sd->channel, msg);
 		break;
 
+	case WIRE_ONCHAIND_NOTIFY_PENALTY_ADJ:
+		handle_onchain_log_penalty_adj(sd->channel, msg);
+		break;
+
 	case WIRE_ONCHAIND_SPEND_TO_US:
 		handle_onchaind_spend_to_us(sd->channel, msg);
 		break;
@@ -1877,11 +1914,8 @@ void onchaind_replay_channels(struct lightningd *ld)
 				 channel_state_name(channel), blockheight);
 
 			/* We're in replay mode */
-			channel->onchaind_replay_watches = tal(channel, struct replay_tx_hash);
+			channel->onchaind_replay_watches = new_htable(channel, replay_tx_hash);
 			channel->onchaind_replay_height = blockheight;
-			replay_tx_hash_init(channel->onchaind_replay_watches);
-			memleak_add_helper(channel->onchaind_replay_watches,
-					   memleak_replay_tx_hash);
 
 			onchaind_funding_spent(channel, tx, blockheight);
 			onchaind_replay(channel);

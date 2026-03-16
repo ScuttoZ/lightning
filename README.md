@@ -22,7 +22,6 @@ Core Lightning (previously c-lightning) is a lightweight, highly customizable an
 [![Continuous Integration][actions-badge]][actions]
 [![Pull Requests Welcome][prs-badge]][prs]
 [![Documentation Status][docs-badge]][docs]
-[![BoL2][bol2-badge]][bol2]
 [![Telegram][telegram-badge]][telegram]
 [![Discord][discord-badge]][discord]
 [![Irc][IRC-badge]][IRC]
@@ -33,7 +32,7 @@ We recommend getting started by experimenting on `testnet` (`testnet4` or `regte
 ## Reach Out to Us
 
 Any help testing the implementation, reporting bugs, or helping with outstanding issues is very welcome.
-Don't hesitate to reach out to us on [Build-on-L2][bol2], or on the implementation-specific [mailing list][ml1], or on [CLN Discord][discord], or on [CLN Telegram][telegram], or on IRC at [dev][irc1]/[gen][irc2] channel.
+Don't hesitate to reach out to us on the implementation-specific [mailing list][ml1], or on [CLN Discord][discord], or on [CLN Telegram][telegram], or on IRC at [dev][irc1]/[gen][irc2] channel.
 
 ## Getting Started
 
@@ -89,13 +88,13 @@ will offer specific information on that command.
 
 Useful commands:
 
-* [newaddr](doc/lightning-newaddr.7.md): get a bitcoin address to deposit funds into your lightning node.
-* [listfunds](doc/lightning-listfunds.7.md): see where your funds are.
-* [connect](doc/lightning-connect.7.md): connect to another lightning node.
-* [fundchannel](doc/lightning-fundchannel.7.md): create a channel to another connected node.
-* [invoice](doc/lightning-invoice.7.md): create an invoice to get paid by another node.
-* [pay](doc/lightning-pay.7.md): pay someone else's invoice.
-* [plugin](doc/lightning-plugin.7.md): commands to control extensions.
+* [newaddr](https://docs.corelightning.org/reference/newaddr): get a bitcoin address to deposit funds into your lightning node.
+* [listfunds](https://docs.corelightning.org/reference/listfunds): see where your funds are.
+* [connect](https://docs.corelightning.org/reference/connect): connect to another lightning node.
+* [fundchannel](https://docs.corelightning.org/reference/fundchannel): create a channel to another connected node.
+* [invoice](https://docs.corelightning.org/reference/invoice): create an invoice to get paid by another node.
+* [pay](https://docs.corelightning.org/reference/pay): pay someone else's invoice.
+* [plugin](https://docs.corelightning.org/reference/plugin): commands to control extensions.
 
 ### Care And Feeding Of Your New Lightning Node
 
@@ -167,7 +166,7 @@ This returns some internal details, and a standard invoice string called `bolt11
 
 [BOLT11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
-The sender can feed this `bolt11` string to the `decodepay` command to see what it is, and pay it simply using the `pay` command:
+The sender can feed this `bolt11` string to the `decode` command to see what it is, and pay it simply using the `pay` command:
 
 ```bash
 lightning-cli pay <bolt11>
@@ -199,7 +198,7 @@ If the two blockheights drift apart it might be necessary to intervene.
 
 ### HD wallet encryption
 
-You can encrypt the `hsm_secret` content (which is used to derive the HD wallet's master key) by passing the `--encrypted-hsm` startup argument, or by using the `hsmtool` (which you can find in the `tool/` directory at the root of this repo) with the `encrypt` method. You can unencrypt an encrypted `hsm_secret` using the `hsmtool` with the `decrypt` method.
+You can encrypt the `hsm_secret` content (which is used to derive the HD wallet's master key) by passing the `--encrypted-hsm` startup argument, or by using the `lightning-hsmtool` (which you can find in the `tool/` directory at the root of this repo) with the `encrypt` method. You can unencrypt an encrypted `hsm_secret` using the `lightning-hsmtool` with the `decrypt` method.
 
 If you encrypt your `hsm_secret`, you will have to pass the `--encrypted-hsm` startup option to `lightningd`. Once your `hsm_secret` is encrypted, you __will not__ be able to access your funds without your password, so please beware with your password management. Also, beware of not feeling too safe with an encrypted `hsm_secret`: unlike for `bitcoind` where the wallet encryption can restrict the usage of some RPC command, `lightningd` always needs to access keys from the wallet which is thus __not locked__ (yet), even with an encrypted BIP32 master seed.
 
@@ -211,8 +210,6 @@ Developers wishing to contribute should start with the developer guide [here](do
 [std]: https://github.com/lightning/bolts
 [prs-badge]: https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat
 [prs]: http://makeapullrequest.com
-[bol2-badge]: https://badgen.net/badge/BoL2/chat/blue
-[bol2]: https://community.corelightning.org
 [ml1]: https://lists.ozlabs.org/listinfo/c-lightning
 [discord-badge]: https://badgen.net/badge/Discord/chat/blue
 [discord]: https://discord.gg/mE9s4rc5un

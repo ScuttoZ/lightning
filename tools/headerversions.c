@@ -32,6 +32,10 @@ static const char template[] =
 	"	if (SQLITE_VERSION_NUMBER + 1000000 < sqlite3_libversion_number())\n"
 	"		errx(1, \"SQLITE major version mismatch: compiled %%u, now %%u\",\n"
 	"		     SQLITE_VERSION_NUMBER, sqlite3_libversion_number());\n"
+	"	/* Earliest supported sqlite3 version */\n"
+	"	if (SQLITE_VERSION_NUMBER < 3026000)\n"
+	"		errx(1, \"SQLITE version %%u too old (minimum 3.26)\",\n"
+	"		     SQLITE_VERSION_NUMBER);\n"
 	)
 	"}\n";
 
@@ -45,7 +49,7 @@ int main(int argc, char *argv[])
 	if (argc != 2)
 		errx(1, "Usage: %s <versionheader>", argv[0]);
 
-	file = grab_file(NULL, argv[1]);
+	file = grab_file_str(NULL, argv[1]);
 	if (!file && errno != ENOENT)
 		err(1, "Reading %s", argv[1]);
 

@@ -5,15 +5,14 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/io/io.h>
 #include <ccan/pipecmd/pipecmd.h>
-#include <ccan/str/str.h>
 #include <ccan/tal/str/str.h>
 #include <common/json_param.h>
-#include <common/json_parse_simple.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
 #include <errno.h>
 #include <plugins/libplugin.h>
 #include <signal.h>
+#include <unistd.h>
 
 static struct plugin *plugin;
 
@@ -240,8 +239,8 @@ static struct command_result *reckless_call(struct command *cmd,
 	struct reckless *reckless;
 	reckless = tal(NULL, struct reckless);
 	reckless->cmd = cmd;
-	reckless->stdoutbuf = tal_arrz(reckless, char, 1024);
-	reckless->stderrbuf = tal_arrz(reckless, char, 1024);
+	reckless->stdoutbuf = tal_arrz(reckless, char, 4096);
+	reckless->stderrbuf = tal_arrz(reckless, char, 4096);
 	reckless->stdout_read = 0;
 	reckless->stdout_new = 0;
 	reckless->stderr_read = 0;

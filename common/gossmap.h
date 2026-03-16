@@ -2,9 +2,6 @@
 #define LIGHTNING_COMMON_GOSSMAP_H
 #include "config.h"
 #include <bitcoin/short_channel_id.h>
-#include <ccan/take/take.h>
-#include <ccan/typesafe_cb/typesafe_cb.h>
-#include <common/amount.h>
 #include <common/fp16.h>
 #include <common/status_levels.h>
 
@@ -49,17 +46,21 @@ struct gossmap_chan {
 					   enum log_level,		\
 					   const char *fmt,		\
 					   ...),			\
-		      (cbarg))
+		      NULL, (cbarg))
 
 /* If we're the author of the gossmap, it should have no redundant records, corruption, etc.
  * So this fails if that's not the case. */
-#define gossmap_load_initial(ctx, filename, expected_len, logcb, cbarg)	\
+#define gossmap_load_initial(ctx, filename, expected_len, logcb, dyingcb, cb_arg) \
 	gossmap_load_((ctx), (filename), (expected_len),			\
-		      typesafe_cb_postargs(void, void *, (logcb), (cbarg), \
+		      typesafe_cb_postargs(void, void *, (logcb), (cb_arg), \
 					   enum log_level,		\
 					   const char *fmt,		\
 					   ...),			\
-		      (cbarg))
+		      typesafe_cb_preargs(void, void *, (dyingcb), (cb_arg), \
+					  struct short_channel_id,	\
+					  u32,				\
+					  u64),				\
+		      (cb_arg))
 
 struct gossmap *gossmap_load_(const tal_t *ctx,
 			      const char *filename,
@@ -68,7 +69,15 @@ struct gossmap *gossmap_load_(const tal_t *ctx,
 					    enum log_level level,
 					    const char *fmt,
 					    ...),
+			      void (*dyingcb)(struct short_channel_id scid,
+					      u32 blockheight,
+					      u64 offset,
+					      void *cb_arg),
 			      void *cb_arg);
+
+/* Disable mmap.  Noop if already disabled. */
+void gossmap_disable_mmap(struct gossmap *map);
+bool gossmap_has_mmap(const struct gossmap *map);
 
 /* Call this before using to ensure it's up-to-date.  Returns true if something
  * was updated. Note: this can scramble node and chan indexes! */
@@ -299,12 +308,13 @@ void gossmap_iter_fast_forward(const struct gossmap *map,
 /* Moves iterator to the end. */
 void gossmap_iter_end(const struct gossmap *map, struct gossmap_iter *iter);
 
+/* How dense is this? */
+void gossmap_stats(const struct gossmap *map, u64 *num_live, u64 *num_dead);
+
 /* For debugging: returns length read, and total known length of file */
 u64 gossmap_lengths(const struct gossmap *map, u64 *total);
 
 /* Debugging: connectd wants to enumerate fds */
 int gossmap_fd(const struct gossmap *map);
 
-/* Fetch unprocessed part of gossmap */
-const u8 *gossmap_fetch_tail(const tal_t *ctx, const struct gossmap *map);
 #endif /* LIGHTNING_COMMON_GOSSMAP_H */

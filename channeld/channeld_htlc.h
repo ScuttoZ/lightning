@@ -1,10 +1,10 @@
 #ifndef LIGHTNING_CHANNELD_CHANNELD_HTLC_H
 #define LIGHTNING_CHANNELD_CHANNELD_HTLC_H
 #include "config.h"
-#include <ccan/crypto/siphash24/siphash24.h>
+#include <ccan/crypto/sha256/sha256.h>
+#include <common/amount.h>
 #include <common/htlc.h>
 #include <common/pseudorand.h>
-#include <wire/onion_wire.h>
 
 struct htlc {
 	/* What's the status. */
@@ -28,6 +28,9 @@ struct htlc {
 
 	/* Blinding (optional). */
 	struct pubkey *path_key;
+
+	/* Any extra tlvs attached to this hltc (optional). */
+	struct tlv_field *extra_tlvs;
 
 	/* Should we immediately fail this htlc? */
 	bool fail_immediate;

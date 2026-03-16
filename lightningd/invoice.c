@@ -2,7 +2,6 @@
 #include <bitcoin/script.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
-#include <ccan/cast/cast.h>
 #include <ccan/json_escape/json_escape.h>
 #include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
@@ -10,14 +9,11 @@
 #include <common/bolt11_json.h>
 #include <common/bolt12_id.h>
 #include <common/bolt12_merkle.h>
-#include <common/configdir.h>
+#include <common/clock_time.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/overflows.h>
+#include <common/randbytes.h>
 #include <common/random_select.h>
 #include <common/timeout.h>
-#include <db/exec.h>
-#include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <lightningd/channel.h>
 #include <lightningd/hsm_control.h>
@@ -26,11 +22,8 @@
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
 #include <lightningd/routehint.h>
-#include <sodium/randombytes.h>
-#include <stdio.h>
 #include <wallet/invoices.h>
 #include <wallet/walletrpc.h>
-#include <wire/wire_sync.h>
 
 const char *invoice_status_str(enum invoice_status state)
 {
@@ -340,6 +333,7 @@ invoice_check_payment(const tal_t *ctx,
 		      struct lightningd *ld,
 		      const struct sha256 *payment_hash,
 		      const struct amount_msat msat,
+		      const struct amount_msat *expected_msat_override,
 		      const struct secret *payment_secret,
 		      const char **err)
 {
@@ -416,15 +410,19 @@ invoice_check_payment(const tal_t *ctx,
 	if (details->msat != NULL) {
 		struct amount_msat twice;
 
-		if (amount_msat_less(msat, *details->msat)) {
+		/* Override the expected amount. */
+		struct amount_msat expected_msat =
+			expected_msat_override ? *expected_msat_override : *details->msat;
+
+		if (amount_msat_less(msat, expected_msat)) {
 			*err = tal_fmt(ctx, "Attempt to pay %s with amount %s < %s",
 				       fmt_sha256(tmpctx, &details->rhash),
 				       fmt_amount_msat(tmpctx, msat),
-				       fmt_amount_msat(tmpctx, *details->msat));
+				       fmt_amount_msat(tmpctx, expected_msat));
 			return tal_free(details);
 		}
 
-		if (amount_msat_add(&twice, *details->msat, *details->msat)
+		if (amount_msat_add(&twice, expected_msat, expected_msat)
 		    && amount_msat_greater(msat, twice)) {
 			*err = tal_fmt(ctx, "Attempt to pay %s with amount %s > %s",
 				       fmt_sha256(tmpctx, &details->rhash),
@@ -573,7 +571,7 @@ static struct route_info **select_inchan(const tal_t *ctx,
 				    candidates[i].c->our_config.channel_reserve,
 				    candidates[i].c->channel_info.their_config.channel_reserve)
 		    || !amount_sat_to_msat(&capacity, candidates[i].c->funding_sats)
-		    || !amount_msat_sub_sat(&capacity, capacity, cumulative_reserve)) {
+		    || !amount_msat_deduct_sat(&capacity, cumulative_reserve)) {
 			log_broken(ld->log, "Channel %s capacity overflow!",
 					fmt_short_channel_id(tmpctx, *candidates[i].c->scid));
 			continue;
@@ -662,6 +660,25 @@ static struct route_info **select_inchan_mpp(const tal_t *ctx,
 	return routehints;
 }
 
+static struct route_info **select_inchan_all(const tal_t *ctx,
+					     struct lightningd *ld,
+					     struct routehint_candidate
+					     *candidates)
+{
+	struct route_info **routehints;
+
+	log_debug(ld->log, "Selecting all %zu candidates",
+		  tal_count(candidates));
+
+	routehints = tal_arr(ctx, struct route_info *, tal_count(candidates));
+	for (size_t i = 0; i < tal_count(candidates); i++) {
+		routehints[i] = tal_dup(routehints, struct route_info,
+					candidates[i].r);
+	}
+
+	return routehints;
+}
+
 /* Encapsulating struct while we wait for gossipd to give us incoming channels */
 struct chanhints {
 	bool expose_all_private;
@@ -723,6 +740,10 @@ add_routehints(struct invoice_info *info,
 
 	needed = info->b11->msat ? *info->b11->msat : AMOUNT_MSAT(1);
 
+	/* --payment-fronting-node means use all candidates. */
+	if (tal_count(info->cmd->ld->fronting_nodes))
+		info->b11->routes = select_inchan_all(info->b11, info->cmd->ld, candidates);
+
 	/* If we are not completely unpublished, try with reservoir
 	 * sampling first.
 	 *
@@ -738,7 +759,7 @@ add_routehints(struct invoice_info *info,
 	 * should make an effort to avoid overlapping incoming
 	 * channels, which is done by select_inchan_mpp.
 	 */
-	if (!node_unpublished)
+	else if (!node_unpublished)
 		info->b11->routes = select_inchan(info->b11,
 						  info->cmd->ld,
 						  needed,
@@ -1137,8 +1158,8 @@ static struct command_result *json_invoice(struct command *cmd,
 
 	if (strlen(desc_val) > BOLT11_FIELD_BYTE_LIMIT && !*hashonly) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Descriptions greater than %d bytes "
-				    "not yet supported "
+				    "Description greater than %d bytes "
+				    "invalid "
 				    "(description length %zu)",
 				    BOLT11_FIELD_BYTE_LIMIT,
 				    strlen(desc_val));
@@ -1183,8 +1204,8 @@ static struct command_result *json_invoice(struct command *cmd,
 		info->payment_preimage = *preimage;
 	else
 		/* Generate random secret preimage. */
-		randombytes_buf(&info->payment_preimage,
-				sizeof(info->payment_preimage));
+		randbytes(&info->payment_preimage,
+			    sizeof(info->payment_preimage));
 	/* Generate preimage hash. */
 	sha256(&rhash, &info->payment_preimage, sizeof(info->payment_preimage));
 	/* Generate payment secret. */
@@ -1192,7 +1213,7 @@ static struct command_result *json_invoice(struct command *cmd,
 
 	info->b11 = new_bolt11(info, msatoshi_val);
 	info->b11->chain = chainparams;
-	info->b11->timestamp = time_now().ts.tv_sec;
+	info->b11->timestamp = clock_time().ts.tv_sec;
 	info->b11->payment_hash = rhash;
 	info->b11->receiver_id = cmd->ld->our_nodeid;
 	info->b11->min_final_cltv_expiry = *cltv;
@@ -1551,45 +1572,6 @@ static const struct json_command waitinvoice_command = {
 };
 AUTODATA(json_command, &waitinvoice_command);
 
-static struct command_result *json_decodepay(struct command *cmd,
-					     const char *buffer,
-					     const jsmntok_t *obj UNNEEDED,
-					     const jsmntok_t *params)
-{
-	struct bolt11 *b11;
-	struct json_stream *response;
-	const char *str, *desc;
-	char *fail;
-
-	if (!param_check(cmd, buffer, params,
-			 p_req("bolt11", param_invstring, &str),
-			 p_opt("description", param_escaped_string, &desc),
-			 NULL))
-		return command_param_failed();
-
-	b11 = bolt11_decode(cmd, str, cmd->ld->our_features, desc, NULL,
-			    &fail);
-
-	if (!b11) {
-		return command_fail(cmd, LIGHTNINGD, "Invalid bolt11: %s", fail);
-	}
-
-	if (command_check_only(cmd))
-		return command_check_done(cmd);
-
-	response = json_stream_success(cmd);
-	json_add_bolt11(response, b11);
-	return command_success(cmd, response);
-}
-
-static const struct json_command decodepay_command = {
-	"decodepay",
-	json_decodepay,
-	.depr_start = "v24.11",
-	.depr_end = "v25.11"
-};
-AUTODATA(json_command, &decodepay_command);
-
 /* If we fail because it exists, we also return the clashing invoice */
 static struct command_result *fail_exists(struct command *cmd,
 					  const struct json_escape *label)
@@ -1623,7 +1605,7 @@ static void add_stub_blindedpath(const tal_t *ctx,
 
 	path = tal(NULL, struct blinded_path);
 	sciddir_or_pubkey_from_pubkey(&path->first_node_id, &ld->our_pubkey);
-	randombytes_buf(&path_key, sizeof(path_key));
+	randbytes(&path_key, sizeof(path_key));
 	if (!pubkey_from_privkey(&path_key, &path->first_path_key))
 		abort();
 	path->path = tal_arr(path, struct blinded_path_hop *, 1);

@@ -2,7 +2,6 @@
 #define LIGHTNING_LIGHTNINGD_CHANNEL_STATE_H
 #include "config.h"
 
-#include <ccan/time/time.h>
 
 /* These are in the database, so don't renumber them! */
 enum channel_state {
@@ -50,7 +49,7 @@ enum channel_state {
 	DUALOPEND_OPEN_COMMIT_READY,
 
 };
-#define CHANNEL_STATE_MAX CHANNELD_AWAITING_SPLICE
+#define CHANNEL_STATE_MAX DUALOPEND_OPEN_COMMIT_READY
 
 /* These are in the database, so don't renumber them! */
 enum state_change {

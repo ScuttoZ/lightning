@@ -4,19 +4,16 @@
 #include <ccan/tal/str/str.h>
 #include <common/blinding.h>
 #include <common/bolt12_merkle.h>
-#include <common/configdir.h>
+#include <common/clock_time.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
 #include <common/onion_decode.h>
 #include <common/onionreply.h>
 #include <common/route.h>
 #include <common/timeout.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/invoice.h>
 #include <lightningd/notification.h>
 #include <lightningd/pay.h>
-#include <lightningd/peer_control.h>
 #include <lightningd/peer_htlcs.h>
 #include <wallet/invoices.h>
 
@@ -588,13 +585,6 @@ void payment_failed(struct lightningd *ld,
 			  onion_wire_name(fail->failcode));
 		failstr = localfail;
 		pay_errcode = PAY_TRY_OTHER_ROUTE;
-	} else if (payment->path_secrets == NULL) {
-		/* This was a payment initiated with `sendonion`/`injectonionmessage`, we therefore
-		 * don't have the path secrets and cannot decode the error
-		 * onion. We hand it to the user. */
-		pay_errcode = PAY_UNPARSEABLE_ONION;
-		fail = NULL;
-		failstr = NULL;
 	} else if (failmsg) {
 		/* This can happen when a direct peer told channeld it's a
 		 * malformed onion using update_fail_malformed_htlc. */
@@ -602,6 +592,14 @@ void payment_failed(struct lightningd *ld,
 		origin_index = 0;
 		pay_errcode = PAY_TRY_OTHER_ROUTE;
 		goto use_failmsg;
+	} else if (payment->path_secrets == NULL) {
+		/* This was a payment initiated with `sendonion`/`injectonionmessage`, we therefore
+		 * don't have the path secrets and cannot decode the error
+		 * onion. We hand it to the user. */
+		assert(failonion != NULL);
+		pay_errcode = PAY_UNPARSEABLE_ONION;
+		fail = NULL;
+		failstr = NULL;
 	} else {
 		/* Must be normal remote fail with an onion-wrapped error. */
 		failstr = "reply from remote";
@@ -747,8 +745,13 @@ static struct command_result *wait_payment(struct lightningd *ld,
 			/* FIXME: We don't store this! */
 			fail->msg = NULL;
 
-			rpcerrorcode = faildestperm ? PAY_DESTINATION_PERM_FAIL
-						    : PAY_TRY_OTHER_ROUTE;
+			/* Peers which fail directly can hit this! */
+			if (failcode & BADONION)
+				rpcerrorcode = PAY_UNPARSEABLE_ONION;
+			else if (faildestperm)
+				rpcerrorcode = PAY_DESTINATION_PERM_FAIL;
+			else
+				rpcerrorcode = PAY_TRY_OTHER_ROUTE;
 
 			return sendpay_fail(
 			    cmd, payment, rpcerrorcode, NULL, fail,
@@ -783,8 +786,8 @@ static const u8 *send_onion(const tal_t *ctx, struct lightningd *ld,
 	return send_htlc_out(ctx, channel, first_hop->amount,
 			     base_expiry + first_hop->delay,
 			     final_amount, payment_hash,
-			     path_key, partid, groupid, onion, NULL, hout);
-}
+			     path_key, NULL, partid, groupid, onion, NULL, hout);
+	}
 
 static struct command_result *check_invoice_request_usage(struct command *cmd,
 							  const struct sha256 *local_invreq_id)
@@ -1150,7 +1153,7 @@ send_payment_core(struct lightningd *ld,
 
 	payment = wallet_add_payment(cmd,
 				     ld->wallet,
-				     time_now().ts.tv_sec,
+				     clock_time().ts.tv_sec,
 				     NULL,
 				     rhash,
 				     partid,
@@ -1464,7 +1467,7 @@ static struct command_result *self_payment(struct lightningd *ld,
 
 	payment = wallet_add_payment(tmpctx,
 				     ld->wallet,
-				     time_now().ts.tv_sec,
+				     clock_time().ts.tv_sec,
 				     NULL,
 				     rhash,
 				     partid,
@@ -1485,7 +1488,7 @@ static struct command_result *self_payment(struct lightningd *ld,
 				     local_invreq_id);
 
 	/* Now, resolve the invoice */
-	inv = invoice_check_payment(tmpctx, ld, rhash, msat, payment_secret, &err);
+	inv = invoice_check_payment(tmpctx, ld, rhash, msat, NULL, payment_secret, &err);
 	if (!inv) {
 		struct routing_failure *fail;
 		wallet_payment_set_status(ld->wallet, rhash, partid, groupid,
@@ -1794,7 +1797,7 @@ static void register_payment_and_waiter(struct command *cmd,
 {
 	wallet_add_payment(cmd,
 			   cmd->ld->wallet,
-			   time_now().ts.tv_sec,
+			   clock_time().ts.tv_sec,
 			   NULL,
 			   payment_hash,
 			   partid,
@@ -1976,7 +1979,7 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 		 * not resolve immediately */
 		fixme_ignore(command_still_pending(cmd));
 		htlc_set_add(cmd->ld, cmd->ld->log, *msat, *payload->total_msat,
-			     payment_hash, payload->payment_secret,
+			     NULL, payment_hash, payload->payment_secret,
 			     selfpay_mpp_fail, selfpay_mpp_succeeded,
 			     selfpay);
 		return command_its_complicated("htlc_set_add may have immediately succeeded or failed");
@@ -2021,7 +2024,7 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 	if (amount_msat_greater(*msat, next->htlc_maximum_msat)
 	    || amount_msat_less(*msat, next->htlc_minimum_msat)) {
 		/* Are we in old-range grace-period? */
-		if (!time_before(time_now(), next->old_feerate_timeout)
+		if (!timemono_before(time_mono(), next->old_feerate_timeout)
 		    || amount_msat_less(*msat, next->old_htlc_minimum_msat)
 		    || amount_msat_greater(*msat, next->old_htlc_maximum_msat)) {
 			return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
@@ -2079,6 +2082,22 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
 
+	failmsg = send_htlc_out(tmpctx, next, *msat,
+				*cltv,
+				/* If unknown, we set this equal (so accounting logs 0 fees) */
+				amount_msat_eq(*destination_msat, AMOUNT_MSAT(0))
+				? *msat : *destination_msat,
+				payment_hash,
+				next_path_key, NULL, *partid, *groupid,
+				serialize_onionpacket(tmpctx, rs->next),
+				NULL, &hout);
+	if (failmsg) {
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Could not send to first peer: %s",
+				    onion_wire_name(fromwire_peektype(failmsg)));
+	}
+
+	/* Now HTLC is created, we can add the payment as pending */
 	register_payment_and_waiter(cmd,
 				    payment_hash,
 				    *partid, *groupid,
@@ -2087,20 +2106,6 @@ static struct command_result *json_injectpaymentonion(struct command *cmd,
 				    &shared_secret,
 				    destination);
 
-	/* If unknown, we set this equal (so accounting logs 0 fees) */
-	if (amount_msat_eq(*destination_msat, AMOUNT_MSAT(0)))
-		*destination_msat = *msat;
-	failmsg = send_htlc_out(tmpctx, next, *msat,
-				*cltv, *destination_msat,
-				payment_hash,
-				next_path_key, *partid, *groupid,
-				serialize_onionpacket(tmpctx, rs->next),
-				NULL, &hout);
-	if (failmsg) {
-		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Could not send to first peer: %s",
-				    onion_wire_name(fromwire_peektype(failmsg)));
-	}
 	return command_still_pending(cmd);
 }
 
@@ -2118,7 +2123,8 @@ static u64 sendpay_index_inc(struct lightningd *ld,
 			     enum payment_status status,
 			     enum wait_index idx)
 {
-	return wait_index_increment(ld, WAIT_SUBSYSTEM_SENDPAY, idx,
+	return wait_index_increment(ld, ld->wallet->db,
+				    WAIT_SUBSYSTEM_SENDPAY, idx,
 				    "status", payment_status_to_string(status),
 				    "=partid", tal_fmt(tmpctx, "%"PRIu64, partid),
 				    "=groupid", tal_fmt(tmpctx, "%"PRIu64, groupid),

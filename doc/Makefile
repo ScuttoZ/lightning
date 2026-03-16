@@ -8,16 +8,17 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/addpsbtoutput.7 \
 	doc/askrene-age.7 \
 	doc/askrene-bias-channel.7 \
-	doc/askrene-create-layer.7 \
-	doc/askrene-remove-layer.7 \
+	doc/askrene-bias-node.7 \
 	doc/askrene-create-channel.7 \
-	doc/askrene-update-channel.7 \
+	doc/askrene-create-layer.7 \
 	doc/askrene-disable-node.7 \
 	doc/askrene-inform-channel.7 \
 	doc/askrene-listlayers.7 \
 	doc/askrene-listreservations.7 \
+	doc/askrene-remove-layer.7 \
 	doc/askrene-reserve.7 \
 	doc/askrene-unreserve.7 \
+	doc/askrene-update-channel.7 \
 	doc/autoclean-once.7 \
 	doc/autoclean-status.7 \
 	doc/batching.7 \
@@ -30,14 +31,13 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/bkpr-listbalances.7 \
 	doc/bkpr-listincome.7 \
 	doc/blacklistrune.7 \
+	doc/cancelrecurringinvoice.7 \
 	doc/check.7 \
 	doc/checkmessage.7 \
 	doc/checkrune.7 \
+	doc/clnrest-register-path.7 \
 	doc/close.7 \
-	doc/commando-blacklist.7 \
 	doc/commando.7 \
-	doc/commando-listrunes.7 \
-	doc/commando-rune.7 \
 	doc/connect.7 \
 	doc/createinvoice.7 \
 	doc/createonion.7 \
@@ -45,10 +45,10 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/datastore.7 \
 	doc/datastoreusage.7 \
 	doc/decode.7 \
-	doc/decodepay.7 \
 	doc/deldatastore.7 \
 	doc/delforward.7 \
 	doc/delinvoice.7 \
+	doc/delnetworkevent.7 \
 	doc/delpay.7 \
 	doc/deprecations.7 \
 	doc/dev-forget-channel.7 \
@@ -57,9 +57,10 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/disableoffer.7 \
 	doc/disconnect.7 \
 	doc/emergencyrecover.7 \
-	doc/enableoffer.7	\
+	doc/enableoffer.7 \
 	doc/exposesecret.7 \
 	doc/feerates.7 \
+	doc/fetchbip353.7 \
 	doc/fetchinvoice.7 \
 	doc/fundchannel_cancel.7 \
 	doc/fundchannel_complete.7 \
@@ -79,6 +80,8 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/invoicerequest.7 \
 	doc/keysend.7 \
 	doc/listaddresses.7 \
+	doc/listchainmoves.7 \
+	doc/listchannelmoves.7 \
 	doc/listchannels.7 \
 	doc/listclosedchannels.7 \
 	doc/listconfigs.7 \
@@ -88,6 +91,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/listhtlcs.7 \
 	doc/listinvoicerequests.7 \
 	doc/listinvoices.7 \
+	doc/listnetworkevents.7 \
 	doc/listnodes.7 \
 	doc/listoffers.7 \
 	doc/listpays.7 \
@@ -129,6 +133,7 @@ MARKDOWNPAGES := doc/addgossip.7 \
 	doc/showrunes.7 \
 	doc/signinvoice.7 \
 	doc/signmessage.7 \
+	doc/signmessagewithkey.7 \
 	doc/signpsbt.7 \
 	doc/splice_init.7 \
 	doc/splice_signed.7 \
@@ -159,6 +164,7 @@ NON_PREFIXED_MANPAGES := doc/lightning-cli.1 \
 	doc/lightningd-config.5 \
 	doc/lightningd-rpc.7 \
 	doc/lightning-hsmtool.8 \
+	doc/lightning-downgrade.8 \
 	doc/lightning-reckless.1
 
 MANPAGES := $(PREFIXED_MANPAGES) $(NON_PREFIXED_MANPAGES)
@@ -201,16 +207,7 @@ RBRACKET=)
 $(MARKDOWNPAGES_WITH_EXT): doc/%.7.md: doc/schemas/%.json tools/fromschema.py
 	@tools/fromschema.py --markdownfile=$@ $< > $@.tmp && mv $@.tmp $@
 
-# If we need to build lowdown, make tools/md2man.sh depend on it.
-# That way it's not used in SHA256STAMP (which only uses direct
-# dependencies), but make will be forced to build it.
-ifeq ($(HAVE_LOWDOWN),0)
-LOWDOWN := $(TARGET_DIR)/lowdown-build/bin/lowdown
-tools/md2man.sh: $(LOWDOWN)
-	touch $@
-else
 LOWDOWN := lowdown
-endif
 
 # For versions in documentation, we don't change with every git version, to
 # save build time.  We build them on new tags or keep them on pre-next-release version.
@@ -225,9 +222,9 @@ doc/.doc_version: version_gen.h
 	@if cmp $@.new $@ >/dev/null 2>&1; then rm -f $@.new; else mv $@.new $@; $(ECHO) Documentation version updated to `cat doc/.doc_version`; fi
 
 $(PREFIXED_MANPAGES): doc/lightning-%: doc/%.md tools/md2man.sh doc/.doc_version
-	@VERSION=`cat doc/.doc_version` tools/md2man.sh $(LOWDOWN) $<
+	@VERSION=`cat doc/.doc_version` SED=$(SED) tools/md2man.sh $(LOWDOWN) $<
 $(NON_PREFIXED_MANPAGES): doc/%: doc/%.md tools/md2man.sh doc/.doc_version
-	@VERSION=`cat doc/.doc_version` tools/md2man.sh $(LOWDOWN) $<
+	@VERSION=`cat doc/.doc_version` SED=$(SED) tools/md2man.sh $(LOWDOWN) $<
 
 doc/protocol-%.svg: test/test_protocol
 	test/test_protocol --svg < test/commits/$*.script > $@
@@ -262,8 +259,8 @@ check: check-manpages
 
 # This needs plugins, too.
 check-manpages: all-programs check-config-docs default-targets
-	@tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.md
-	@tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.md
+	@SED=$(SED) tools/check-manpage.sh cli/lightning-cli doc/lightning-cli.1.md
+	@SED=$(SED) tools/check-manpage.sh "lightningd/lightningd --lightning-dir=/tmp/" doc/lightningd-config.5.md
 	@awk '/^$$/ { do { getline } while ($$0 ~ /^( {4,}|\t)/) } /^\s*```/ { do { getline } while ($$0 !~ /^\s*```/) } /^([^`_\\]|`([^`\\]|\\.)*`|\b_|_\b|\\.)*\B_\B/ { print "" ; print "Unescaped underscore at " FILENAME ":" NR ":" ; print ; ret = 1 } ENDFILE { NR = 0 } END { exit ret }' doc/*.[0-9].md
 
 # Makes sure that fields mentioned in schema are in man page, and vice versa.
@@ -280,7 +277,7 @@ doc/index.rst: $(MARKDOWNPAGES_WITH_EXT) $(NON_PREFIXED_MARKDOWNPAGES_WITH_EXT) 
 	  for m in $(MARKDOWNPAGES_WITH_EXT) $(NON_PREFIXED_MARKDOWNPAGES_WITH_EXT); do \
 	    base=$$(basename "$$m"); \
 	    echo "$$base" | \
-	      sed -E 's/^(.*)\.([0-9]+)\.md$$/\1 <\1.\2.md>/; t; s/^(.*)\.md$$/\1 <\1.md>/'; \
+	      $(SED) -E 's/^(.*)\.([0-9]+)\.md$$/\1 <\1.\2.md>/; t; s/^(.*)\.md$$/\1 <\1.md>/'; \
 	  done | \
 	  LC_ALL=C sort | \
 	  $(PYTHON) devtools/blockreplace.py doc/index.rst manpages --language=rst --indent "   " \

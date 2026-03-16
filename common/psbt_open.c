@@ -2,8 +2,6 @@
 #include <bitcoin/psbt.h>
 #include <bitcoin/script.h>
 #include <ccan/asort/asort.h>
-#include <ccan/ccan/endian/endian.h>
-#include <ccan/ccan/mem/mem.h>
 #include <common/channel_id.h>
 #include <common/psbt_open.h>
 #include <common/pseudorand.h>
@@ -82,6 +80,7 @@ static const u8 *linearize_input(const tal_t *ctx,
 	wally_psbt_input_set_witness_script(&psbt->inputs[0], NULL, 0);
 	wally_psbt_input_set_redeem_script(&psbt->inputs[0], NULL, 0);
 	wally_psbt_input_set_taproot_signature(&psbt->inputs[0], NULL, 0);
+	wally_psbt_input_set_sighash(&psbt->inputs[0], 0);
 	psbt->inputs[0].taproot_leaf_hashes.num_items = 0;
 	psbt->inputs[0].taproot_leaf_paths.num_items = 0;
 	psbt->inputs[0].keypaths.num_items = 0;

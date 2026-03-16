@@ -2,11 +2,8 @@
 #define LIGHTNING_DB_COMMON_H
 #include "config.h"
 #include <ccan/list/list.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/strset/strset.h>
 #include <common/autodata.h>
 #include <common/utils.h>
-#include <stdarg.h>
 
 /**
  * Macro to annotate a named SQL query.
@@ -32,6 +29,8 @@
 struct db {
 	char *filename;
 	const char *in_transaction;
+	/* For lazy transaction activation */
+	bool transaction_started;
 
 	/* DB-specific context */
 	void *conn;
@@ -67,6 +66,9 @@ struct db {
 
 	/* Fatal if we try to write to db */
 	bool readonly;
+
+	/* Set during migrations to skip STRICT on legacy table creation */
+	bool in_migration;
 };
 
 struct db_query {
@@ -183,7 +185,7 @@ struct db_config {
 	u64 (*last_insert_id_fn)(struct db_stmt *stmt);
 	size_t (*count_changes_fn)(struct db_stmt *stmt);
 
-	bool (*setup_fn)(struct db *db);
+	bool (*setup_fn)(struct db *db, bool create);
 	void (*teardown_fn)(struct db *db);
 
 	bool (*vacuum_fn)(struct db *db);

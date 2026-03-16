@@ -6,9 +6,6 @@
 #include <common/json_parse_simple.h>
 #include <common/utils.h>
 #include <errno.h>
-#include <inttypes.h>
-#include <stdio.h>
-#include <wire/onion_wire.h>
 
 const char *json_tok_full(const char *buffer, const jsmntok_t *t)
 {
@@ -31,11 +28,6 @@ bool json_tok_strneq(const char *buffer, const jsmntok_t *tok,
 	if (tok->type != JSMN_STRING)
 		return false;
 	return memeq(buffer + tok->start, tok->end - tok->start, str, len);
-}
-
-bool json_tok_streq(const char *buffer, const jsmntok_t *tok, const char *str)
-{
-	return json_tok_strneq(buffer, tok, str, strlen(str));
 }
 
 bool json_tok_startswith(const char *buffer, const jsmntok_t *tok,
@@ -71,6 +63,7 @@ bool json_to_u64(const char *buffer, const jsmntok_t *tok, u64 *num)
 	char *end;
 	unsigned long long l;
 
+	errno = 0;
 	l = strtoull(buffer + tok->start, &end, 0);
 	if (end != buffer + tok->end)
 		return false;
@@ -93,6 +86,7 @@ bool json_to_s64(const char *buffer, const jsmntok_t *tok, s64 *num)
 	char *end;
 	long long l;
 
+	errno = 0;
 	l = strtoll(buffer + tok->start, &end, 0);
 	if (end != buffer + tok->end)
 		return false;
@@ -112,19 +106,6 @@ bool json_to_s64(const char *buffer, const jsmntok_t *tok, s64 *num)
 	return true;
 }
 
-bool json_str_to_u64(const char *buffer, const jsmntok_t *tok, u64 *num)
-{
-	jsmntok_t temp;
-	if (tok->type != JSMN_STRING)
-		return false;
-
-	temp = *tok;
-	temp.start += 1;
-	temp.end -= 1;
-
-	return json_to_u64(buffer, &temp, num);
-}
-
 bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num)
 {
 	char *end;
@@ -134,7 +115,7 @@ bool json_to_double(const char *buffer, const jsmntok_t *tok, double *num)
 	if (end != buffer + tok->end)
 		return false;
 
-	/* Check for overflow */
+	/* Check for overflow/underflow */
 	if (errno == ERANGE)
 		return false;
 
@@ -215,12 +196,6 @@ const jsmntok_t *json_get_membern(const char *buffer,
 			return t + 1;
 
 	return NULL;
-}
-
-const jsmntok_t *json_get_member(const char *buffer, const jsmntok_t tok[],
-				 const char *label)
-{
-	return json_get_membern(buffer, tok, label, strlen(label));
 }
 
 const jsmntok_t *json_get_arr(const jsmntok_t tok[], size_t index)
@@ -511,24 +486,24 @@ bool json_parse_input(jsmn_parser *parser,
 
 again:
 	ret = jsmn_parse(parser, input, len, *toks, tal_count(*toks) - 1);
-
-	switch (ret) {
-	case JSMN_ERROR_INVAL:
+	if (ret == JSMN_ERROR_INVAL)
 		return false;
-	case JSMN_ERROR_NOMEM:
-		tal_resize(toks, tal_count(*toks) * 2);
-		goto again;
-	}
 
 	/* Check whether we read at least one full root element, i.e., root
 	 * element has its end set. */
 	if ((*toks)[0].type == JSMN_UNDEFINED || (*toks)[0].end == -1) {
+		/* If it ran out of tokens, provide more. */
+		if (ret == JSMN_ERROR_NOMEM) {
+			tal_resize(toks, tal_count(*toks) * 2);
+			goto again;
+		}
+		/* Otherwise, must be incomplete */
 		*complete = false;
 		return true;
 	}
 
 	/* If we read a partial element at the end of the stream we'll get a
-	 * ret=JSMN_ERROR_PART, but due to the previous check we know we read at
+	 * errro, but due to the previous check we know we read at
 	 * least one full element, so count tokens that are part of this root
 	 * element. */
 	ret = json_next(*toks) - *toks;

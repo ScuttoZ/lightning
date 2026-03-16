@@ -9,8 +9,7 @@
 # include <external/jsmn/jsmn.h>
 
 #include <bitcoin/short_channel_id.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/tal/tal.h>
+#include <ccan/list/list.h>
 #include <ccan/time/time.h>
 #include <common/amount.h>
 #include <common/jsonrpc_errors.h>
@@ -38,6 +37,8 @@ struct wireaddr;
 struct wireaddr_internal;
 
 struct json_stream {
+	struct list_node list;
+
 	struct json_out *jout;
 
 	/* Who is writing to this buffer now; NULL if nobody is. */
@@ -242,8 +243,7 @@ void json_add_s32(struct json_stream *result, const char *fieldname,
 void json_add_bool(struct json_stream *result, const char *fieldname,
 		   bool value);
 
-/* '"fieldname" : null' or 'null' if fieldname is NULL */
-void json_add_null(struct json_stream *stream, const char *fieldname);
+/* Looking for json_add_null?  Don't do that: we omit fields, don't 'null' them! */
 
 /* '"fieldname" : "0189abcdef..."' or "0189abcdef..." if fieldname is NULL */
 void json_add_hex(struct json_stream *result, const char *fieldname,
@@ -253,8 +253,13 @@ void json_add_hex_talarr(struct json_stream *result,
 			 const char *fieldname,
 			 const tal_t *data);
 
+/* '"fieldname" : 1749785122.000000001 */
 void json_add_timeabs(struct json_stream *result, const char *fieldname,
 		      struct timeabs t);
+
+/* '"fieldname" : 1.000000001 */
+void json_add_timerel(struct json_stream *result, const char *fieldname,
+		      struct timerel t);
 
 /* used in log.c and notification.c*/
 void json_add_timestr(struct json_stream *result, const char *fieldname,

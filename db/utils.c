@@ -1,8 +1,9 @@
 #include "config.h"
+#include <ccan/strset/strset.h>
 #include <ccan/tal/str/str.h>
 #include <common/trace.h>
-#include <common/utils.h>
 #include <db/common.h>
+#include <db/exec.h>
 #include <db/utils.h>
 
 /* Matches the hash function used in devtools/sql-rewrite.py */
@@ -153,8 +154,7 @@ bool db_query_prepared_canfail(struct db_stmt *stmt)
 void db_query_prepared(struct db_stmt *stmt)
 {
 	if (!db_query_prepared_canfail(stmt))
-		db_fatal(stmt->db, "query failed: %s: %s",
-			 stmt->location, stmt->query->query);
+		db_fatal(stmt->db, "query failed: %s", stmt->error);
 }
 
 bool db_step(struct db_stmt *stmt)
@@ -175,9 +175,12 @@ bool db_step(struct db_stmt *stmt)
 
 void db_exec_prepared_v2(struct db_stmt *stmt TAKES)
 {
+	bool ret;
+
+	db_need_transaction(stmt->db, stmt->query->query);
 	trace_span_start("db_exec_prepared", stmt);
 	trace_span_tag(stmt, "query", stmt->query->query);
-	bool ret = stmt->db->config->exec_fn(stmt);
+	ret = stmt->db->config->exec_fn(stmt);
 	trace_span_end(stmt);
 
 	if (stmt->db->readonly)
@@ -334,6 +337,7 @@ void db_warn(const struct db *db, const char *fmt, ...)
 
 struct db *db_open_(const tal_t *ctx, const char *filename,
 		    bool developer,
+		    bool create,
 		    void (*errorfn)(void *arg, bool fatal, const char *fmt, va_list ap),
 		    void *arg)
 {
@@ -357,19 +361,25 @@ struct db *db_open_(const tal_t *ctx, const char *filename,
 	if (!db->queries)
 		db_fatal(db, "Unable to find DB queries for %s", db->config->name);
 
-	tal_add_destructor(db, destroy_db);
 	db->in_transaction = NULL;
+	db->transaction_started = false;
 	db->changes = NULL;
+	db->in_migration = false;
 
 	/* This must be outside a transaction, so catch it */
 	assert(!db->in_transaction);
 
 	trace_span_start("db_setup", db);
 	db_prepare_for_changes(db);
-	if (db->config->setup_fn && !db->config->setup_fn(db))
-		db_fatal(db, "Error calling DB setup: %s", db->error);
+	if (!db->config->setup_fn(db, create)) {
+		if (create)
+			db_fatal(db, "Error calling DB setup: %s", db->error);
+		trace_span_end(db);
+		return tal_free(db);
+	}
 	db_report_changes(db, NULL, 0);
 	trace_span_end(db);
 
+	tal_add_destructor(db, destroy_db);
 	return db;
 }

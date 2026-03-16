@@ -1,9 +1,6 @@
 #include "config.h"
-#include <ccan/crypto/siphash24/siphash24.h>
 #include <ccan/htable/htable.h>
 #include <ccan/ptrint/ptrint.h>
-#include <common/memleak.h>
-#include <common/pseudorand.h>
 #include <connectd/gossip_rcvd_filter.h>
 #include <wire/peer_wire.h>
 
@@ -73,6 +70,8 @@ static bool is_msg_gossip_broadcast(const u8 *cursor)
 	case WIRE_UPDATE_FULFILL_HTLC:
 	case WIRE_UPDATE_FAIL_HTLC:
 	case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+	case WIRE_PROTOCOL_BATCH_ELEMENT:
+	case WIRE_START_BATCH:
 	case WIRE_COMMITMENT_SIGNED:
 	case WIRE_REVOKE_AND_ACK:
 	case WIRE_UPDATE_FEE:

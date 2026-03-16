@@ -2,23 +2,17 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/bitmap/bitmap.h>
 #include <ccan/json_escape/json_escape.h>
-#include <ccan/rune/rune.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt12.h>
-#include <common/configdir.h>
+#include <common/clock_time.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/json_stream.h>
-#include <common/memleak.h>
 #include <common/overflows.h>
-#include <common/timeout.h>
-#include <db/exec.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <inttypes.h>
 #include <lightningd/hsm_control.h>
 #include <lightningd/jsonrpc.h>
 #include <lightningd/lightningd.h>
 #include <lightningd/runes.h>
-#include <wallet/wallet.h>
 
 /* "640k should be enough for anybody!" */
 #define MAX_BLACKLIST_NUM 100000000
@@ -484,10 +478,8 @@ static struct rune_altern *rune_altern_from_json(const tal_t *ctx,
 	/* We still need to unescape here, for \\ -> \.  JSON doesn't
 	 * allow unnecessary \ */
 	const char *unescape;
-	struct json_escape *e = json_escape_string_(tmpctx,
-						    buffer + tok->start,
-						    tok->end - tok->start);
-	unescape = json_escape_unescape(tmpctx, e);
+	unescape = json_escape_unescape_len(tmpctx, buffer + tok->start,
+					    tok->end - tok->start);
 	if (!unescape)
 		return NULL;
 
@@ -948,7 +940,7 @@ static struct command_result *json_checkrune(struct command *cmd,
 	cinfo.buf = buffer;
 	cinfo.method = method;
 	cinfo.params = methodparams;
-	cinfo.now = time_now();
+	cinfo.now = clock_time();
 	strmap_init(&cinfo.cached_params);
 
 	err = rune_is_ours(cmd->ld, ras->rune);

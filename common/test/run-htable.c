@@ -6,7 +6,9 @@
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/amount.h>
+#include <common/memleak.h>
 #include <common/pseudorand.h>
+#include <common/randbytes.h>
 #include <common/setup.h>
 #include <common/utils.h>
 #include <inttypes.h>

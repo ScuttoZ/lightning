@@ -1,3 +1,4 @@
+from bitcoin.rpc import RawProxy
 from collections import OrderedDict
 from datetime import datetime
 from fixtures import *  # noqa: F401,F403
@@ -10,12 +11,14 @@ from utils import (
     expected_peer_features, expected_node_features,
     expected_channel_features, account_balance,
     check_coin_moves, first_channel_id, EXPERIMENTAL_DUAL_FUND,
-    mine_funding_to_announce, VALGRIND
+    mine_funding_to_announce, VALGRIND, first_scid
 )
+from tests.test_wallet import HsmTool, write_all, WAIT_TIMEOUT
 
 import ast
 import base64
 import math
+import copy
 import json
 import os
 import pytest
@@ -514,6 +517,29 @@ def test_plugin_connected_hook_chaining(node_factory):
     assert not l1.daemon.is_in_log(f"peer_connected_logger_b {l3id}")
 
 
+def test_plugin_connected_hook_disconnect_crash(node_factory, executor):
+    """A peer disconnnects between plugin hook invocations"""
+    opts = [{},
+            {'plugin':
+             [os.path.join(os.getcwd(),
+                           'tests/plugins/peer_connected_logger_a.py'),
+              os.path.join(os.getcwd(),
+                           'tests/plugins/peer_connected_logger_b.py')],
+             'logger_a_sleep': True},
+            ]
+
+    l1, l2 = node_factory.get_nodes(2, opts=opts)
+    executor.submit(l1.rpc.connect, l2.info['id'], 'localhost', l2.port)
+    l2.daemon.wait_for_log(f'plugin-peer_connected_logger_a.py: peer_connected_logger_a {l1.info["id"]}')
+    l1.stop()
+
+    # Now make first plugin continue...
+    open(os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, "unsleep"), "w").close()
+
+    # Should get log from second
+    l2.daemon.wait_for_log(f'plugin-peer_connected_logger_b.py: peer_connected_logger_b {l1.info["id"]}')
+
+
 def test_peer_connected_remote_addr(node_factory):
     """This tests the optional tlv `remote_addr` being passed to a plugin.
 
@@ -662,14 +688,21 @@ def test_invoice_payment_hook(node_factory):
     l2.daemon.wait_for_log('preimage=' + '0' * 64)
 
 
-def test_invoice_payment_hook_hold(node_factory):
+def test_invoice_payment_hook_hold(node_factory, executor):
     """ l1 uses the hold_invoice plugin to delay invoice payment.
     """
-    opts = [{}, {'plugin': os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py'), 'holdtime': TIMEOUT / 2}]
+    opts = [{}, {'plugin': os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py')}]
     l1, l2 = node_factory.line_graph(2, opts=opts)
 
     inv1 = l2.rpc.invoice(1230, 'label', 'description', preimage='1' * 64)
-    l1.rpc.pay(inv1['bolt11'])
+
+    # This should block.
+    f = executor.submit(l1.rpc.pay, inv1['bolt11'])
+    time.sleep(5)
+    assert not f.done()
+
+    open(os.path.join(l2.daemon.lightning_dir, TEST_NETWORK, "unhold"), "w").close()
+    f.result(TIMEOUT)
 
 
 @pytest.mark.openchannel('v1')
@@ -697,8 +730,10 @@ def test_openchannel_hook(node_factory, bitcoind):
 
     if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
         feerate = 3750
+        expected['channel_type'] = r"{'bits': \[12, 22\], 'names': \['static_remotekey/even', 'anchors/even'\]}"
     else:
         feerate = 7500
+        expected['channel_type'] = r"{'bits': \[12\], 'names': \['static_remotekey/even'\]}"
     if l2.config('experimental-dual-fund'):
         # openchannel2 var checks
         expected.update({
@@ -833,13 +868,13 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
         for ev in [event1a, event1b]:
             assert(ev['peer_id'] == l2_id)  # we only test these IDs the first time
             assert(ev['channel_id'] == cid)
-            assert(ev['short_channel_id'] is None)  # None until locked in
+            assert('short_channel_id' not in ev)  # Missing until locked in
             assert(ev['cause'] == "remote")
 
         for ev in [event2a, event2b]:
             assert(ev['peer_id'] == l1_id)  # we only test these IDs the first time
             assert(ev['channel_id'] == cid)
-            assert(ev['short_channel_id'] is None)  # None until locked in
+            assert('short_channel_id' not in ev)  # Missing until locked in
             assert(ev['cause'] == "remote")
 
         for ev in [event1a, event2a]:
@@ -861,12 +896,12 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
         event2 = wait_for_event(l2)
         assert(event1['peer_id'] == l2_id)  # we only test these IDs the first time
         assert(event1['channel_id'] == cid)
-        assert(event1['short_channel_id'] is None)  # None until locked in
+        assert('short_channel_id' not in event1)  # Not present until locked in
         assert(event1['cause'] == "user")
 
         assert(event2['peer_id'] == l1_id)  # we only test these IDs the first time
         assert(event2['channel_id'] == cid)
-        assert(event2['short_channel_id'] is None)  # None until locked in
+        assert('short_channel_id' not in event2)  # Not present until locked in
         assert(event2['cause'] == "remote")
 
         for ev in [event1, event2]:
@@ -938,7 +973,7 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
     assert(event2['cause'] == "remote")
     assert(event2['message'] == "Closing complete")
 
-    bitcoind.generate_block(100, wait_for_mempool=1)  # so it gets settled
+    bitcoind.generate_block(99, wait_for_mempool=1)  # so it gets settled
 
     event1 = wait_for_event(l1)
     assert(event1['old_state'] == "CLOSINGD_COMPLETE")
@@ -961,6 +996,18 @@ def test_channel_state_changed_bilateral(node_factory, bitcoind):
     assert(event2['new_state'] == "ONCHAIN")
     assert(event2['cause'] == "remote")
     assert(event2['message'] == "Onchain init reply")
+
+    bitcoind.generate_block(1)
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "ONCHAIN")
+    assert(event1['new_state'] == "CLOSED")
+    assert(event1['cause'] == "unknown")
+    assert('message' not in event1)
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "ONCHAIN")
+    assert(event2['new_state'] == "CLOSED")
+    assert(event2['cause'] == "unknown")
+    assert('message' not in event2)
 
 
 @pytest.mark.openchannel('v1')
@@ -989,7 +1036,7 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     event2 = wait_for_event(l2)
     assert(event2['peer_id'] == l1_id)
     assert(event2['channel_id'] == cid)
-    assert(event2['short_channel_id'] is None)
+    assert('short_channel_id' not in event2)
     assert(event2['cause'] == "remote")
 
     if l2.config('experimental-dual-fund'):
@@ -1056,8 +1103,8 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     assert(event1['cause'] == "protocol")
     assert(event1['message'] == "channeld: received ERROR channel {}: Forcibly closed by `close` command timeout".format(cid))
 
-    # settle the channel closure
-    bitcoind.generate_block(100)
+    # Almost settle the channel closure
+    bitcoind.generate_block(99, wait_for_mempool=1)
 
     event2 = wait_for_event(l2)
     assert(event2['old_state'] == "AWAITING_UNILATERAL")
@@ -1084,6 +1131,19 @@ def test_channel_state_changed_unilateral(node_factory, bitcoind):
     assert(event1['new_state'] == "ONCHAIN")
     assert(event1['cause'] == "onchain")
     assert(event1['message'] == "Onchain init reply")
+
+    bitcoind.generate_block(1)
+    event1 = wait_for_event(l1)
+    assert(event1['old_state'] == "ONCHAIN")
+    assert(event1['new_state'] == "CLOSED")
+    assert(event1['cause'] == "unknown")
+    assert('message' not in event1)
+
+    event2 = wait_for_event(l2)
+    assert(event2['old_state'] == "ONCHAIN")
+    assert(event2['new_state'] == "CLOSED")
+    assert(event2['cause'] == "unknown")
+    assert('message' not in event2)
 
 
 @pytest.mark.openchannel('v1')
@@ -1244,7 +1304,8 @@ def test_htlc_accepted_hook_forward_restart(node_factory, executor):
     # additional checks
     logline = l2.daemon.wait_for_log(r'Onion written to')
     fname = re.search(r'Onion written to (.*\.json)', logline).group(1)
-    onion = json.load(open(fname))
+    with open(fname) as f:
+        onion = json.load(f)
     assert onion['type'] == 'tlv'
     assert re.match(r'^11020203e80401..0608................$', onion['payload'])
     assert len(onion['shared_secret']) == 64
@@ -1635,6 +1696,7 @@ def test_libplugin(node_factory):
 
     # Test commands
     assert l1.rpc.call("helloworld") == {"hello": "NOT FOUND"}
+    l1.daemon.wait_for_log(r'listpeers gave 3 tokens: {"peers":\[\]}')
     l1.daemon.wait_for_log("get_ds_bin_done: 00010203")
     l1.daemon.wait_for_log("BROKEN.* Datastore gave nonstring result.*00010203")
     assert l1.rpc.call("helloworld", {"name": "test"}) == {"hello": "test"}
@@ -1682,6 +1744,7 @@ def test_libplugin(node_factory):
     assert l1.daemon.is_in_stderr(r"somearg-deprecated=test_opt: deprecated option")
 
     del l1.daemon.opts["somearg-deprecated"]
+    l1.daemon.opts["multiopt"] = ['hello', 'world']
     l1.start()
 
     # Test that check works as expected.
@@ -1694,6 +1757,9 @@ def test_libplugin(node_factory):
 
     # This works
     assert l1.rpc.check('checkthis', key=["test_libplugin", "name"]) == {'command_to_check': 'checkthis'}
+
+    assert l1.daemon.is_in_log('plugin-test_libplugin: multiopt#0 = hello')
+    assert l1.daemon.is_in_log('plugin-test_libplugin: multiopt#1 = world')
 
 
 def test_libplugin_deprecated(node_factory):
@@ -1744,6 +1810,27 @@ def test_plugin_feature_announce(node_factory):
     # Check the featurebit set in the `node_announcement`
     node = l1.rpc.listnodes(l1.info['id'])['nodes'][0]
     assert node['features'] == expected_node_features(extra=[203])
+
+
+def test_plugin_feature_remove(node_factory):
+    """Check that features registered by plugins get removed if a plugin
+    disables itself.
+
+    We set the following feature bits we don't want to include if the plugin is
+    disabled during init.
+     - 1 << 201 for `init` messages
+     - 1 << 203 for `node_announcement`
+     - 1 << 205 for bolt11 invoices
+    """
+
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/feature-test.py')
+    l1 = node_factory.get_node(options={'plugin': plugin, 'disable-on-init': True})
+
+    # Check that we don't include the features set in getmanifest.
+    our_feats = l1.rpc.getinfo()["our_features"]
+    assert((int(our_feats["init"], 16) & (1 << 201)) == 0)
+    assert((int(our_feats["node"], 16) & (1 << 203)) == 0)
+    assert((int(our_feats["invoice"], 16) & (1 << 205)) == 0)
 
 
 def test_hook_chaining(node_factory):
@@ -1851,6 +1938,23 @@ def test_bitcoin_backend(node_factory, bitcoind):
                                " bitcoind")
 
 
+def test_bitcoin_backend_gianttx(node_factory, bitcoind):
+    """Test that a giant tx doesn't crash bcli"""
+    # This complains about how long fundpsbt took.
+    l1 = node_factory.get_node(start=False, broken_log="That's weird: Request .*psbt took")
+    # With memleak we spend far too much time gathering backtraces.
+    if "LIGHTNINGD_DEV_MEMLEAK" in l1.daemon.env:
+        del l1.daemon.env["LIGHTNINGD_DEV_MEMLEAK"]
+    l1.start()
+    addrs = {addr: 0.00200000 for addr in [l1.rpc.newaddr('bech32')['bech32'] for _ in range(700)]}
+    bitcoind.rpc.sendmany("", addrs)
+    bitcoind.generate_block(1, wait_for_mempool=1)
+    sync_blockheight(bitcoind, [l1])
+
+    l1.rpc.withdraw(bitcoind.getnewaddress(), 'all')
+    bitcoind.generate_block(1, wait_for_mempool=1)
+
+
 def test_bitcoin_bad_estimatefee(node_factory, bitcoind):
     """
     This tests that we don't crash if bitcoind backend gives bad estimatefees.
@@ -1922,6 +2026,111 @@ def test_bcli(node_factory, bitcoind, chainparams):
 
     resp = l1.rpc.call("sendrawtransaction", {"tx": "dummy", "allowhighfees": False})
     assert not resp["success"] and "decode failed" in resp["errmsg"]
+
+
+def test_bcli_concurrent(node_factory, bitcoind, executor):
+    """Test bcli handles concurrent requests while `getblockfrompeer` retry is active.
+
+    Simulates a pruned node scenario where getblock initially fails. The bcli
+    plugin should use getblockfrompeer to fetch the block from peers, then
+    retry `getblock` successfully. Meanwhile, other concurrent requests
+    (`getchaininfo`, `estimatefees`) should complete normally.
+    """
+    retry_count = 5
+    getblockfrompeer_count = 0
+
+    def mock_getblock(r):
+        if getblockfrompeer_count >= retry_count:
+            conf_file = os.path.join(bitcoind.bitcoin_dir, "bitcoin.conf")
+            brpc = RawProxy(btc_conf_file=conf_file)
+            return {
+                "result": brpc._call(r["method"], *r["params"]),
+                "error": None,
+                "id": r["id"]
+            }
+        return {
+            "id": r["id"],
+            "result": None,
+            "error": {"code": -1, "message": "Block not available (pruned data)"}
+        }
+
+    def mock_getpeerinfo(r):
+        return {"id": r["id"], "result": [{"id": 1, "services": "000000000000040d"}]}
+
+    def mock_getblockfrompeer(r):
+        nonlocal getblockfrompeer_count
+        getblockfrompeer_count += 1
+        return {"id": r["id"], "result": {}}
+
+    l1 = node_factory.get_node(start=False)
+    l1.daemon.rpcproxy.mock_rpc("getblock", mock_getblock)
+    l1.daemon.rpcproxy.mock_rpc("getpeerinfo", mock_getpeerinfo)
+    l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer)
+    l1.start(wait_for_bitcoind_sync=False)
+
+    # Submit concurrent bcli requests, `getrawblockbyheight` hits a retry path.
+    block_future = executor.submit(l1.rpc.call, "getrawblockbyheight", {"height": 1})
+    chaininfo_futures = []
+    fees_futures = []
+    for _ in range(5):
+        chaininfo_futures.append(executor.submit(l1.rpc.call, "getchaininfo", {"last_height": 0}))
+        fees_futures.append(executor.submit(l1.rpc.call, "estimatefees"))
+
+    block_result = block_future.result(TIMEOUT)
+    assert "blockhash" in block_result
+    assert "block" in block_result
+
+    for fut in chaininfo_futures:
+        result = fut.result(TIMEOUT)
+        assert "chain" in result
+        assert "blockcount" in result
+
+    for fut in fees_futures:
+        result = fut.result(TIMEOUT)
+        assert "feerates" in result
+        assert "feerate_floor" in result
+
+    assert getblockfrompeer_count == retry_count
+
+
+def test_bcli_retry_timeout(node_factory, bitcoind):
+    """Test that lightningd crashes when getblock retries are exhausted.
+
+    Currently, when bcli returns an error after retry timeout, lightningd's
+    get_bitcoin_result() calls fatal(). This test documents that behavior.
+    """
+    getblockfrompeer_count = 0
+
+    def mock_getblock(r):
+        return {
+            "id": r["id"],
+            "result": None,
+            "error": {"code": -1, "message": "Block not available (pruned data)"}
+        }
+
+    def mock_getpeerinfo(r):
+        return {"id": r["id"], "result": [{"id": 1, "services": "000000000000040d"}]}
+
+    def mock_getblockfrompeer(r):
+        nonlocal getblockfrompeer_count
+        getblockfrompeer_count += 1
+        return {"id": r["id"], "result": {}}
+
+    l1 = node_factory.get_node(may_fail=True,
+                               broken_log=r'getrawblockbyheight|FATAL SIGNAL|backtrace',
+                               options={"bitcoin-retry-timeout": 3})
+    sync_blockheight(bitcoind, [l1])
+
+    l1.daemon.rpcproxy.mock_rpc("getblock", mock_getblock)
+    l1.daemon.rpcproxy.mock_rpc("getpeerinfo", mock_getpeerinfo)
+    l1.daemon.rpcproxy.mock_rpc("getblockfrompeer", mock_getblockfrompeer)
+
+    # Mine a new block - lightningd will try to fetch it and crash.
+    bitcoind.generate_block(1)
+
+    l1.daemon.wait_for_log(r"timed out after 3 seconds")
+    assert l1.daemon.wait() != 0
+    assert getblockfrompeer_count > 0
 
 
 @unittest.skipIf(TEST_NETWORK != 'regtest', 'p2tr addresses not supported by elementsd')
@@ -2071,15 +2280,16 @@ def test_watchtower(node_factory, bitcoind, directory, chainparams):
 
     cheat_tx = bitcoind.rpc.decoderawtransaction(tx)
     lastcommitnum = 0
-    for l in open(wt_file, 'r'):
-        txid, penalty, channel_id_hook, commitnum = l.strip().split(', ')
-        assert lastcommitnum == int(commitnum)
-        assert channel_id_hook == channel_id
-        lastcommitnum += 1
-        if txid == cheat_tx['txid']:
-            # This one should succeed, since it is a response to the cheat_tx
-            bitcoind.rpc.sendrawtransaction(penalty)
-            break
+    with open(wt_file, 'r') as f:
+        for l in f:
+            txid, penalty, channel_id_hook, commitnum = l.strip().split(', ')
+            assert lastcommitnum == int(commitnum)
+            assert channel_id_hook == channel_id
+            lastcommitnum += 1
+            if txid == cheat_tx['txid']:
+                # This one should succeed, since it is a response to the cheat_tx
+                bitcoind.rpc.sendrawtransaction(penalty)
+                break
 
     # Need this to check that l2 gets the funds
     penalty_meta = bitcoind.rpc.decoderawtransaction(penalty)
@@ -2200,6 +2410,9 @@ def test_coin_movement_notices(node_factory, bitcoind, chainparams):
     l2.rpc.sendpay(route, payment_hash21, payment_secret=inv['payment_secret'])
     l2.rpc.waitsendpay(payment_hash21)
 
+    # Make sure coin_movements.py sees event before we restart!
+    l2.daemon.wait_for_log(f"plugin-coin_movements.py: coin movement: .*'payment_hash': '{payment_hash21}'")
+
     # restart to test index
     l2.restart()
     wait_for(lambda: all(c['state'] == 'CHANNELD_NORMAL' for c in l2.rpc.listpeerchannels()["channels"]))
@@ -2248,7 +2461,7 @@ def test_important_plugin(node_factory):
     n = node_factory.get_node(options={"important-plugin": os.path.join(pluginsdir, "nonexistent")},
                               may_fail=True, expect_fail=True,
                               # Other plugins can complain as lightningd stops suddenly:
-                              broken_log='Plugin marked as important, shutting down lightningd|Reading JSON input: Connection reset by peer|Lost connection to the RPC socket',
+                              broken_log='Plugin marked as important, shutting down lightningd|Reading sync lightningd: Connection reset by peer|Lost connection to the RPC socket|Plugin terminated before replying to RPC call|plugin-cln-xpay: askrene-create-layer failed with.*Unkown command',
                               start=False)
 
     n.daemon.start(wait_for_initialized=False, stderr_redir=True)
@@ -2421,6 +2634,48 @@ def test_htlc_accepted_hook_failmsg(node_factory):
             l1.rpc.pay(inv)
 
 
+def test_htlc_accepted_hook_customtlvs(node_factory):
+    """ Passes an custom extra tlv field to the hooks return that should be set
+        as the `update_add_htlc_tlvs` in the `update_add_htlc` message on
+        forwards.
+    """
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted-customtlv.py')
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{}, {'plugin': plugin}, {'plugin': plugin}], wait_for_announce=True)
+
+    # Single tlv - Check that we receive the extra tlv at l3 attached by l2.
+    single_tlv = "fe00010001012a"  # represents type: 65537, lenght: 1, value: 42
+    l2.rpc.setcustomtlvs(tlvs=single_tlv)
+    inv = l3.rpc.invoice(1000, 'customtlvs-singletlv', '')['bolt11']
+    l1.rpc.pay(inv)
+    l3.daemon.wait_for_log(f"called htlc accepted hook with extra_tlvs: {single_tlv}")
+
+    # Mutliple tlvs - Check that we recieve multiple extra tlvs at l3 attached by l2.
+    multi_tlv = "fdffff012afe00010001020539"  # represents type: 65535, length: 1, value: 42 and type: 65537, length: 2, value: 1337
+    l2.rpc.setcustomtlvs(tlvs=multi_tlv)
+    inv = l3.rpc.invoice(1000, 'customtlvs-multitlvs', '')['bolt11']
+    l1.rpc.pay(inv)
+    l3.daemon.wait_for_log(f"called htlc accepted hook with extra_tlvs: {multi_tlv}")
+
+
+def test_htlc_accepted_hook_malformedtlvs(node_factory):
+    """ Passes an custom extra tlv field to the hooks return that is malformed
+        and should cause a broken log.
+        l1 -- l2 -- l3
+    """
+    plugin = os.path.join(os.path.dirname(__file__), 'plugins/htlc_accepted-customtlv.py')
+    l1, l2, l3 = node_factory.line_graph(3, opts=[{}, {'plugin': plugin, 'broken_log': "lightningd: ", 'may_fail': True}, {}], wait_for_announce=True)
+
+    mal_tlv = "fe00010001020539fdffff012a"  # is malformed, types are 65537 and 65535 not in asc order.
+    l2.rpc.setcustomtlvs(tlvs=mal_tlv)
+    inv = l3.rpc.invoice(1000, 'customtlvs-maltlvs', '')
+    phash = inv['payment_hash']
+    route = l1.rpc.getroute(l3.info['id'], 1000, 1)['route']
+
+    # Here shouldn't use `pay` command because l2 should fail with a broken log.
+    l1.rpc.sendpay(route, phash, payment_secret=inv['payment_secret'])
+    assert l2.daemon.wait_for_log("BROKEN.*htlc_accepted_hook returned bad extra_tlvs")
+
+
 def test_hook_dep(node_factory):
     dep_a = os.path.join(os.path.dirname(__file__), 'plugins/dep_a.py')
     dep_b = os.path.join(os.path.dirname(__file__), 'plugins/dep_b.py')
@@ -2499,6 +2754,40 @@ def test_htlc_accepted_hook_failonion(node_factory):
     inv = l2.rpc.invoice(42, 'failonion000', '')['bolt11']
     with pytest.raises(RpcError):
         l1.rpc.pay(inv)
+
+
+@pytest.mark.slow_test  # VALGRIND running generally too slow to trigger race we need.
+def test_hook_in_use(node_factory):
+    """If a hook is in use when we add a plugin to it, we have to defer"""
+    dep_a = os.path.join(os.path.dirname(__file__), 'plugins/dep_a.py')
+    dep_b = os.path.join(os.path.dirname(__file__), 'plugins/dep_b.py')
+
+    l1, l2 = node_factory.line_graph(2, opts=[{}, {'plugin': [dep_a]}])
+
+    NUM_ITERATIONS = 10
+
+    invs = [l2.rpc.invoice(1, f'test_hook_in_use{i}', 'test_hook_in_use') for i in range(NUM_ITERATIONS)]
+
+    route = [{'amount_msat': 1,
+              'id': l2.info['id'],
+              'delay': 20,
+              'channel': l1.get_channel_scid(l2)}]
+
+    for i in range(NUM_ITERATIONS):
+        l1.rpc.sendpay(route,
+                       amount_msat=1,
+                       payment_hash=invs[i]['payment_hash'],
+                       payment_secret=invs[i]['payment_secret'])
+        if i % 2 == 1:
+            l1.rpc.waitsendpay(payment_hash=invs[i - 1]['payment_hash'])
+            l1.rpc.waitsendpay(payment_hash=invs[i]['payment_hash'])
+        else:
+            l2.rpc.plugin_start(plugin=dep_b)
+            l2.rpc.plugin_stop(plugin=dep_b)
+
+    # We should have deferred hook update at least once!
+    l2.daemon.wait_for_log("UNUSUAL plugin-dep_b.py: Deferring registration of hook htlc_accepted until it's not in use.")
+    l2.daemon.wait_for_log("UNUSUAL lightningd: Updating hooks for htlc_accepted now usage is done.")
 
 
 def test_htlc_accepted_hook_fwdto(node_factory):
@@ -2599,7 +2888,7 @@ def test_custom_notification_topics(node_factory):
     )
     l1, l2 = node_factory.line_graph(2, opts=[{'plugin': plugin}, {}])
     l1.rpc.emit()
-    l1.daemon.wait_for_log(r'Got a custom notification Hello world')
+    l1.daemon.wait_for_log("Got a custom notification Hello world from plugin custom_notifications.py")
 
     inv = l2.rpc.invoice(42, "lbl", "desc")['bolt11']
     l1.rpc.pay(inv)
@@ -2643,9 +2932,8 @@ plugin.run()
     # write hello world plugin to lndir/plugins
     os.makedirs(os.path.join(lndir, 'plugins'), exist_ok=True)
     path = os.path.join(lndir, 'plugins', 'test_restart_on_update.py')
-    file = open(path, 'w+')
-    file.write(content % "1")
-    file.close()
+    with open(path, 'w+') as file:
+        file.write(content % "1")
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
     # now fire up the node and wait for the plugin to print hello
@@ -2658,9 +2946,8 @@ plugin.run()
     assert not n.daemon.is_in_log(r"Plugin changed, needs restart.")
 
     # modify the file
-    file = open(path, 'w+')
-    file.write(content % "2")
-    file.close()
+    with open(path, 'w+') as file:
+        file.write(content % "2")
     os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
 
     # rescan and check
@@ -2798,324 +3085,6 @@ def test_commando(node_factory, executor):
     assert exc_info.value.error['data']['erring_index'] == 0
 
 
-def test_commando_rune(node_factory):
-    l1, l2 = node_factory.line_graph(2, fundchannel=False, opts={
-        'i-promise-to-fix-broken-api-user': 'commando-rune'
-    })
-
-    rune1 = l1.rpc.commando_rune()
-    assert rune1['rune'] == 'OSqc7ixY6F-gjcigBfxtzKUI54uzgFSA6YfBQoWGDV89MA=='
-    assert rune1['unique_id'] == '0'
-    rune2 = l1.rpc.commando_rune(restrictions="readonly")
-    assert rune2['rune'] == 'zm0x_eLgHexaTvZn3Cz7gb_YlvrlYGDo_w4BYlR9SS09MSZtZXRob2RebGlzdHxtZXRob2ReZ2V0fG1ldGhvZD1zdW1tYXJ5Jm1ldGhvZC9saXN0ZGF0YXN0b3Jl'
-    assert rune2['unique_id'] == '1'
-    rune3 = l1.rpc.commando_rune(restrictions=[["time>1656675211"]])
-    assert rune3['rune'] == 'mxHwVsC_W-PH7r79wXQWqxBNHaHncIqIjEPyP_vGOsE9MiZ0aW1lPjE2NTY2NzUyMTE='
-    assert rune3['unique_id'] == '2'
-    rune4 = l1.rpc.commando_rune(restrictions=[["id^022d223620a359a47ff7"], ["method=listpeers"]])
-    assert rune4['rune'] == 'YPojv9qgHPa3im0eiqRb-g8aRq76OasyfltGGqdFUOU9MyZpZF4wMjJkMjIzNjIwYTM1OWE0N2ZmNyZtZXRob2Q9bGlzdHBlZXJz'
-    assert rune4['unique_id'] == '3'
-    rune5 = l1.rpc.commando_rune(rune4['rune'], [["pnamelevel!", "pnamelevel/io"]])
-    assert rune5['rune'] == 'Zm7A2mKkLnd5l6Er_OMAHzGKba97ij8lA-MpNYMw9nk9MyZpZF4wMjJkMjIzNjIwYTM1OWE0N2ZmNyZtZXRob2Q9bGlzdHBlZXJzJnBuYW1lbGV2ZWwhfHBuYW1lbGV2ZWwvaW8='
-    assert rune5['unique_id'] == '3'
-    rune6 = l1.rpc.commando_rune(rune5['rune'], [["parr1!", "parr1/io"]])
-    assert rune6['rune'] == 'm_tyR0qqHUuLEbFJW6AhmBg-9npxVX2yKocQBFi9cvY9MyZpZF4wMjJkMjIzNjIwYTM1OWE0N2ZmNyZtZXRob2Q9bGlzdHBlZXJzJnBuYW1lbGV2ZWwhfHBuYW1lbGV2ZWwvaW8mcGFycjEhfHBhcnIxL2lv'
-    assert rune6['unique_id'] == '3'
-    rune7 = l1.rpc.commando_rune(restrictions=[["pnum=0"]])
-    assert rune7['rune'] == 'enX0sTpHB8y1ktyTAF80CnEvGetG340Ne3AGItudBS49NCZwbnVtPTA='
-    assert rune7['unique_id'] == '4'
-    rune8 = l1.rpc.commando_rune(rune7['rune'], [["rate=3"]])
-    assert rune8['rune'] == '_h2eKjoK7ITAF-JQ1S5oum9oMQesrz-t1FR9kDChRB49NCZwbnVtPTAmcmF0ZT0z'
-    assert rune8['unique_id'] == '4'
-    rune9 = l1.rpc.commando_rune(rune8['rune'], [["rate=1"]])
-    assert rune9['rune'] == 'U1GDXqXRvfN1A4WmDVETazU9YnvMsDyt7WwNzpY0khE9NCZwbnVtPTAmcmF0ZT0zJnJhdGU9MQ=='
-    assert rune9['unique_id'] == '4'
-
-    # Test rune with \|.
-    weirdrune = l1.rpc.commando_rune(restrictions=[["method=invoice"],
-                                                   ["pnamedescription=@tipjar|jb55@sendsats.lol"]])
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: pnamedescription is not equal to @tipjar|jb55@sendsats.lol'):
-        l2.rpc.call(method='commando',
-                    payload={'peer_id': l1.info['id'],
-                             'rune': weirdrune['rune'],
-                             'method': 'invoice',
-                             'params': {"amount_msat": "any",
-                                        "label": "lbl",
-                                        "description": "@tipjar\\|jb55@sendsats.lol"}})
-    l2.rpc.call(method='commando',
-                payload={'peer_id': l1.info['id'],
-                         'rune': weirdrune['rune'],
-                         'method': 'invoice',
-                         'params': {"amount_msat": "any",
-                                    "label": "lbl",
-                                    "description": "@tipjar|jb55@sendsats.lol"}})
-
-    runedecodes = ((rune1, []),
-                   (rune2, [{'alternatives': ['method^list', 'method^get', 'method=summary'],
-                             'summary': "method (of command) starts with 'list' OR method (of command) starts with 'get' OR method (of command) equal to 'summary'"},
-                            {'alternatives': ['method/listdatastore'],
-                             'summary': "method (of command) unequal to 'listdatastore'"}]),
-                   (rune4, [{'alternatives': ['id^022d223620a359a47ff7'],
-                             'summary': "id (of commanding peer) starts with '022d223620a359a47ff7'"},
-                            {'alternatives': ['method=listpeers'],
-                             'summary': "method (of command) equal to 'listpeers'"}]),
-                   (rune5, [{'alternatives': ['id^022d223620a359a47ff7'],
-                             'summary': "id (of commanding peer) starts with '022d223620a359a47ff7'"},
-                            {'alternatives': ['method=listpeers'],
-                             'summary': "method (of command) equal to 'listpeers'"},
-                            {'alternatives': ['pnamelevel!', 'pnamelevel/io'],
-                             'summary': "pnamelevel (object parameter 'level') is missing OR pnamelevel (object parameter 'level') unequal to 'io'"}]),
-                   (rune6, [{'alternatives': ['id^022d223620a359a47ff7'],
-                             'summary': "id (of commanding peer) starts with '022d223620a359a47ff7'"},
-                            {'alternatives': ['method=listpeers'],
-                             'summary': "method (of command) equal to 'listpeers'"},
-                            {'alternatives': ['pnamelevel!', 'pnamelevel/io'],
-                             'summary': "pnamelevel (object parameter 'level') is missing OR pnamelevel (object parameter 'level') unequal to 'io'"},
-                            {'alternatives': ['parr1!', 'parr1/io'],
-                             'summary': "parr1 (array parameter #1) is missing OR parr1 (array parameter #1) unequal to 'io'"}]),
-                   (rune7, [{'alternatives': ['pnum=0'],
-                             'summary': "pnum (number of command parameters) equal to 0"}]))
-    for decode in runedecodes:
-        rune = decode[0]
-        restrictions = decode[1]
-        decoded = l1.rpc.decode(rune['rune'])
-        assert decoded['type'] == 'rune'
-        assert decoded['unique_id'] == rune['unique_id']
-        assert decoded['valid'] is True
-        assert decoded['restrictions'] == restrictions
-
-    # Time handling is a bit special, since we annotate the timestamp with how far away it is.
-    decoded = l1.rpc.decode(rune3['rune'])
-    assert decoded['type'] == 'rune'
-    assert decoded['unique_id'] == rune3['unique_id']
-    assert decoded['valid'] is True
-    assert len(decoded['restrictions']) == 1
-    assert decoded['restrictions'][0]['alternatives'] == ['time>1656675211']
-    assert decoded['restrictions'][0]['summary'].startswith("time (in seconds since 1970) greater than 1656675211 (")
-
-    # Replace rune3 with a more useful timestamp!
-    expiry = int(time.time()) + 15
-    rune3 = l1.rpc.commando_rune(restrictions=[["time<{}".format(expiry)]])
-
-    successes = ((rune1, "listpeers", {}),
-                 (rune2, "listpeers", {}),
-                 (rune2, "getinfo", {}),
-                 (rune2, "getinfo", {}),
-                 (rune3, "getinfo", {}),
-                 (rune4, "listpeers", {}),
-                 (rune5, "listpeers", {'id': l2.info['id']}),
-                 (rune5, "listpeers", {'id': l2.info['id'], 'level': 'broken'}),
-                 (rune6, "listpeers", [l2.info['id'], 'broken']),
-                 (rune6, "listpeers", [l2.info['id']]),
-                 (rune7, "listpeers", []),
-                 (rune7, "getinfo", {}))
-
-    failures = ((rune2, "withdraw", {}),
-                (rune2, "plugin", {'subcommand': 'list'}),
-                (rune3, "getinfo", {}),
-                (rune4, "listnodes", {}),
-                (rune5, "listpeers", {'id': l2.info['id'], 'level': 'io'}),
-                (rune6, "listpeers", [l2.info['id'], 'io']),
-                (rune7, "listpeers", [l2.info['id']]),
-                (rune7, "listpeers", {'id': l2.info['id']}))
-
-    for rune, cmd, params in successes:
-        l2.rpc.call(method='commando',
-                    payload={'peer_id': l1.info['id'],
-                             'rune': rune['rune'],
-                             'method': cmd,
-                             'params': params})
-
-    while time.time() < expiry:
-        time.sleep(1)
-
-    for rune, cmd, params in failures:
-        with pytest.raises(RpcError, match='Invalid rune: Not permitted:') as exc_info:
-            l2.rpc.call(method='commando',
-                        payload={'peer_id': l1.info['id'],
-                                 'rune': rune['rune'],
-                                 'method': cmd,
-                                 'params': params})
-        assert exc_info.value.error['code'] == 0x4c51
-
-
-def test_commando_listrunes(node_factory):
-    l1 = node_factory.get_node(options={'i-promise-to-fix-broken-api-user': ['commando-rune', 'commando-listrunes']})
-    rune = l1.rpc.commando_rune()
-    assert rune == {
-        'rune': 'OSqc7ixY6F-gjcigBfxtzKUI54uzgFSA6YfBQoWGDV89MA==',
-        'unique_id': '0',
-        'warning_unrestricted_rune': 'WARNING: This rune has no restrictions! Anyone who has access to this rune could drain funds from your node. Be careful when giving this to apps that you don\'t trust. Consider using the restrictions parameter to only allow access to specific rpc methods.'
-    }
-    listrunes = l1.rpc.commando_listrunes()
-    assert len(l1.rpc.commando_listrunes()) == 1
-    rune = l1.rpc.commando_rune()
-    listrunes = l1.rpc.commando_listrunes()
-    assert len(listrunes['runes']) == 2
-    assert listrunes == {
-        'runes': [
-            {
-                'rune': 'OSqc7ixY6F-gjcigBfxtzKUI54uzgFSA6YfBQoWGDV89MA==',
-                'unique_id': '0',
-                'restrictions': [],
-                'restrictions_as_english': ''
-            },
-            {
-                'rune': 'geZmO6U7yqpHn-moaX93FVMVWrDRfSNY4AXx9ypLcqg9MQ==',
-                'unique_id': '1',
-                'restrictions': [],
-                'restrictions_as_english': ''
-            }
-        ]
-    }
-    our_unstored_rune = l1.rpc.commando_listrunes(rune='M8f4jNx9gSP2QoiRbr10ybwzFxUgd-rS4CR4yofMSuA9Mg==')['runes'][0]
-    assert our_unstored_rune['stored'] is False
-
-    our_unstored_rune = l1.rpc.commando_listrunes(rune='m_tyR0qqHUuLEbFJW6AhmBg-9npxVX2yKocQBFi9cvY9MyZpZF4wMjJkMjIzNjIwYTM1OWE0N2ZmNyZtZXRob2Q9bGlzdHBlZXJzJnBuYW1lbGV2ZWwhfHBuYW1lbGV2ZWwvaW8mcGFycjEhfHBhcnIxL2lv')['runes'][0]
-    assert our_unstored_rune['stored'] is False
-
-    not_our_rune = l1.rpc.commando_listrunes(rune='Am3W_wI0PRn4qVNEsJ2iInHyFPQK8wfdqEXztm8-icQ9MA==')['runes'][0]
-    assert not_our_rune['stored'] is False
-    assert not_our_rune['our_rune'] is False
-
-
-def test_commando_rune_pay_amount(node_factory):
-    l1, l2 = node_factory.line_graph(2, opts={
-        'i-promise-to-fix-broken-api-user': 'commando-rune'
-    })
-
-    # This doesn't really work, since amount_msat is illegal if invoice
-    # includes an amount, and runes aren't smart enough to decode bolt11!
-    rune = l1.rpc.commando_rune(restrictions=[['method=pay'],
-                                              ['pnameamountmsat<10000']])['rune']
-    inv1 = l2.rpc.invoice(amount_msat=12300, label='inv1', description='description1')['bolt11']
-    inv2 = l2.rpc.invoice(amount_msat='any', label='inv2', description='description2')['bolt11']
-
-    # Rune requires amount_msat!
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: parameter amountmsat not present'):
-        l2.rpc.commando(peer_id=l1.info['id'],
-                        rune=rune,
-                        method='pay',
-                        params={'bolt11': inv1})
-
-    # As a named parameter!
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: parameter amountmsat not present'):
-        l2.rpc.commando(peer_id=l1.info['id'],
-                        rune=rune,
-                        method='pay',
-                        params=[inv1])
-
-    # Can't get around it this way!
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: parameter amountmsat not present'):
-        l2.rpc.commando(peer_id=l1.info['id'],
-                        rune=rune,
-                        method='pay',
-                        params=[inv2, 12000])
-
-    # Nor this way, using a string!
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: parameter amountmsat is not an integer field'):
-        l2.rpc.commando(peer_id=l1.info['id'],
-                        rune=rune,
-                        method='pay',
-                        params={'bolt11': inv2, 'amount_msat': '10000sat'})
-
-    # Too much!
-    with pytest.raises(RpcError, match='Invalid rune: Not permitted: parameter amountmsat is greater or equal to 10000'):
-        l2.rpc.commando(peer_id=l1.info['id'],
-                        rune=rune,
-                        method='pay',
-                        params={'bolt11': inv2, 'amount_msat': 12000})
-
-    # This works
-    l2.rpc.commando(peer_id=l1.info['id'],
-                    rune=rune,
-                    method='pay',
-                    params={'bolt11': inv2, 'amount_msat': 9999})
-
-
-def test_commando_blacklist(node_factory):
-    l1, l2 = node_factory.get_nodes(2, opts={
-        'i-promise-to-fix-broken-api-user': ['commando-rune', 'commando-blacklist', 'commando-listrunes']
-    })
-
-    l2.connect(l1)
-    rune0 = l1.rpc.commando_rune()
-    assert rune0['unique_id'] == '0'
-    rune1 = l1.rpc.commando_rune()
-    assert rune1['unique_id'] == '1'
-
-    # Make sure runes work!
-    assert l2.rpc.call(method='commando',
-                       payload={'peer_id': l1.info['id'],
-                                'rune': rune0['rune'],
-                                'method': 'getinfo',
-                                'params': []})['id'] == l1.info['id']
-
-    assert l2.rpc.call(method='commando',
-                       payload={'peer_id': l1.info['id'],
-                                'rune': rune1['rune'],
-                                'method': 'getinfo',
-                                'params': []})['id'] == l1.info['id']
-
-    blacklist = l1.rpc.commando_blacklist(start=1)
-    assert blacklist == {'blacklist': [{'start': 1, 'end': 1}]}
-
-    # Make sure rune id 1 does not work!
-    with pytest.raises(RpcError, match='Not authorized: Blacklisted rune'):
-        assert l2.rpc.call(method='commando',
-                           payload={'peer_id': l1.info['id'],
-                                    'rune': rune1['rune'],
-                                    'method': 'getinfo',
-                                    'params': []})['id'] == l1.info['id']
-
-    # But, other rune still works!
-    assert l2.rpc.call(method='commando',
-                       payload={'peer_id': l1.info['id'],
-                                'rune': rune0['rune'],
-                                'method': 'getinfo',
-                                'params': []})['id'] == l1.info['id']
-
-    blacklist = l1.rpc.commando_blacklist(start=2)
-    assert blacklist == {'blacklist': [{'start': 1, 'end': 2}]}
-
-    blacklist = l1.rpc.commando_blacklist(start=6)
-    assert blacklist == {'blacklist': [{'start': 1, 'end': 2},
-                                       {'start': 6, 'end': 6}]}
-
-    blacklist = l1.rpc.commando_blacklist(start=3, end=5)
-    assert blacklist == {'blacklist': [{'start': 1, 'end': 6}]}
-
-    blacklist = l1.rpc.commando_blacklist(start=9)
-    assert blacklist == {'blacklist': [{'start': 1, 'end': 6},
-                                       {'start': 9, 'end': 9}]}
-
-    blacklist = l1.rpc.commando_blacklist(start=0)
-    assert blacklist == {'blacklist': [{'start': 0, 'end': 6},
-                                       {'start': 9, 'end': 9}]}
-
-    # Now both runes fail!
-    with pytest.raises(RpcError, match='Not authorized: Blacklisted rune'):
-        assert l2.rpc.call(method='commando',
-                           payload={'peer_id': l1.info['id'],
-                                    'rune': rune0['rune'],
-                                    'method': 'getinfo',
-                                    'params': []})['id'] == l1.info['id']
-
-    with pytest.raises(RpcError, match='Not authorized: Blacklisted rune'):
-        assert l2.rpc.call(method='commando',
-                           payload={'peer_id': l1.info['id'],
-                                    'rune': rune1['rune'],
-                                    'method': 'getinfo',
-                                    'params': []})['id'] == l1.info['id']
-
-    blacklist = l1.rpc.commando_blacklist()
-    assert blacklist == {'blacklist': [{'start': 0, 'end': 6},
-                                       {'start': 9, 'end': 9}]}
-
-    blacklisted_rune = l1.rpc.commando_listrunes(rune='geZmO6U7yqpHn-moaX93FVMVWrDRfSNY4AXx9ypLcqg9MQ==')['runes'][0]['blacklisted']
-    assert blacklisted_rune is True
-
-
 @pytest.mark.slow_test
 def test_commando_stress(node_factory, executor):
     """Stress test to slam commando with many large queries"""
@@ -3153,33 +3122,13 @@ def test_commando_stress(node_factory, executor):
         assert not nodes[0].daemon.is_in_log(r"New cmd from .*, replacing old")
 
 
-def test_commando_badrune(node_factory):
-    """Test invalid UTF-8 encodings in rune: used to make us kill the offers plugin which implements decode, as it gave bad utf8!"""
-    l1 = node_factory.get_node(options={'i-promise-to-fix-broken-api-user': 'commando-rune'})
-
-    l1.rpc.decode('5zi6-ugA6hC4_XZ0R7snl5IuiQX4ugL4gm9BQKYaKUU9gCZtZXRob2RebGlzdHxtZXRob2ReZ2V0fG1ldGhvZD1zdW1tYXJ5Jm1ldGhvZC9saXN0ZGF0YXN0b3Jl')
-    rune = l1.rpc.commando_rune(restrictions="readonly")
-
-    binrune = base64.urlsafe_b64decode(rune['rune'])
-    # Mangle each part, try decode.  Skip most of the boring chars
-    # (just '|', '&', '#').
-    for i in range(32, len(binrune)):
-        for span in (range(0, 32), (124, 38, 35), range(127, 256)):
-            for c in span:
-                modrune = binrune[:i] + bytes([c]) + binrune[i + 1:]
-                try:
-                    l1.rpc.decode(base64.urlsafe_b64encode(modrune).decode('utf8'))
-                except RpcError:
-                    pass
-
-
 def test_autoclean(node_factory):
     l1, l2, l3 = node_factory.line_graph(3, opts={'may_reconnect': True},
                                          wait_for_announce=True)
 
     # Under valgrind in CI, it can 50 seconds between creating invoice
     # and restarting.
-    if node_factory.valgrind:
+    if VALGRIND:
         short_timeout = 10
         longer_timeout = 60
     else:
@@ -3326,6 +3275,15 @@ def test_autoclean(node_factory):
     # We still see correct total in getinfo!
     assert l2.rpc.getinfo()['fees_collected_msat'] == amt_before
 
+    # Clean network events.
+    nevents = l2.rpc.listnetworkevents()['networkevents']
+    # At least two connects, one disconnect.  Maybe pings.
+    assert len(nevents) >= 3
+    l2.rpc.setconfig('autoclean-networkevents-age', 1)
+
+    # A ping happens each 15-45 seconds, so this should work.
+    wait_for(lambda: l2.rpc.listnetworkevents()['networkevents'] == [])
+
 
 def test_autoclean_timer_crash(node_factory):
     """Running two autocleans at once crashed timer code"""
@@ -3348,92 +3306,56 @@ def test_autoclean_once(node_factory):
     with pytest.raises(RpcError, match='WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS'):
         l1.rpc.pay(inv3['bolt11'])
 
+    # Default status
+    default_status = {'autoclean': {'failedpays': {'enabled': False,
+                                                   'cleaned': 0},
+                                    'succeededpays': {'enabled': False,
+                                                      'cleaned': 0},
+                                    'failedforwards': {'enabled': False,
+                                                       'cleaned': 0},
+                                    'succeededforwards': {'enabled': False,
+                                                          'cleaned': 0},
+                                    'expiredinvoices': {'enabled': False,
+                                                        'cleaned': 0},
+                                    'paidinvoices': {'enabled': False,
+                                                     'cleaned': 0},
+                                    'networkevents': {'enabled': True,
+                                                      'age': 2592000,
+                                                      'cleaned': 0}}}
+    expected = [copy.deepcopy(default_status) for _ in (l1, l2, l3)]
+    for i, node in enumerate([l1, l2, l3]):
+        assert node.rpc.autoclean_status() == expected[i]
+
     # Make sure > 1 second old!
     time.sleep(2)
     assert (l1.rpc.autoclean_once('failedpays', 1)
-            == {'autoclean': {'failedpays': {'cleaned': 1, 'uncleaned': 1}}})
-    assert l1.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 1},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 0},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 0},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 0},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 0},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 0}}}
+            == {'autoclean': {'failedpays': {'cleaned': 1, 'uncleaned': 0}}})
+
     assert (l1.rpc.autoclean_once('succeededpays', 1)
             == {'autoclean': {'succeededpays': {'cleaned': 1, 'uncleaned': 0}}})
-    assert l1.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 1},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 1},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 0},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 0},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 0},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 0}}}
+    expected[0]['autoclean']['failedpays']['cleaned'] = 1
+    expected[0]['autoclean']['succeededpays']['cleaned'] = 1
+    assert l1.rpc.autoclean_status() == expected[0]
+
     assert (l2.rpc.autoclean_once('failedforwards', 1)
-            == {'autoclean': {'failedforwards': {'cleaned': 1, 'uncleaned': 1}}})
-    assert l2.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 0},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 0},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 1},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 0},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 0},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 0}}}
+            == {'autoclean': {'failedforwards': {'cleaned': 1, 'uncleaned': 0}}})
+    expected[1]['autoclean']['failedforwards']['cleaned'] = 1
+    assert l2.rpc.autoclean_status() == expected[1]
+
     assert (l2.rpc.autoclean_once('succeededforwards', 1)
             == {'autoclean': {'succeededforwards': {'cleaned': 1, 'uncleaned': 0}}})
-    assert l2.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 0},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 0},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 1},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 1},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 0},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 0}}}
+    expected[1]['autoclean']['succeededforwards']['cleaned'] = 1
+    assert l2.rpc.autoclean_status() == expected[1]
+
     assert (l3.rpc.autoclean_once('expiredinvoices', 1)
-            == {'autoclean': {'expiredinvoices': {'cleaned': 1, 'uncleaned': 1}}})
-    assert l3.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 0},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 0},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 0},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 0},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 1},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 0}}}
+            == {'autoclean': {'expiredinvoices': {'cleaned': 1, 'uncleaned': 0}}})
+    expected[2]['autoclean']['expiredinvoices']['cleaned'] = 1
+    assert l3.rpc.autoclean_status() == expected[2]
+
     assert (l3.rpc.autoclean_once('paidinvoices', 1)
             == {'autoclean': {'paidinvoices': {'cleaned': 1, 'uncleaned': 0}}})
-    assert l3.rpc.autoclean_status() == {'autoclean': {'failedpays': {'enabled': False,
-                                                                      'cleaned': 0},
-                                                       'succeededpays': {'enabled': False,
-                                                                         'cleaned': 0},
-                                                       'failedforwards': {'enabled': False,
-                                                                          'cleaned': 0},
-                                                       'succeededforwards': {'enabled': False,
-                                                                             'cleaned': 0},
-                                                       'expiredinvoices': {'enabled': False,
-                                                                           'cleaned': 1},
-                                                       'paidinvoices': {'enabled': False,
-                                                                        'cleaned': 1}}}
+    expected[2]['autoclean']['paidinvoices']['cleaned'] = 1
+    assert l3.rpc.autoclean_status() == expected[2]
 
 
 def test_block_added_notifications(node_factory, bitcoind):
@@ -3473,14 +3395,16 @@ def test_block_added_notifications(node_factory, bitcoind):
 def test_sql(node_factory, bitcoind):
     opts = {'experimental-dual-fund': None,
             'dev-allow-localhost': None,
-            'may_reconnect': True}
+            'may_reconnect': True,
+            'dev-no-reconnect': None}
     l2opts = {'lease-fee-basis': 50,
               'experimental-dual-fund': None,
               'lease-fee-base-sat': '2000msat',
               'channel-fee-max-base-msat': '500sat',
               'channel-fee-max-proportional-thousandths': 200,
               'dev-sqlfilename': 'sql.sqlite3',
-              'may_reconnect': True}
+              'may_reconnect': True,
+              'dev-no-reconnect': None}
     l2opts.update(opts)
     l1, l2, l3 = node_factory.line_graph(3, wait_for_announce=True,
                                          opts=[opts, l2opts, opts])
@@ -3553,6 +3477,10 @@ def test_sql(node_factory, bitcoind):
                          'type': 'txid'},
                         {'name': 'funding_outnum',
                          'type': 'u32'},
+                        {'name': 'funding_psbt',
+                         'type': 'string'},
+                        {'name': 'funding_withheld',
+                         'type': 'boolean'},
                         {'name': 'leased',
                          'type': 'boolean'},
                         {'name': 'funding_fee_paid_msat',
@@ -3727,6 +3655,8 @@ def test_sql(node_factory, bitcoind):
                          'type': 'boolean'},
                         {'name': 'bolt12',
                          'type': 'string'},
+                        {'name': 'description',
+                         'type': 'string'},
                         {'name': 'used',
                          'type': 'boolean'},
                         {'name': 'label',
@@ -3832,6 +3762,8 @@ def test_sql(node_factory, bitcoind):
                          'type': 'string'},
                         {'name': 'short_channel_id',
                          'type': 'short_channel_id'},
+                        {'name': 'direction',
+                         'type': 'u32'},
                         {'name': 'channel_id',
                          'type': 'hash'},
                         {'name': 'funding_txid',
@@ -3864,6 +3796,10 @@ def test_sql(node_factory, bitcoind):
                          'type': 'msat'},
                         {'name': 'funding_fee_rcvd_msat',
                          'type': 'msat'},
+                        {'name': 'funding_psbt',
+                         'type': 'string'},
+                        {'name': 'funding_withheld',
+                         'type': 'boolean'},
                         {'name': 'to_us_msat',
                          'type': 'msat'},
                         {'name': 'min_to_us_msat',
@@ -3930,9 +3866,7 @@ def test_sql(node_factory, bitcoind):
                         {'name': 'close_to_addr',
                          'type': 'string'},
                         {'name': 'last_tx_fee_msat',
-                         'type': 'msat'},
-                        {'name': 'direction',
-                         'type': 'u32'}]},
+                         'type': 'msat'}]},
         'peerchannels_features': {
             'columns': [{'name': 'row',
                          'type': 'u64'},
@@ -4052,6 +3986,65 @@ def test_sql(node_factory, bitcoind):
                          'type': 'msat'},
                         {'name': 'scriptPubKey',
                          'type': 'hex'}]},
+        'chainmoves': {
+            'indices': [['account_id']],
+            'columns': [{'name': 'created_index',
+                         'type': 'u64'},
+                        {'name': 'account_id',
+                         'type': 'string'},
+                        {'name': 'credit_msat',
+                         'type': 'msat'},
+                        {'name': 'debit_msat',
+                         'type': 'msat'},
+                        {'name': 'timestamp',
+                         'type': 'u64'},
+                        {'name': 'primary_tag',
+                         'type': 'string'},
+                        {'name': 'peer_id',
+                         'type': 'pubkey'},
+                        {'name': 'originating_account',
+                         'type': 'string'},
+                        {'name': 'spending_txid',
+                         'type': 'txid'},
+                        {'name': 'utxo',
+                         'type': 'outpoint'},
+                        {'name': 'payment_hash',
+                         'type': 'hash'},
+                        {'name': 'output_msat',
+                         'type': 'msat'},
+                        {'name': 'output_count',
+                         'type': 'u32'},
+                        {'name': 'blockheight',
+                         'type': 'u32'}]},
+        'chainmoves_extra_tags': {
+            'columns': [{'name': 'row',
+                         'type': 'u64'},
+                        {'name': 'arrindex',
+                         'type': 'u64'},
+                        {'name': 'extra_tags',
+                         'type': 'string'}]},
+        'channelmoves': {
+            'indices': [['account_id'], ['payment_hash']],
+            'columns': [{'name': 'created_index',
+                         'type': 'u64'},
+                        {'name': 'account_id',
+                         'type': 'string'},
+                        {'name': 'credit_msat',
+                         'type': 'msat'},
+                        {'name': 'debit_msat',
+                         'type': 'msat'},
+                        {'name': 'timestamp',
+                         'type': 'u64'},
+                        {'name': 'primary_tag',
+                         'type': 'string'},
+                        {'name': 'payment_hash',
+                         'type': 'hash'},
+                        {'name': 'part_id',
+                         'type': 'u64'},
+                        {'name': 'group_id',
+                         'type': 'u64'},
+                        {'name': 'fees_msat',
+                         'type': 'msat'}]},
         'bkpr_accountevents': {
             'columns': [{'name': 'account',
                          'type': 'string'},
@@ -4105,7 +4098,23 @@ def test_sql(node_factory, bitcoind):
                         {'name': 'txid',
                          'type': 'txid'},
                         {'name': 'payment_id',
-                         'type': 'hex'}]}}
+                         'type': 'hex'}]},
+        'networkevents': {
+            'columns': [{'name': 'created_index',
+                         'type': 'u64'},
+                        {'name': 'timestamp',
+                         'type': 'u64'},
+                        {'name': 'peer_id',
+                         'type': 'pubkey'},
+                        {'name': 'type',
+                         'type': 'string'},
+                        {'name': 'reason',
+                         'type': 'string'},
+                        {'name': 'duration_nsec',
+                         'type': 'u64'},
+                        {'name': 'connect_attempted',
+                         'type': 'boolean'}]},
+    }
 
     sqltypemap = {'string': 'TEXT',
                   'boolean': 'INTEGER',
@@ -4118,18 +4127,23 @@ def test_sql(node_factory, bitcoind):
                   'hex': 'BLOB',
                   'hash': 'BLOB',
                   'txid': 'BLOB',
+                  'outpoint': 'TEXT',
                   'pubkey': 'BLOB',
                   'secret': 'BLOB',
                   'number': 'REAL',
                   'short_channel_id': 'TEXT'}
 
-    # Check schemas match (each one has rowid at start)
-    rowidcol = {'name': 'rowid', 'type': 'u64'}
+    # Check schemas match
     for table, schema in expected_schemas.items():
         res = only_one(l2.rpc.listsqlschemas(table)['schemas'])
         assert res['tablename'] == table
         assert res.get('indices') == schema.get('indices')
-        sqlcolumns = [{'name': c['name'], 'type': sqltypemap[c['type']]} for c in [rowidcol] + schema['columns']]
+        # Those without a created_index get an *explicit* rowid;
+        if any([c['name'] == 'created_index' for c in schema['columns']]):
+            prefix = []
+        else:
+            prefix = [{'name': 'rowid', 'type': 'u64'}]
+        sqlcolumns = [{'name': c['name'], 'type': sqltypemap[c['type']]} for c in prefix + schema['columns']]
         assert res['columns'] == sqlcolumns
 
     # Make sure we didn't miss any
@@ -4148,6 +4162,9 @@ def test_sql(node_factory, bitcoind):
     # Make sure l3 sees new channel
     wait_for(lambda: len(l3.rpc.listchannels(scid)['channels']) == 2)
 
+    # Make sure we have a node_announcement for l1
+    wait_for(lambda: l2.rpc.listnodes(l1.info['id'])['nodes'] != [])
+
     # This should create a forward through l2
     l1.rpc.pay(l3.rpc.invoice(amount_msat=12300, label='inv1', description='description')['bolt11'])
 
@@ -4157,8 +4174,7 @@ def test_sql(node_factory, bitcoind):
     l2.rpc.pay(l3.rpc.invoice(amount_msat=12300, label='inv2', description='description')['bolt11'])
 
     # And I need at least one HTLC in-flight so listpeers.channels.htlcs isn't empty:
-    l3.rpc.plugin_start(os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py'),
-                        holdtime=TIMEOUT * 2)
+    l3.rpc.plugin_start(os.path.join(os.getcwd(), 'tests/plugins/hold_invoice.py'))
     inv = l3.rpc.invoice(amount_msat=12300, label='inv3', description='description')
     route = l1.rpc.getroute(l3.info['id'], 12300, 1)['route']
     l1.rpc.sendpay(route, inv['payment_hash'], payment_secret=inv['payment_secret'])
@@ -4167,11 +4183,17 @@ def test_sql(node_factory, bitcoind):
 
     for table, schema in expected_schemas.items():
         ret = l2.rpc.sql("SELECT * FROM {};".format(table))
-        assert len(ret['rows'][0]) == 1 + len(schema['columns'])
+        # If you have created_index, we don't create an explicit rowid.
+        has_rowid = not any([c['name'] == 'created_index' for c in schema['columns']])
 
-        # First column is always rowid!
-        for row in ret['rows']:
-            assert row[0] > 0
+        if has_rowid:
+            assert len(ret['rows'][0]) == 1 + len(schema['columns'])
+
+            # First column is always rowid!
+            for row in ret['rows']:
+                assert row[0] > 0
+        else:
+            assert len(ret['rows'][0]) == len(schema['columns'])
 
         for col in schema['columns']:
             # We will get a complaint for trying to access deprecated cols by name:
@@ -4198,6 +4220,10 @@ def test_sql(node_factory, bitcoind):
                 val += ""
             elif col['type'] == "short_channel_id":
                 assert len(val.split('x')) == 3
+            elif col['type'] == "outpoint":
+                txid, vout = val.split(':')
+                assert len(bytes.fromhex(txid)) == 32
+                int(vout)
             else:
                 assert False
 
@@ -4216,6 +4242,7 @@ def test_sql(node_factory, bitcoind):
     l3.daemon.wait_for_log("Refreshing channel: {}".format(scid))
 
     # This has to wait for the hold_invoice plugin to let go!
+    open(os.path.join(l3.daemon.lightning_dir, TEST_NETWORK, "unhold"), "w").close()
     txid = only_one(l1.rpc.close(l2.info['id'])['txids'])
     bitcoind.generate_block(13, wait_for_mempool=txid)
     wait_for(lambda: len(l3.rpc.listchannels(source=l1.info['id'])['channels']) == 0)
@@ -4265,13 +4292,38 @@ def test_sql(node_factory, bitcoind):
     l2.rpc.connect(l3.info['id'], 'localhost', l3.port)
     wait_for(lambda: l3.rpc.sql("SELECT * FROM nodes WHERE alias = '{}'".format(alias))['rows'] != [])
 
+    # Test json functions
+    scidl1l3, _ = l1.fundchannel(l3)
+    l1.rpc.pay(l3.rpc.invoice(amount_msat=1000000, label='inv1000', description='description 1000 msat')['bolt11'])
+
+    # Two channels, l1->l3 *may* have an HTLC in flight.
+    ret = l1.rpc.sql("SELECT json_object('peer_id', hex(pc.peer_id), 'alias', alias, 'scid', short_channel_id, 'htlcs',"
+                     " (SELECT json_group_array(json_object('id', hex(id), 'amount_msat', amount_msat))"
+                     " FROM peerchannels_htlcs ph WHERE ph.row = pc.rowid)) FROM peerchannels pc JOIN nodes n"
+                     " ON pc.peer_id = n.nodeid ORDER BY n.alias, pc.peer_id;")
+    assert len(ret['rows']) == 2
+    row1 = json.loads(only_one(ret['rows'][0]))
+    row2 = json.loads(only_one(ret['rows'][1]))
+    assert row1 in ({"peer_id": format(l3.info['id'].upper()),
+                     "alias": l3.rpc.getinfo()['alias'],
+                     "scid": scidl1l3,
+                     "htlcs": []},
+                    {"peer_id": format(l3.info['id'].upper()),
+                     "alias": l3.rpc.getinfo()['alias'],
+                     "scid": scidl1l3,
+                     "htlcs": [{"id": "30", "amount_msat": 1000000}]})
+    assert row2 == {"peer_id": format(l2.info['id'].upper()),
+                    "alias": l2.rpc.getinfo()['alias'],
+                    "scid": scid,
+                    "htlcs": []}
+
 
 def test_sql_deprecated(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, opts=[{'allow-deprecated-apis': True}, {}])
 
-    # l1 allows it, l2 doesn't
-    ret = l1.rpc.sql("SELECT max_total_htlc_in_msat FROM peerchannels;")
-    assert ret == {'rows': [[-1]]}
+    # Even with deprecated APIs, this isn't there.
+    with pytest.raises(RpcError, match="Deprecated column table peerchannels.max_total_htlc_in_msat"):
+        l1.rpc.sql("SELECT max_total_htlc_in_msat FROM peerchannels;")
 
     # It's deprecated in l2, so that will fail!
     with pytest.raises(RpcError, match="Deprecated column table peerchannels.max_total_htlc_in_msat"):
@@ -4406,7 +4458,6 @@ def test_plugin_nostart(node_factory):
     assert [p['name'] for p in l1.rpc.plugin_list()['plugins'] if 'badinterp' in p['name']] == []
 
 
-@unittest.skip("A bit flaky, but when breaks, it is costing us 2h of CI time")
 def test_plugin_startdir_lol(node_factory):
     """Though we fail to start many of them, we don't crash!"""
     l1 = node_factory.get_node(broken_log='.*')
@@ -4453,7 +4504,7 @@ def test_sql_crash(node_factory, bitcoind):
     """
     l1, l2 = node_factory.line_graph(2, fundchannel=False)
 
-    addr = l1.rpc.newaddr()['bech32']
+    addr = l1.rpc.newaddr('bech32')['bech32']
     bitcoind.rpc.sendtoaddress(addr, 1)
     bitcoind.generate_block(1)
 
@@ -4463,6 +4514,19 @@ def test_sql_crash(node_factory, bitcoind):
 
     assert 'updates' not in only_one(l1.rpc.listpeerchannels()['channels'])
     l1.rpc.sql(f"SELECT * FROM peerchannels;")
+
+
+def test_sql_parallel(node_factory, executor):
+    """Parallel refreshes of tables causes SQL errors:
+    Error executing INSERT INTO chainmoves VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?); on row 0: UNIQUE constraint failed: chainmoves.created_index
+    """
+    l1, l2 = node_factory.line_graph(2)
+
+    futs = []
+    for _ in range(5):
+        futs.append(executor.submit(l1.rpc.sql, "SELECT * FROM chainmoves"))
+    for f in futs:
+        f.result(TIMEOUT)
 
 
 def test_listchannels_broken_message(node_factory):
@@ -4482,8 +4546,9 @@ def test_important_plugin_shutdown(node_factory):
 
 
 @unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
-def test_exposesecret(node_factory):
-    l1, l2 = node_factory.get_nodes(2, opts=[{'exposesecret-passphrase': "test_exposesecret"}, {}])
+@pytest.mark.parametrize("old_hsmsecret", [True, False])
+def test_exposesecret(node_factory, old_hsmsecret):
+    l1, l2 = node_factory.get_nodes(2, opts=[{'exposesecret-passphrase': "test_exposesecret", 'old_hsmsecret': old_hsmsecret}, {}])
 
     # listconfigs will conceal the value for us, even if we ask directly.
     l1.rpc.listconfigs()['configs']['exposesecret-passphrase']['value_str'] == '...'
@@ -4516,49 +4581,136 @@ def test_exposesecret(node_factory):
         with pytest.raises(RpcError, match="must be valid bech32 string"):
             l1.rpc.exposesecret(passphrase='test_exposesecret', identifier=invalid)
 
-    # As given by hsmtool:
-    # $ ./tools/hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret junr
-    # cl10junrsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj00m675kxffh
-    # $ ./tools/hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret junx
-    # cl10junxsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6mdtn5lql6p8m
-    # $ ./tools/hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret cln2
-    # cl10cln2sd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2v3y60yxxn4mq
-    assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10junrsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj00m675kxffh',
-                                                                   'identifier': 'junr'}
+    if old_hsmsecret:
+        # As given by lightning-hsmtool:
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret junr
+        # cl10junrsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj00m675kxffh
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret junx
+        # cl10junxsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6mdtn5lql6p8m
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-10uyxcnw/test_exposesecret_1/lightning-1/regtest/hsm_secret cln2
+        # cl10cln2sd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2v3y60yxxn4mq
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10junrsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj00m675kxffh',
+                                                                       'identifier': 'junr'}
 
-    assert l1.rpc.exposesecret(passphrase='test_exposesecret', identifier='cln2') == {'codex32': 'cl10cln2sd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2v3y60yxxn4mq',
-                                                                                      'identifier': 'cln2'}
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret', identifier='cln2') == {'codex32': 'cl10cln2sd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq2v3y60yxxn4mq',
+                                                                                          'identifier': 'cln2'}
+    else:
+        # As given by lightning-hsmtool:
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-2xbjux9b/test_exposesecret_1/lightning-1/regtest/hsm_secret stra
+        # cl10strasmms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gts07pad39rz85w6
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-2xbjux9b/test_exposesecret_1/lightning-1/regtest/hsm_secret junx
+        # cl10junxsmms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gtsfcrlankxlxmaa
+        # $ ./tools/lightning-hsmtool getcodexsecret /tmp/ltests-2xbjux9b/test_exposesecret_1/lightning-1/regtest/hsm_secret cln2
+        # cl10cln2smms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gtse0ls5gdqx00px
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10strasmms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gts07pad39rz85w6',
+                                                                       'identifier': 'stra',
+                                                                       'mnemonic': 'hockey enroll sure trip track rescue original plate abandon abandon abandon account'}
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret', identifier='cln2') == {'codex32': 'cl10cln2smms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gtse0ls5gdqx00px',
+                                                                                          'identifier': 'cln2',
+                                                                                          'mnemonic': 'hockey enroll sure trip track rescue original plate abandon abandon abandon account'}
 
     # FIXME: runtime config for alias!!
     l1.stop()
     l1.daemon.opts["alias"] = 'J1U1IOBiobN'
     l1.start()
 
-    assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10junxsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6mdtn5lql6p8m',
-                                                                   'identifier': 'junx'}
+    if old_hsmsecret:
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10junxsd35kw6r5de5kueedxyqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6mdtn5lql6p8m',
+                                                                       'identifier': 'junx'}
+    else:
+        assert l1.rpc.exposesecret(passphrase='test_exposesecret') == {'codex32': 'cl10junxsmms5axpgnml3svm0urkrvv2cuvxmz0xyd3dlfhaljvcy5wuu2gtsfcrlankxlxmaa',
+                                                                       'identifier': 'junx',
+                                                                       'mnemonic': 'hockey enroll sure trip track rescue original plate abandon abandon abandon account'}
 
-    # Test with encrypted-hsm (fails!)
-    password = 'test_exposesecret'
-    l1.stop()
-    # We need to simulate a terminal to use termios in `lightningd`.
+
+@unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+def test_exposesecret_with_hsm_passphrase(node_factory):
+    """Test that exposesecret plugin correctly handles hsm-passphrase option"""
+    # Create a node with exposesecret-passphrase option
+    l1 = node_factory.get_node(options={
+        'exposesecret-passphrase': "test_exposesecret",
+    }, start=False)
+
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
+    if os.path.exists(hsm_path):
+        os.remove(hsm_path)
+
+    # Generate hsm_secret with mnemonic and passphrase using hsmtool
+    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    hsm_passphrase = "test_hsm_passphrase"  # Any passphrase, since we expect exposesecret to fail
+    expected_format = "mnemonic with passphrase"
+
+    hsmtool = HsmTool(node_factory.directory, "generatehsm", hsm_path)
     master_fd, slave_fd = os.openpty()
+    hsmtool.start(stdin=slave_fd)
+    hsmtool.wait_for_log(r"Introduce your BIP39 word list")
+    write_all(master_fd, f"{mnemonic}\n".encode("utf-8"))
+    hsmtool.wait_for_log(r"Enter your passphrase:")
+    write_all(master_fd, f"{hsm_passphrase}\n".encode("utf-8"))
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 0
+    hsmtool.is_in_log(r"New hsm_secret file created")
+    hsmtool.is_in_log(f"Format: {expected_format}")
+    os.close(master_fd)
+    os.close(slave_fd)
 
-    def write_all(fd, bytestr):
-        """Wrapper, since os.write can do partial writes"""
-        off = 0
-        while off < len(bytestr):
-            off += os.write(fd, bytestr[off:])
+    # Add --hsm-passphrase option to trigger interactive prompting
+    l1.daemon.opts["hsm-passphrase"] = None
 
-    l1.daemon.opts.update({"encrypted-hsm": None})
-    l1.daemon.start(stdin=slave_fd, wait_for_initialized=False)
-    l1.daemon.wait_for_log(r'Enter hsm_secret password')
-    write_all(master_fd, (password + '\n').encode("utf-8"))
-    l1.daemon.wait_for_log(r'Confirm hsm_secret password')
-    write_all(master_fd, (password + '\n').encode("utf-8"))
+    # Create a pty to handle the interactive passphrase prompt
+    master_fd2, slave_fd2 = os.openpty()
+    l1.daemon.start(stdin=slave_fd2, wait_for_initialized=False)
+
+    # Wait for the passphrase prompt and provide it
+    l1.daemon.wait_for_log("Enter hsm_secret passphrase:")
+    print(f"DEBUG: About to send passphrase: '{hsm_passphrase}'")
+    passphrase_bytes = f"{hsm_passphrase}\n".encode("utf-8")
+    print(f"DEBUG: Passphrase bytes: {passphrase_bytes}")
+    write_all(master_fd2, passphrase_bytes)
+    print("DEBUG: Passphrase sent!")
+
+    # Wait for the node to be ready
     l1.daemon.wait_for_log("Server started with public key")
 
-    with pytest.raises(RpcError, match="maybe encrypted"):
-        l1.rpc.exposesecret(passphrase=password)
+    os.close(master_fd2)
+    os.close(slave_fd2)
+
+    # Test that exposesecret fails with mnemonic+passphrase format since it needs a passphrase
+    with pytest.raises(RpcError, match="Secret with passphrase is not supported"):
+        l1.rpc.exposesecret(passphrase="test_exposesecret")
+
+
+@unittest.skipIf(VALGRIND, "It does not play well with prompt and key derivation.")
+def test_exposesecret_with_mnemonic_no_passphrase(node_factory):
+    """Test that exposesecret plugin works correctly with mnemonic-based hsm_secret without passphrase"""
+    # Create a node with exposesecret-passphrase option
+    l1 = node_factory.get_node(options={
+        'exposesecret-passphrase': "test_exposesecret",
+    }, start=False)
+    hsm_path = os.path.join(l1.daemon.lightning_dir, TEST_NETWORK, "hsm_secret")
+    if os.path.exists(hsm_path):
+        os.remove(hsm_path)
+
+    # Generate hsm_secret with mnemonic and no passphrase using hsmtool
+    mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+    hsmtool = HsmTool(node_factory.directory, "generatehsm", hsm_path)
+    master_fd, slave_fd = os.openpty()
+    hsmtool.start(stdin=slave_fd)
+    hsmtool.wait_for_log(r"Introduce your BIP39 word list")
+    write_all(master_fd, f"{mnemonic}\n".encode("utf-8"))
+    hsmtool.wait_for_log(r"Enter your passphrase:")
+    write_all(master_fd, "\n".encode("utf-8"))
+    assert hsmtool.proc.wait(WAIT_TIMEOUT) == 0
+
+    # Start the daemon normally (no hsm-passphrase option needed for mnemonic without passphrase)
+    l1.start()
+
+    # Test that exposesecret works correctly with mnemonic-based hsm_secret without passphrase
+    result = l1.rpc.exposesecret(passphrase="test_exposesecret")
+    assert result == {
+        'codex32': 'cl10peevst6cqh0wu7p5ssjyf4z4ez42ks9jlt3zneju9uuypr2hddak6tlqsjhsks4laxts8q',
+        'identifier': 'peev',
+        'mnemonic': 'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about'
+    }
 
 
 def test_peer_storage(node_factory, bitcoind):
@@ -4653,6 +4805,94 @@ def test_peer_storage(node_factory, bitcoind):
     # This should never happen
     assert not l1.daemon.is_in_log(r'PeerStorageFailed')
     assert not l2.daemon.is_in_log(r'PeerStorageFailed')
+
+
+@pytest.mark.parametrize("deprecated", [False, True])
+def test_pay_plugin_notifications(node_factory, bitcoind, chainparams, deprecated):
+    plugin = os.path.join(os.getcwd(), 'tests/plugins/all_notifications.py')
+    opts = {"plugin": plugin}
+    if deprecated:
+        opts['allow-deprecated-apis'] = True
+
+    l1, l2, l3 = node_factory.line_graph(3, opts=[opts, {}, {}],
+                                         wait_for_announce=True)
+
+    def zero_timestamps(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k == "timestamp":
+                    obj[k] = 0
+                else:
+                    zero_timestamps(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                zero_timestamps(item)
+        # other types are ignored
+        return obj
+
+    inv1 = l3.rpc.invoice(20000, "first", "desc")
+    l1.rpc.pay(inv1['bolt11'])
+
+    # It gets a channel hint update notification
+    line = l1.daemon.wait_for_log(f"plugin-all_notifications.py: notification channel_hint_update: ")
+    dict_str = line.split("notification channel_hint_update: ", 1)[1]
+    data = zero_timestamps(ast.literal_eval(dict_str))
+
+    channel_hint_update_core = {'scid': first_scid(l1, l2) + '/1',
+                                'estimated_capacity_msat': 964719000 if chainparams['elements'] else 978718000,
+                                'total_capacity_msat': 1000000000,
+                                'timestamp': 0,
+                                'enabled': True}
+    channel_hint_update = {'origin': 'pay',
+                           'channel_hint_update': channel_hint_update_core}
+    if deprecated:
+        # pyln-client's plugin.py duplicated payload into same name as update.
+        channel_hint_update['payload'] = {'channel_hint': channel_hint_update_core}
+
+    assert data == channel_hint_update
+
+    # It gets a success notification
+    line = l1.daemon.wait_for_log(f"plugin-all_notifications.py: notification pay_success: ")
+    dict_str = line.split("notification pay_success: ", 1)[1]
+    data = ast.literal_eval(dict_str)
+    success_core = {'payment_hash': inv1['payment_hash'],
+                    'bolt11': inv1['bolt11']}
+    success = {'origin': 'pay',
+               'pay_success': success_core}
+    if deprecated:
+        # pyln-client's plugin.py duplicated payload into same name as update.
+        success['payload'] = success_core
+    assert data == success
+
+    inv2 = l3.rpc.invoice(10000, "second", "desc")
+    l3.rpc.delinvoice('second', 'unpaid')
+    with pytest.raises(RpcError, match="WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS"):
+        l1.rpc.pay(inv2['bolt11'])
+
+    line = l1.daemon.wait_for_log(f"plugin-all_notifications.py: notification pay_failure: ")
+    dict_str = line.split("notification pay_failure: ", 1)[1]
+    data = ast.literal_eval(dict_str)
+    failure_core = {'payment_hash': inv2['payment_hash'], 'bolt11': inv2['bolt11'], 'error': {'message': 'failed: WIRE_INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS (reply from remote)'}}
+    failure = {'origin': 'pay',
+               'pay_failure': failure_core}
+    if deprecated:
+        # pyln-client's plugin.py duplicated payload into same name as update.
+        failure['payload'] = failure_core
+    assert data == failure
+
+
+@pytest.mark.openchannel('v1')
+@pytest.mark.openchannel('v2')
+def test_openchannel_hook_channel_type(node_factory, bitcoind):
+    """openchannel hook should get a channel_type field.
+    """
+    opts = {'plugin': os.path.join(os.getcwd(), 'tests/plugins/openchannel_hook_accepter.py')}
+    l1, l2 = node_factory.line_graph(2, opts=opts)
+
+    if 'anchors/even' in only_one(l1.rpc.listpeerchannels()['channels'])['channel_type']['names']:
+        l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12, 22\], 'names': \['static_remotekey/even', 'anchors/even'\]}")
+    else:
+        l2.daemon.wait_for_log(r"plugin-openchannel_hook_accepter.py: accept by design: channel_type {'bits': \[12\], 'names': \['static_remotekey/even'\]}")
 
 
 # ---------------------------------------------------------------------------

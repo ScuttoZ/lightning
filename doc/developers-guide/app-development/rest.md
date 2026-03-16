@@ -1,9 +1,8 @@
 ---
-title: "REST APIs"
-slug: "rest"
-hidden: false
-createdAt: "2023-09-05T09:54:01.784Z"
-updatedAt: "2023-10-13T09:54:01.784Z"
+title: REST APIs
+slug: rest
+privacy:
+  view: public
 ---
 
 # CLNRest
@@ -31,13 +30,6 @@ An online demo for the REST interface is available at [REST API REFERENCE](ref:g
 > - Default `clnrest-host` is `127.0.0.1` but this testing will require it to be `0.0.0.0`.
 >
 > Note: This setup is for **testing only**. It is **highly recommended** to test with _non-mainnet_ (regtest/testnet) setup only.
-
-
-## Installation
-
-Note: if you have the older c-lightning-REST plugin, you can configure Core Lightning with `disable-plugin=clnrest`
-option to avoid confusion with this one. You can also run both plugins simultaneously till all your applications
-are not migrated to `clnrest`.
 
 
 ## Configuration

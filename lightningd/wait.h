@@ -11,8 +11,11 @@ enum wait_subsystem {
 	WAIT_SUBSYSTEM_SENDPAY,
 	WAIT_SUBSYSTEM_INVOICE,
 	WAIT_SUBSYSTEM_HTLCS,
+	WAIT_SUBSYSTEM_CHAINMOVES,
+	WAIT_SUBSYSTEM_CHANNELMOVES,
+	WAIT_SUBSYSTEM_NETWORKEVENTS,
 };
-#define NUM_WAIT_SUBSYSTEM (WAIT_SUBSYSTEM_HTLCS+1)
+#define NUM_WAIT_SUBSYSTEM (WAIT_SUBSYSTEM_NETWORKEVENTS+1)
 
 enum wait_index {
 	WAIT_INDEX_CREATED,
@@ -35,6 +38,7 @@ const char *wait_subsystem_name(enum wait_subsystem subsystem);
 /**
  * wait_index_increment - increment an index, tell waiters.
  * @ld: the lightningd
+ * @db: the database (usually ld->wallet->db, except really early)
  * @subsystem: subsystem for index
  * @index: which index
  * ...: name/value pairs, followed by NULL.
@@ -42,10 +46,12 @@ const char *wait_subsystem_name(enum wait_subsystem subsystem);
  * Increase index, write to db, wake any waiters, give them any name/value pairs.
  * If the value is NULL, omit that name.
  * If the name starts with '=', the value is a JSON literal (and skip over the =)
+ * If the value is "", use the resulting index value.
  *
  * Returns the updated index value (always > 0).
  */
 u64 LAST_ARG_NULL wait_index_increment(struct lightningd *ld,
+				       struct db *db,
 				       enum wait_subsystem subsystem,
 				       enum wait_index index,
 				       ...);
@@ -53,6 +59,7 @@ u64 LAST_ARG_NULL wait_index_increment(struct lightningd *ld,
 /**
  * wait_index_increase - increase an index, tell waiters.
  * @ld: the lightningd
+ * @db: the database (usually ld->wallet->db, except really early)
  * @subsystem: subsystem for index
  * @index: which index
  * @num: number to add (if > 0).
@@ -61,6 +68,7 @@ u64 LAST_ARG_NULL wait_index_increment(struct lightningd *ld,
  * A more generic version if wait_index_increment: if num is 0 it's a noop.
  */
 void LAST_ARG_NULL wait_index_increase(struct lightningd *ld,
+				       struct db *db,
 				       enum wait_subsystem subsystem,
 				       enum wait_index index,
 				       u64 num,

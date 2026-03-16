@@ -1678,6 +1678,82 @@
                 ]
               }
             }
+          },
+          "currencyrate-add-source": {
+            "added": "v26.04",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "values_str",
+              "sources"
+            ],
+            "properties": {
+              "values_str": {
+                "type": "array",
+                "added": "v26.04",
+                "items": {
+                  "type": "string",
+                  "description": [
+                    "A source for cln-currencyrate to fetch price data from in the format of NAME,URL,MEMBERS"
+                  ]
+                }
+              },
+              "sources": {
+                "type": "array",
+                "added": "v26.04",
+                "items": {
+                  "type": "string",
+                  "description": [
+                    "Source of configuration setting."
+                  ]
+                }
+              },
+              "plugin": {
+                "type": "string",
+                "added": "v26.04",
+                "description": [
+                  "Plugin which registered this configuration setting."
+                ]
+              }
+            }
+          },
+          "currencyrate-disable-source": {
+            "added": "v26.04",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "values_str",
+              "sources"
+            ],
+            "properties": {
+              "values_str": {
+                "type": "array",
+                "added": "v26.04",
+                "items": {
+                  "type": "string",
+                  "description": [
+                    "The name of the cln-currencyrate source to disable"
+                  ]
+                }
+              },
+              "sources": {
+                "type": "array",
+                "added": "v26.04",
+                "items": {
+                  "type": "string",
+                  "description": [
+                    "Source of configuration setting."
+                  ]
+                }
+              },
+              "plugin": {
+                "type": "string",
+                "added": "v26.04",
+                "description": [
+                  "Plugin which registered this configuration setting."
+                ]
+              }
+            }
           }
         }
       }
@@ -1706,7 +1782,7 @@
     "- -32602: Error in given parameters or field with *config* name doesn't exist."
   ],
   "author": [
-    "Vincenzo Palazzo <<vincenzo.palazzo@protonmail.com>> wrote the initial version of this man page,",
+    "Vincenzo Palazzo [vincenzo.palazzo@protonmail.com](mailto:vincenzo.palazzo@protonmail.com) wrote the initial version of this man page,",
     "but many others did the hard work of actually implementing this rpc command."
   ],
   "see_also": [
@@ -1714,7 +1790,7 @@
     "lightningd-config(5)"
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {
@@ -1941,10 +2017,6 @@
             "set": true,
             "source": "cmdline"
           },
-          "experimental-peer-storage": {
-            "set": false,
-            "source": "default"
-          },
           "experimental-quiesce": {
             "set": false,
             "source": "default"
@@ -1954,10 +2026,6 @@
             "source": "default"
           },
           "experimental-splicing": {
-            "set": false,
-            "source": "default"
-          },
-          "experimental-upgrade-protocol": {
             "set": false,
             "source": "default"
           },

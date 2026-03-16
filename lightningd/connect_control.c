@@ -1,26 +1,18 @@
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <ccan/err/err.h>
+#include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
-#include <common/configdir.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/memleak.h>
-#include <common/timeout.h>
 #include <connectd/connectd_wiregen.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/permissions.h>
 #include <lightningd/channel.h>
-#include <lightningd/channel_gossip.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
 #include <lightningd/hsm_control.h>
-#include <lightningd/lightningd.h>
 #include <lightningd/notification.h>
 #include <lightningd/onion_message.h>
 #include <lightningd/opening_common.h>
-#include <lightningd/opening_control.h>
-#include <lightningd/peer_control.h>
+#include <lightningd/ping.h>
 #include <lightningd/plugin_hook.h>
 
 struct connect {
@@ -227,25 +219,34 @@ static struct command_result *json_connect(struct command *cmd,
 
 	/* If we know about peer, see if it's already connected. */
 	peer = peer_by_id(cmd->ld, &id_addr.id);
-	if (peer && peer->connected == PEER_CONNECTED) {
-		log_debug(cmd->ld->log, "Already connected via %s",
-			  fmt_wireaddr_internal(tmpctx,
+	if (peer) {
+		switch (peer->connected) {
+		case PEER_CONNECTED:
+			log_debug(cmd->ld->log, "Already connected via %s",
+				  fmt_wireaddr_internal(tmpctx,
 					 &peer->addr));
-		return connect_cmd_succeed(cmd, peer,
-					   peer->connected_incoming,
-					   &peer->addr);
+			return connect_cmd_succeed(cmd, peer,
+						   peer->connected_incoming,
+						   &peer->addr);
+		case PEER_DISCONNECTED:
+			/* When a peer disconnects, we give subds time to clean themselves up
+			 * (this lets connectd ensure they've seen the final messages).  But
+			 * now it's going to try to reconnect, we've gotta force them out. */
+			peer_channels_cleanup(peer);
+			break;
+		case PEER_CONNECTING:
+			/* Just wait until connection finished.  Though we still ask connectd to connect,
+			 * it's going to ignore it. */
+			break;
+		}
 	}
 
-	/* When a peer disconnects, we give subds time to clean themselves up
-	 * (this lets connectd ensure they've seen the final messages).  But
-	 * now it's going to try to reconnect, we've gotta force them out. */
-	if (peer)
-		peer_channels_cleanup(peer);
-
 	subd_send_msg(cmd->ld->connectd,
-		      take(towire_connectd_connect_to_peer(NULL, &id_addr.id, addr, true)));
+		      take(towire_connectd_connect_to_peer(NULL, &id_addr.id,
+							   addr, true,
+							   tal_fmt(tmpctx, "connect command %s", cmd->id))));
 
-	/* Leave this here for peer_connected, connect_failed or peer_disconnect_done. */
+	/* Leave this here for peer_connected, connect_failed or peer_disconnected. */
 	new_connect(cmd->ld, &id_addr.id, cmd);
 	return command_still_pending(cmd);
 }
@@ -260,15 +261,38 @@ AUTODATA(json_command, &connect_command);
 static void connect_failed(struct lightningd *ld,
 			   const struct node_id *id,
 			   const struct wireaddr_internal *addrhint,
+			   const char *connect_reason,
+			   u64 connect_nsec,
 			   enum jsonrpc_errcode errcode,
-			   const char *errmsg)
+			   const char *errmsg,
+			   bool connect_attempted)
 {
 	struct connect *c;
 
-	/* We can have multiple connect commands: fail them all */
-	while ((c = find_connect(ld, id)) != NULL) {
-		/* They delete themselves from list */
-		was_pending(command_fail(c->cmd, errcode, "%s", errmsg));
+	/* Don't record twice. */
+	if (errcode != CONNECT_DISCONNECTED_DURING)
+		wallet_save_network_event(ld, id,
+					  NETWORK_EVENT_CONNECTFAIL,
+					  errmsg,
+					  connect_nsec,
+					  connect_attempted);
+
+	/* There's a race between autoreconnect and connect commands.  This
+	 * matters because the autoreconnect might have failed, but that was before
+	 * the connect_to_peer command gave connectd a new address.  This we wait for
+	 * one we explicitly asked for before failing.
+	 *
+	 * A similar pattern could occur with multiple connect commands, however connectd
+	 * does simply combine those, so we don't get a response per request, and it's a
+	 * very rare corner case (which, unlike the above, doesn't happen in CI!).
+	 */
+	if (strstarts(connect_reason, "connect command")
+	    || errcode == CONNECT_DISCONNECTED_DURING) {
+		/* We can have multiple connect commands: fail them all */
+		while ((c = find_connect(ld, id)) != NULL) {
+			/* They delete themselves from list */
+			was_pending(command_fail(c->cmd, errcode, "%s", errmsg));
+		}
 	}
 }
 
@@ -276,8 +300,11 @@ void connect_failed_disconnect(struct lightningd *ld,
 			       const struct node_id *id,
 			       const struct wireaddr_internal *addrhint)
 {
-	connect_failed(ld, id, addrhint, CONNECT_DISCONNECTED_DURING,
-		       "disconnected during connection");
+	connect_failed(ld, id, addrhint,
+		       "", 0,
+		       CONNECT_DISCONNECTED_DURING,
+		       "disconnected during connection",
+		       false);
 }
 
 static void handle_connect_failed(struct lightningd *ld, const u8 *msg)
@@ -285,12 +312,20 @@ static void handle_connect_failed(struct lightningd *ld, const u8 *msg)
 	struct node_id id;
 	enum jsonrpc_errcode errcode;
 	char *errmsg;
+	char *connect_reason;
+	u64 nsec;
+	bool connect_attempted;
 
-	if (!fromwire_connectd_connect_failed(tmpctx, msg, &id, &errcode, &errmsg))
+	if (!fromwire_connectd_connect_failed(tmpctx, msg, &id,
+					      &connect_reason,
+					      &nsec,
+					      &errcode, &errmsg,
+					      &connect_attempted))
 		fatal("Connect gave bad CONNECTD_CONNECT_FAILED message %s",
 		      tal_hex(msg, msg));
 
-	connect_failed(ld, &id, NULL, errcode, errmsg);
+	connect_failed(ld, &id, NULL, connect_reason, nsec, errcode, errmsg,
+		       connect_attempted);
 }
 
 const char *connect_any_cmd_id(const tal_t *ctx,
@@ -316,6 +351,7 @@ void connect_succeeded(struct lightningd *ld, const struct peer *peer,
 }
 
 struct custommsg_payload {
+	struct lightningd *ld;
 	struct node_id peer_id;
 	u8 *msg;
 };
@@ -341,6 +377,11 @@ static bool custommsg_cb(struct custommsg_payload *payload,
 
 static void custommsg_final(struct custommsg_payload *payload STEALS)
 {
+	/* Note: on shutdown, ld->connectd can be NULL! */
+	if (payload->ld->connectd) {
+		subd_send_msg(payload->ld->connectd,
+			      take(towire_connectd_custommsg_in_complete(NULL, &payload->peer_id)));
+	}
 	tal_steal(tmpctx, payload);
 }
 
@@ -352,16 +393,17 @@ static void custommsg_payload_serialize(struct custommsg_payload *payload,
 	json_add_node_id(stream, "peer_id", &payload->peer_id);
 }
 
-REGISTER_PLUGIN_HOOK(custommsg,
-		     custommsg_cb,
-		     custommsg_final,
-		     custommsg_payload_serialize,
-		     struct custommsg_payload *);
+REGISTER_PLUGIN_HOOK_INTFILTER(custommsg,
+			       custommsg_cb,
+			       custommsg_final,
+			       custommsg_payload_serialize,
+			       struct custommsg_payload *);
 
 static void handle_custommsg_in(struct lightningd *ld, const u8 *msg)
 {
 	struct custommsg_payload *p = tal(NULL, struct custommsg_payload);
 
+	p->ld = ld;
 	if (!fromwire_connectd_custommsg_in(p, msg, &p->peer_id, &p->msg)) {
 		log_broken(ld->log, "Malformed custommsg: %s",
 			   tal_hex(tmpctx, msg));
@@ -370,7 +412,7 @@ static void handle_custommsg_in(struct lightningd *ld, const u8 *msg)
 	}
 
 	notify_custommsg(ld, &p->peer_id, p->msg);
-	plugin_hook_call_custommsg(ld, NULL, p);
+	plugin_hook_call_custommsg(ld, fromwire_peektype(p->msg), NULL, p);
 }
 
 static void handle_onionmsg_forward_fail(struct lightningd *ld, const u8 *msg)
@@ -430,6 +472,7 @@ void connectd_start_shutdown(struct subd *connectd)
 
 void connectd_connect_to_peer(struct lightningd *ld,
 			      const struct peer *peer,
+			      const char *reason,
 			      bool is_important)
 {
 	/* Give connectd an address if we know it. */
@@ -443,7 +486,8 @@ void connectd_connect_to_peer(struct lightningd *ld,
 	subd_send_msg(peer->ld->connectd,
 		      take(towire_connectd_connect_to_peer(NULL, &peer->id,
 							   waddr,
-							   !is_important)));
+							   !is_important,
+							   reason)));
 }
 
 void tell_connectd_peer_importance(struct peer *peer,
@@ -461,8 +505,31 @@ void tell_connectd_peer_importance(struct peer *peer,
 	} else if (!was_important && is_important) {
 		/* Tell connectd it's now important (unless we're told not to reconnect) */
 		if (peer->ld->reconnect)
-			connectd_connect_to_peer(peer->ld, peer, true);
+			connectd_connect_to_peer(peer->ld, peer,
+						 "peer established channel",
+						 true);
 	}
+}
+
+static void handle_ping_latency(struct lightningd *ld, const u8 *msg)
+{
+	struct node_id id;
+	u64 nsec;
+
+	if (!fromwire_connectd_ping_latency(msg, &id, &nsec)) {
+		log_broken(ld->log, "Malformed ping_latency: %s",
+			   tal_hex(tmpctx, msg));
+		return;
+	}
+
+	log_peer_trace(ld->log, &id, "Ping latency: %"PRIu64"nsec",
+		       nsec);
+
+	wallet_save_network_event(ld, &id,
+				  NETWORK_EVENT_PING,
+				  NULL,
+				  nsec,
+				  false);
 }
 
 static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fds)
@@ -490,25 +557,26 @@ static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fd
 	case WIRE_CONNECTD_DEV_EXHAUST_FDS:
 	case WIRE_CONNECTD_DEV_SET_MAX_SCIDS_ENCODE_SIZE:
 	case WIRE_CONNECTD_SCID_MAP:
+	case WIRE_CONNECTD_CUSTOMMSG_IN_COMPLETE:
 	/* This is a reply, so never gets through to here. */
 	case WIRE_CONNECTD_INIT_REPLY:
 	case WIRE_CONNECTD_ACTIVATE_REPLY:
 	case WIRE_CONNECTD_DEV_MEMLEAK_REPLY:
-	case WIRE_CONNECTD_PING_REPLY:
 	case WIRE_CONNECTD_START_SHUTDOWN_REPLY:
 	case WIRE_CONNECTD_INJECT_ONIONMSG_REPLY:
 		break;
 
 	case WIRE_CONNECTD_PEER_CONNECTED:
-		peer_connected(connectd->ld, msg);
+	case WIRE_CONNECTD_PEER_RECONNECTED:
+		handle_peer_connected(connectd->ld, msg);
 		break;
 
 	case WIRE_CONNECTD_PEER_SPOKE:
-		peer_spoke(connectd->ld, msg);
+		handle_peer_spoke(connectd->ld, msg);
 		break;
 
-	case WIRE_CONNECTD_PEER_DISCONNECT_DONE:
-		peer_disconnect_done(connectd->ld, msg);
+	case WIRE_CONNECTD_PEER_DISCONNECTED:
+		handle_peer_disconnected(connectd->ld, msg);
 		break;
 
 	case WIRE_CONNECTD_CONNECT_FAILED:
@@ -525,6 +593,14 @@ static unsigned connectd_msg(struct subd *connectd, const u8 *msg, const int *fd
 
 	case WIRE_CONNECTD_ONIONMSG_FORWARD_FAIL:
 		handle_onionmsg_forward_fail(connectd->ld, msg);
+		break;
+
+	case WIRE_CONNECTD_PING_DONE:
+		handle_ping_done(connectd, msg);
+		break;
+
+	case WIRE_CONNECTD_PING_LATENCY:
+		handle_ping_latency(connectd->ld, msg);
 		break;
 	}
 	return 0;
@@ -643,7 +719,6 @@ int connectd_init(struct lightningd *ld)
 				   ld->tor_service_password ? ld->tor_service_password : "",
 				   ld->config.connection_timeout_secs,
 				   websocket_helper_path,
-				   !ld->deprecated_ok,
 				   ld->dev_fast_gossip,
 				   ld->dev_disconnect_fd >= 0,
 				   ld->dev_no_ping_timer,
@@ -651,7 +726,8 @@ int connectd_init(struct lightningd *ld)
 				   ld->dev_throttle_gossip,
 				   !ld->reconnect,
 				   ld->dev_fast_reconnect,
-				   ld->dev_limit_connections_inflight);
+				   ld->dev_limit_connections_inflight,
+				   ld->dev_keep_nagle);
 
 	subd_req(ld->connectd, ld->connectd, take(msg), -1, 0,
 		 connect_init_done, NULL);

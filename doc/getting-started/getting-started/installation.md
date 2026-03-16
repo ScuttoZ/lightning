@@ -1,16 +1,15 @@
 ---
-title: "Installation"
-slug: "installation"
-excerpt: "Core lightning is available on many platforms and environments. Learn how to install on your preferred platform."
-hidden: false
-createdAt: "2022-11-18T14:32:02.251Z"
-updatedAt: "2023-07-13T05:08:44.966Z"
+title: Installation
+slug: installation
+content:
+  excerpt: >-
+    Core lightning is available on many platforms and environments. Learn how to install on your preferred platform.
+privacy:
+  view: public
 ---
 # Binaries
 
 If you're on Ubuntu, you need to install bitcoind:
-
-
 ```shell
 sudo apt-get install -y software-properties-common
 sudo snap install bitcoin-core
@@ -19,25 +18,28 @@ sudo ln -s /snap/bitcoin-core/current/bin/bitcoin{d,-cli} /usr/local/bin/
 ```
 
 Then you can fetch a pre-compiled binary from the [releases](https://github.com/ElementsProject/lightning/releases) page on GitHub. Core Lightning provides binaries for both Ubuntu and Fedora distributions. Normally these binaries are extracted into /usr/local:
-
 ```shell
+sudo rm -R /usr/local/libexec/c-lightning/plugins # If you are upgrading run this first to avoid plugin conflicts
 sudo tar -xvf <release>.tar.xz -C /usr/local --strip-components=2
 ```
 
-If you're on a different distribution or OS, you can compile the source by following the instructions from [Installing from Source](<>).
+If you're on a different distribution or OS, you can compile the source by following the instructions from [Installing from Source](doc:installing-from-source).
 
 # Docker
 
-To install the Docker image for the latest stable release: 
-
+To install the Docker image for the latest stable release:
 ```shell
 docker pull elementsproject/lightningd:latest
 ```
 
 To install for a specific version, for example, 24.05:
-
 ```shell
 docker pull elementsproject/lightningd:v24.05
+```
+
+To run the Docker container:
+```shell
+docker run --rm --init -v /path/on/host/lightning-data:/root/.lightning -p 9735:9735 -p 9835:9835 lightningd
 ```
 
 See all of the docker images for Core Lightning on [Docker Hub](https://hub.docker.com/r/elementsproject/lightningd/tags).
@@ -71,21 +73,18 @@ You will also need a version of bitcoind with segregated witness and `estimatesm
 OS version: Ubuntu 15.10 or above
 
 Get dependencies:
-
 ```shell
 sudo apt-get update
 sudo apt-get install -y \
   jq autoconf automake build-essential git libtool libsqlite3-dev libffi-dev \
-  python3 python3-pip net-tools zlib1g-dev libsodium-dev gettext
+  python3 python3-pip net-tools zlib1g-dev libsodium-dev gettext lowdown
 pip3 install --upgrade pip
-pip3 install --user poetry
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-(If installing `poetry` with `pip` as above fails, try installing it with the [official poetry installer](https://python-poetry.org/docs/#installing-with-the-official-installer).)
-
+After installing uv, restart your shell or run `source ~/.bashrc` to ensure `uv` is in your PATH.
 
 If you don't have Bitcoin installed locally you'll need to install that as well. It's now available via [snapd](https://snapcraft.io/bitcoin-core).
-
 ```shell
 sudo apt-get install snapd
 sudo snap install bitcoin-core
@@ -95,73 +94,56 @@ sudo ln -s /snap/bitcoin-core/current/bin/bitcoin{d,-cli} /usr/local/bin/
 ```
 
 Clone lightning:
-
 ```shell
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning
 ```
 
 Checkout a release tag:
-
 ```shell
 git checkout v25.02
 ```
 
 For development or running tests, get additional dependencies:
-
 ```shell
 sudo apt-get install -y valgrind libpq-dev shellcheck cppcheck \
   libsecp256k1-dev lowdown
-pip3 install pytest
 ```
 
-If you can't install `lowdown`, a version will be built in-tree.
-
-If you want to build the Rust plugins (currently cln-grpc and clnrest, which changed from Python to Rust as of v25.02):
-
+If you want to build the Rust plugins (cln-grpc, clnrest, cln-bip353 and wss-proxy):
 ```shell
 sudo apt-get install -y cargo rustfmt protobuf-compiler
 ```
 
-> 📘 
-> 
+> 📘
+>
 > If your build fails because of your Rust version, you might want to check out [rustup](https://rustup.rs/) to install a newer version
-
 
 There are two ways to build core lightning, and this depends on how you want use it.
 
 To build CLN for production:
-
 ```shell
-poetry install
+uv sync --all-extras --all-groups --frozen
 ./configure
-RUST_PROFILE=release poetry run make
+RUST_PROFILE=release uv run make
 sudo RUST_PROFILE=release make install
 ```
 
-> 📘 
-> 
-> If you want disable Rust because you do not want use it or you do not want `cln-grpc` or `clnrest`, you can use `./configure --disable-rust`.
+> 📘
+>
+> If you want to disable Rust because you don't need it or its plugins (cln-grpc, clnrest, cln-bip353 or wss-proxy), you can use `./configure --disable-rust`.
 
 To build CLN for development:
-
 ```shell
-poetry shell
-```
-
-This will put you in a new shell to enter the following commands:
-
-```shell
-poetry install
+uv sync --all-extras --all-groups --frozen
 ./configure
-make
-make check VALGRIND=0
+uv run make
+uv run make check VALGRIND=0
 ```
 
 Optionally, add `-j$(nproc)` after `make` to speed up compilation. (e.g. `make -j$(nproc)`)
 
 Running lightning:
-
 ```shell
 bitcoind &
 ./lightningd/lightningd &
@@ -170,15 +152,14 @@ bitcoind &
 
 ## To Build on Fedora
 
-OS version: Fedora 27 or above
+OS version: Fedora 39 or above
 
 Get dependencies:
-
 ```shell
 sudo dnf update -y && \
         sudo dnf groupinstall -y \
-                'C Development Tools and Libraries' \
-                'Development Tools' && \
+                'c-development' \
+                'development-tools' && \
         sudo dnf install -y \
                 clang \
                 gettext \
@@ -193,27 +174,50 @@ sudo dnf update -y && \
                 wget \
                 jq \
                 zlib-devel \
-				libsodium-devel && \
+                libsodium-devel \
+                which \
+                sed \
+                protobuf-compiler \
+                protobuf-devel \
+                postgresql-devel \
+                python3-mako && \
         sudo dnf clean all
+```
+
+Install Rust via rustup (required for Cargo lockfile v4 support):
+```shell
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
+```
+
+Install lowdown (for documentation generation):
+```shell
+cd /tmp && \
+wget https://github.com/kristapsdz/lowdown/archive/refs/tags/VERSION_1_0_2.tar.gz && \
+tar -xzf VERSION_1_0_2.tar.gz && \
+cd lowdown-VERSION_1_0_2 && \
+./configure && \
+make && \
+sudo make install && \
+sudo ldconfig && \
+cd ~ && \
+rm -rf /tmp/VERSION_1_0_2.tar.gz /tmp/lowdown-VERSION_1_0_2
 ```
 
 Make sure you have [bitcoind](https://github.com/bitcoin/bitcoin) available to run.
 
 Clone lightning:
-
 ```shell
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning
 ```
 
 Checkout a release tag:
-
 ```shell
 git checkout v24.05
 ```
 
 Build and install lightning:
-
 ```shell
 ./configure
 make
@@ -221,14 +225,12 @@ sudo make install
 ```
 
 Running lightning (mainnet):
-
 ```shell
 bitcoind &
 lightningd --network=bitcoin
 ```
 
 Running lightning on testnet:
-
 ```shell
 bitcoind -testnet &
 lightningd --network=testnet
@@ -237,10 +239,9 @@ lightningd --network=testnet
 ## To Build on FreeBSD
 
 OS version: FreeBSD 11.1-RELEASE or above
-
 ```shell
-pkg install git python py39-pip gmake libtool gmp sqlite3 postgresql13-client gettext autotools
-https://github.com/ElementsProject/lightning.git
+pkg install git python py39-pip gmake libtool gmp sqlite3 postgresql13-client gettext autotools lowdown libsodium
+git clone https://github.com/ElementsProject/lightning.git
 pip install --upgrade pip
 pip3 install mako
 ./configure
@@ -249,30 +250,26 @@ gmake install
 ```
 
 Alternatively, Core Lightning is in the FreeBSD ports, so install it as any other port (dependencies are handled automatically):
-
 ```shell
 # pkg install c-lightning
 ```
 
 If you want to compile locally and fiddle with compile time options:
-
 ```shell
 # cd /usr/ports/net-p2p/c-lightning && make install
 ```
 
 See `/usr/ports/net-p2p/c-lightning/Makefile` for instructions on how to build from an arbitrary git commit, instead of the latest release tag.
 
-> 📘 
-> 
+> 📘
+>
 > Make sure you've set an utf-8 locale, e.g. `export LC_CTYPE=en_US.UTF-8`, otherwise manpage installation may fail.
 
 Running lightning:
 
 Configure bitcoind, if not already: add `rpcuser=<foo>` and `rpcpassword=<bar>` to `/usr/local/etc/bitcoin.conf`, maybe also `testnet=1`.
 
-Configure lightningd: copy `/usr/local/etc/lightningd-bitcoin.conf.sample` to  
-`/usr/local/etc/lightningd-bitcoin.conf` and edit according to your needs.
-
+Configure lightningd: copy `/usr/local/etc/lightningd-bitcoin.conf.sample` to `/usr/local/etc/lightningd-bitcoin.conf` and edit according to your needs.
 ```shell
 # service bitcoind start
 # service lightningd start
@@ -284,7 +281,6 @@ Configure lightningd: copy `/usr/local/etc/lightningd-bitcoin.conf.sample` to
 OS version: OpenBSD 7.3
 
 Install dependencies:
-
 ```shell
 pkg_add git python gmake py3-pip libtool gettext-tools
 pkg_add automake # (select highest version, automake1.16.2 at time of writing)
@@ -292,9 +288,8 @@ pkg_add autoconf # (select highest version, autoconf-2.69p2 at time of writing)
 ```
 
 Install `mako` otherwise we run into build errors:
-
 ```shell
-pip3.8 install --user poetry
+pip3 install --user poetry
 poetry install
 ```
 
@@ -303,7 +298,6 @@ Add `/home/<username>/.local/bin` to your path:
 `export PATH=$PATH:/home/<username>/.local/bin`
 
 Needed for `configure`:
-
 ```shell
 export AUTOCONF_VERSION=2.69
 export AUTOMAKE_VERSION=1.16
@@ -317,7 +311,6 @@ Finally, build `c-lightning`:
 ## To Build on NixOS
 
 Use nix-shell launch a shell with a full Core Lightning dev environment:
-
 ```shell
 nix-shell -Q -p gdb sqlite autoconf git clang libtool sqlite autoconf \
 autogen automake gmp zlib gettext libsodium poetry 'python3.withPackages (p: [p.bitcoinlib])' \
@@ -326,43 +319,58 @@ poetry install
 make
 ```
 
-## To Build on macOS
+## To Build on macOS Apple Silicon
 
-Assuming you have Xcode and Homebrew installed. Install dependencies:
+Assuming you have Xcode and Homebrew installed.
 
+First confirm which architecture of Mac you are running
 ```shell
-brew install autoconf automake libtool python3 gnu-sed gettext libsodium protobuf
-export PATH="/usr/local/opt:$PATH"
+arch
 ```
 
-If you need SQLite (or get a SQLite mismatch build error):
+If you see this result: `arm64`
 
+Continue with these instructions. If you see any other result switch to Build on macOS Intel instructions.
+
+Confirm you are using Apple Silicon Homebrew
 ```shell
-brew install sqlite
-export LDFLAGS="-L/usr/local/opt/sqlite/lib"
-export CPPFLAGS="-I/usr/local/opt/sqlite/include"
+which brew
+which pkg-config
 ```
 
-Some library paths are different when using `homebrew` on Macs with Apple silicon, therefore the following two variables need to be set for Macs with Apple silicon:
+If you see this result:
+```
+/opt/homebrew/bin/brew
+/opt/homebrew/bin/pkg-config
+```
 
+You are using Apple Silicon Homebrew and can continue with the instructions, skip to "Install dependencies"
+
+If you see this in the result: `/usr/local/bin/brew`
+
+You are using brew in Intel compatibility mode. The simplest solution is to remove brew entirely, reinstall it, and start these instructions over.
+
+Install dependencies:
 ```shell
+brew install autoconf automake libtool python3 gnu-sed gettext libsodium protobuf lowdown pkgconf openssl make
+export PATH="/opt/homebrew/opt/:$PATH"
 export CPATH=/opt/homebrew/include
 export LIBRARY_PATH=/opt/homebrew/lib
 ```
 
-If you need Python 3.x for mako (or get a mako build error):
-
+If you need SQLite (or get a SQLite mismatch build error):
 ```shell
-brew install pyenv
-echo -e 'if command -v pyenv 1>/dev/null 2>&1; then\n  eval "$(pyenv init -)"\nfi' >> ~/.bash_profile
-source ~/.bash_profile
-pyenv install 3.8.10
-pip install --upgrade pip
-pip install poetry==2.0.1
+brew install sqlite
 ```
 
-If you don't have bitcoind installed locally you'll need to install that as well:
+Install uv for Python dependency management:
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
+After installing uv, restart your shell or run `source ~/.zshrc` to ensure `uv` is in your PATH.
+
+If you don't have bitcoind installed locally you'll need to install that as well:
 ```shell
 brew install boost cmake pkg-config libevent
 git clone https://github.com/bitcoin/bitcoin
@@ -373,68 +381,131 @@ cmake --install build --component bitcoind && cmake --install build --component 
 ```
 
 Clone lightning:
-
 ```shell
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning
 ```
 
 Checkout a release tag:
-
 ```shell
 git checkout v24.05
 ```
 
 Build lightning:
-
 ```shell
-poetry install
+uv sync --all-extras --all-groups --frozen
 ./configure
-poetry run make
+```
+
+If you see `/usr/local` in the log, an Intel compatability dependency has been picked up. The simplest solution is to remove brew entirely, reinstall it, and start these instructions over.
+```shell
+uv run gmake
 ```
 
 Running lightning:
 
-> 📘 
-> 
-> Edit your `~/Library/Application\ Support/Bitcoin/bitcoin.conf`to include `rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also need to include `testnet=1`.
-
+> 📘
+>
+> Edit your `~/Library/Application\ Support/Bitcoin/bitcoin.conf` to include `rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also need to include `testnet=1`.
 ```shell
 bitcoind &
 ./lightningd/lightningd &
 ./cli/lightning-cli help
 ```
 
-To install the built binaries into your system, you'll need to run `make install`:
-
+To install the built binaries into your system, you'll need to run `gmake install`:
 ```shell
-make install
+gmake install
 ```
 
-On a Mac with Apple silicon, you may need to use this command instead:
-
+You may need to use this command instead. Confirm the exported PATH, CPATH, and LIBRARY_PATH environment variables set earlier are still present.
 ```shell
-sudo PATH="/usr/local/opt:$PATH"  LIBRARY_PATH=/opt/homebrew/lib CPATH=/opt/homebrew/include make install
+sudo gmake install
+```
+
+## To Build on macOS Intel
+
+Assuming you have Xcode and Homebrew installed.
+
+Install dependencies:
+```shell
+brew install autoconf automake libtool python3 gnu-sed gettext libsodium protobuf lowdown pkgconf openssl make
+export PATH="/usr/local/opt/:$PATH"
+export CPATH=/usr/local/include
+export LIBRARY_PATH=/usr/local/lib
+```
+
+If you need SQLite (or get a SQLite mismatch build error):
+```shell
+brew install sqlite
+```
+
+Install uv for Python dependency management:
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+After installing uv, restart your shell or run `source ~/.zshrc` to ensure `uv` is in your PATH.
+
+If you don't have bitcoind installed locally you'll need to install that as well:
+```shell
+brew install boost cmake pkg-config libevent
+git clone https://github.com/bitcoin/bitcoin
+cd bitcoin
+cmake -B build
+cmake --build build --target bitcoind bitcoin-cli
+cmake --install build --component bitcoind && cmake --install build --component bitcoin-cli
+```
+
+Clone lightning:
+```shell
+git clone https://github.com/ElementsProject/lightning.git
+cd lightning
+```
+
+Checkout a release tag:
+```shell
+git checkout v24.05
+```
+
+Build lightning:
+```shell
+uv sync --all-extras --all-groups --frozen
+./configure
+uv run gmake
+```
+
+Running lightning:
+
+> 📘
+>
+> Edit your `~/Library/Application\ Support/Bitcoin/bitcoin.conf` to include `rpcuser=<foo>` and `rpcpassword=<bar>` first, you may also need to include `testnet=1`.
+```shell
+bitcoind &
+./lightningd/lightningd &
+./cli/lightning-cli help
+```
+
+To install the built binaries into your system, you'll need to run `gmake install`:
+```shell
+gmake install
 ```
 
 ## To Build on Arch Linux
 
 Install dependencies:
-
 ```shell
 pacman --sync autoconf automake gcc git make python-pip
 pip install --user poetry
 ```
 
 Clone Core Lightning:
-
 ```shell
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning
 ```
 
 Build Core Lightning:
-
 ```shell
 python -m poetry install
 ./configure
@@ -442,18 +513,17 @@ python -m poetry run make
 ```
 
 Launch Core Lightning:
-
 ```
 ./lightningd/lightningd
 ```
 
 ## To cross-compile for Android
 
-Make a standalone toolchain as per <https://developer.android.com/ndk/guides/standalone_toolchain.html>.  
+Make a standalone toolchain as per https://developer.android.com/ndk/guides/standalone_toolchain.html.
+
 For Core Lightning you must target an API level of 24 or higher.
 
 Depending on your toolchain location and target arch, source env variables such as:
-
 ```shell
 export PATH=$PATH:/path/to/android/toolchain/bin
 # Change next line depending on target device arch
@@ -467,17 +537,17 @@ export STRIP=$target_host-strip
 ```
 
 Two makefile targets should not be cross-compiled so we specify a native CC:
-
 ```shell
 make CC=clang clean ccan/tools/configurator/configurator
 make clean -C ccan/ccan/cdump/tools \
   && make CC=clang -C ccan/ccan/cdump/tools
 ```
 
-Install the `qemu-user` package.  
-This will allow you to properly configure the build for the target device environment.  
-Build with:
+Install the `qemu-user` package.
 
+This will allow you to properly configure the build for the target device environment.
+
+Build with:
 ```shell
 BUILD=x86_64 MAKE_HOST=arm-linux-androideabi \
   make PIE=1 \
@@ -489,7 +559,6 @@ BUILD=x86_64 MAKE_HOST=arm-linux-androideabi \
 Obtain the [official Raspberry Pi toolchains](https://github.com/raspberrypi/tools). This document assumes compilation will occur towards the Raspberry Pi 3 (arm-linux-gnueabihf as of Mar. 2018).
 
 Depending on your toolchain location and target arch, source env variables will need to be set. They can be set from the command line as such:
-
 ```shell
 export PATH=$PATH:/path/to/arm-linux-gnueabihf/bin
 # Change next line depending on specific Raspberry Pi device
@@ -502,10 +571,9 @@ export LD=$target_host-ld
 export STRIP=$target_host-strip
 ```
 
-Install the `qemu-user` package. This will allow you to properly configure the  
-build for the target device environment.  
-Config the arm elf interpreter prefix:
+Install the `qemu-user` package. This will allow you to properly configure the build for the target device environment.
 
+Config the arm elf interpreter prefix:
 ```shell
 export QEMU_LD_PREFIX=/path/to/raspberry/arm-bcm2708/arm-rpi-4.9.3-linux-gnueabihf/arm-linux-gnueabihf/sysroot/
 ```
@@ -513,7 +581,6 @@ export QEMU_LD_PREFIX=/path/to/raspberry/arm-bcm2708/arm-rpi-4.9.3-linux-gnueabi
 Obtain and install cross-compiled versions of sqlite3 and zlib:
 
 Download and build zlib:
-
 ```shell
 wget https://zlib.net/fossils/zlib-1.2.13.tar.gz
 tar xvf zlib-1.2.13.tar.gz
@@ -524,7 +591,6 @@ make install
 ```
 
 Download and build sqlite3:
-
 ```shell
 wget https://www.sqlite.org/2018/sqlite-src-3260000.zip
 unzip sqlite-src-3260000.zip
@@ -535,7 +601,6 @@ make install
 ```
 
 Then, build Core Lightning with the following commands:
-
 ```
 ./configure
 make
@@ -547,13 +612,11 @@ For all the other Pi devices out there, consider using [Armbian](https://www.arm
 
 You can compile in `customize-image.sh` using the instructions for Ubuntu.
 
-A working example that compiles both bitcoind and Core Lightning for Armbian can  
-be found [here](https://github.com/Sjors/armbian-bitcoin-core).
+A working example that compiles both bitcoind and Core Lightning for Armbian can be found [here](https://github.com/Sjors/armbian-bitcoin-core).
 
 ## To compile for Alpine
 
 Get dependencies:
-
 ```shell
 apk update
 apk add --virtual .build-deps ca-certificates alpine-sdk autoconf automake git libtool \
@@ -561,7 +624,6 @@ sqlite-dev python3 py3-mako net-tools zlib-dev libsodium gettext
 ```
 
 Clone lightning:
-
 ```shell
 git clone https://github.com/ElementsProject/lightning.git
 cd lightning
@@ -569,7 +631,6 @@ git submodule update --init --recursive
 ```
 
 Build and install:
-
 ```shell
 ./configure
 make
@@ -577,28 +638,18 @@ make install
 ```
 
 Clean up:
-
 ```shell
 cd .. && rm -rf lightning
 apk del .build-deps
 ```
 
 Install runtime dependencies:
-
 ```shell
 apk add libgcc libsodium sqlite-libs zlib
 ```
 
 ## Python plugins
 
-Python plugins will be installed with the `poetry install` step mentioned above fron development setup. 
+Python plugins will be installed with the `poetry install` step mentioned above from development setup.
 
-Other users will need some Python packages if python plugins are used. Unfortunately there are some Python packages which are not packaged in Ubuntu, and so force installation will be needed (Flag `--user` is recommended which will install them in user's own .local directory, so at least the risk of breaking Python globally can be avoided!).
-
-### wss-proxy
-
-Below libraries are required for wss-proxy:
-
-```
-pip3 install --user pyln-client websockets
-```
+Other users will need some Python packages if python plugins are used. Unfortunately there are some Python packages which are not packaged in Ubuntu, and so forced installation will be needed (Flag `--user` is recommended which will install them in user's own .local directory, so at least the risk of breaking Python globally can be avoided!).

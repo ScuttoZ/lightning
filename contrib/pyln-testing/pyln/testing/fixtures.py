@@ -1,8 +1,9 @@
 from concurrent import futures
 from pyln.testing.db import SqliteDbProvider, PostgresDbProvider
-from pyln.testing.utils import NodeFactory, BitcoinD, ElementsD, env, LightningNode, TEST_DEBUG, TEST_NETWORK
+from pyln.testing.utils import NodeFactory, BitcoinD, ElementsD, env, LightningNode, TEST_DEBUG, TEST_NETWORK, SLOW_MACHINE, VALGRIND
 from pyln.client import Millisatoshi
 from typing import Dict
+from pathlib import Path
 
 import json
 import jsonschema  # type: ignore
@@ -58,6 +59,9 @@ def setup_logging():
     if TEST_DEBUG:
         logging.basicConfig(level=logging.DEBUG, stream=sys.stdout)
 
+    if env("TEST_LOG_IGNORE_ERRORS", "0") == "1":
+        logging.raiseExceptions = False
+
     yield
 
     loggers = [logging.getLogger()] + list(logging.Logger.manager.loggerDict.values())
@@ -74,7 +78,6 @@ def directory(request, test_base_dir, test_name):
     This makes a unique test-directory even if a test is rerun multiple times.
 
     """
-    global __attempts
     # Auto set value if it isn't in the dict yet
     __attempts[test_name] = __attempts.get(test_name, 0) + 1
     directory = os.path.join(test_base_dir, "{}_{}".format(test_name, __attempts[test_name]))
@@ -125,36 +128,40 @@ def node_cls():
 
 
 @pytest.fixture
-def bitcoind(directory, teardown_checks):
+def bitcoind(request, directory, teardown_checks):
     chaind = network_daemons[env('TEST_NETWORK', 'regtest')]
     bitcoind = chaind(bitcoin_dir=directory)
 
-    try:
-        bitcoind.start()
-    except Exception:
-        bitcoind.stop()
-        raise
+    # @pytest.mark.parametrize('bitcoind', [False], indirect=True) if you don't
+    # want bitcoind started!
+    if getattr(request, 'param', True):
+        try:
+            bitcoind.start()
+        except Exception:
+            bitcoind.stop()
+            raise
 
-    info = bitcoind.rpc.getnetworkinfo()
+        info = bitcoind.rpc.getnetworkinfo()
 
-    # FIXME: include liquid-regtest in this check after elementsd has been
-    # updated
-    if info['version'] < 200100 and env('TEST_NETWORK') != 'liquid-regtest':
-        bitcoind.rpc.stop()
-        raise ValueError("bitcoind is too old. At least version 20100 (v0.20.1)"
-                         " is needed, current version is {}".format(info['version']))
-    elif info['version'] < 160000:
-        bitcoind.rpc.stop()
-        raise ValueError("elementsd is too old. At least version 160000 (v0.16.0)"
-                         " is needed, current version is {}".format(info['version']))
+        # FIXME: include liquid-regtest in this check after elementsd has been
+        # updated
+        if info['version'] < 200100 and env('TEST_NETWORK') != 'liquid-regtest':
+            bitcoind.rpc.stop()
+            raise ValueError("bitcoind is too old. At least version 20100 (v0.20.1)"
+                             " is needed, current version is {}".format(info['version']))
+        elif info['version'] < 160000:
+            bitcoind.rpc.stop()
+            raise ValueError("elementsd is too old. At least version 160000 (v0.16.0)"
+                             " is needed, current version is {}".format(info['version']))
 
-    info = bitcoind.rpc.getblockchaininfo()
-    # Make sure we have some spendable funds
-    if info['blocks'] < 101:
-        bitcoind.generate_block(101 - info['blocks'])
-    elif bitcoind.rpc.getwalletinfo()['balance'] < 1:
-        logging.debug("Insufficient balance, generating 1 block")
-        bitcoind.generate_block(1)
+        info = bitcoind.rpc.getblockchaininfo()
+
+        # Make sure we have some spendable funds
+        if info['blocks'] < 101:
+            bitcoind.generate_block(101 - info['blocks'])
+        elif bitcoind.rpc.getwalletinfo()['balance'] < 1:
+            logging.debug("Insufficient balance, generating 1 block")
+            bitcoind.generate_block(1)
 
     yield bitcoind
 
@@ -407,6 +414,17 @@ def _extra_validator(is_request: bool):
             return True
         return False
 
+    def is_string_map(checker, instance):
+        """key, value map with strings"""
+        if not checker.is_type(instance, "object"):
+            return False
+        for k, v in instance.items():
+            if not checker.is_type(k, "string"):
+                return False
+            if not checker.is_type(v, "string"):
+                return False
+        return True
+
     # "msat" for request can be many forms
     if is_request:
         is_msat = is_msat_request
@@ -435,6 +453,7 @@ def _extra_validator(is_request: bool):
         "outpoint": is_outpoint,
         "feerate": is_feerate,
         "outputdesc": is_outputdesc,
+        "string_map": is_string_map,
     })
 
     return jsonschema.validators.extend(jsonschema.Draft7Validator,
@@ -494,9 +513,10 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
 
     map_node_error(nf.nodes, printValgrindErrors, "reported valgrind errors")
     map_node_error(nf.nodes, printCrashLog, "had crash.log files")
-    map_node_error(nf.nodes, checkBroken, "had BROKEN messages")
+    map_node_error(nf.nodes, checkBroken, "had BROKEN or That's weird messages")
     map_node_error(nf.nodes, lambda n: not n.allow_warning and n.daemon.is_in_log(r' WARNING:'), "had warning messages")
     map_node_error(nf.nodes, checkReconnect, "had unexpected reconnections")
+    map_node_error(nf.nodes, checkPluginJSON, "had malformed hooks/notifications")
 
     # On any bad gossip complaints, print out every nodes' gossip_store
     if map_node_error(nf.nodes, checkBadGossip, "had bad gossip messages"):
@@ -510,6 +530,9 @@ def node_factory(request, directory, test_name, bitcoind, executor, db_provider,
     map_node_error(nf.nodes, lambda n: n.rc != 0 and not n.may_fail, "Node exited with return code {n.rc}")
     if not ok:
         map_node_error(nf.nodes, prinErrlog, "some node failed unexpected, non-empty errlog file")
+
+    for n in nf.nodes:
+        n.daemon.cleanup_files()
 
 
 def getErrlog(node):
@@ -608,13 +631,68 @@ def checkBadGossip(node):
 
 def checkBroken(node):
     node.daemon.logs_catchup()
-    broken_lines = [l for l in node.daemon.logs if '**BROKEN**' in l]
+    broken_lines = [l for l in node.daemon.logs if '**BROKEN**' in l or "That's weird: " in l]
     if node.broken_log:
         ex = re.compile(node.broken_log)
         broken_lines = [l for l in broken_lines if not ex.search(l)]
+    # Valgrind under CI can be really slow, so we get spurious alerts
+    if SLOW_MACHINE and VALGRIND:
+        slowreq = re.compile("That's weird: Request .* took [0-9]* milliseconds")
+        broken_lines = [l for l in broken_lines if not slowreq.search(l)]
     if broken_lines:
         print(broken_lines)
         return 1
+    return 0
+
+
+def checkPluginJSON(node):
+    if node.bad_notifications:
+        return 0
+
+    try:
+        notificationfiles = os.listdir('doc/schemas/notification')
+    except FileNotFoundError:
+        notificationfiles = []
+
+    notifications = {}
+    for fname in notificationfiles:
+        if fname.endswith('.json'):
+            base = fname.replace('.json', '')
+            # Request is 0 and Response is 1
+            notifications[base] = _load_schema(os.path.join('doc/schemas/notification', fname))
+
+    # FIXME: add doc/schemas/hook/
+    hooks = {}
+
+    for f in (Path(node.daemon.lightning_dir) / "plugin-io").iterdir():
+        # e.g. hook_in-peer_connected-124567-358
+        io = json.loads(f.read_text())
+        parts = f.name.split('-')
+        if parts[0] == 'hook_in':
+            schema = hooks.get(parts[1])
+            req = io['result']
+            direction = 1
+        elif parts[0] == 'hook_out':
+            schema = hooks.get(parts[1])
+            req = io['params']
+            direction = 0
+        else:
+            assert parts[0] == 'notification_out'
+            schema = notifications.get(parts[1])
+            # The notification is wrapped in an object of its own name.
+            req = io['params'][parts[1]]
+            direction = 1
+
+        # Until v26.09, with channel_state_changed.null_scid, that notification will be non-schema compliant.
+        if f.name.startswith('notification_out-channel_state_changed-') and node.daemon.opts.get('allow-deprecated-apis', True) is True:
+            continue
+
+        if schema is not None:
+            try:
+                schema[direction].validate(req)
+            except jsonschema.exceptions.ValidationError as e:
+                print(f"Failed validating {f}: {e}")
+                return 1
     return 0
 
 

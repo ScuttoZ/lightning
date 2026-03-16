@@ -6,9 +6,14 @@
 #include <tests/fuzz/libfuzz.h>
 
 /* Include bolt12.c directly, to gain access to string_to_data(). */
-#include "../../common/bolt12.c"
+  #include "../../common/bolt12.c"
 
-void init(int *argc, char ***argv) { common_setup("fuzzer"); }
+void init(int *argc, char ***argv)
+{
+	/* Don't call this if we're in unit-test mode, as libfuzz.c does it */
+	if (!tmpctx)
+		common_setup("fuzzer");
+}
 
 void run(const u8 *data, size_t size)
 {

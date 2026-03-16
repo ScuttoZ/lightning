@@ -1,18 +1,16 @@
 /* This contains the code which actively seeks out gossip from peers */
 #include "config.h"
-#include <bitcoin/chainparams.h>
-#include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
 #include <ccan/intmap/intmap.h>
 #include <ccan/tal/str/str.h>
+#include <common/clock_time.h>
 #include <common/daemon_conn.h>
 #include <common/decode_array.h>
 #include <common/gossmap.h>
 #include <common/memleak.h>
-#include <common/pseudorand.h>
-#include <common/random_select.h>
 #include <common/status.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <gossipd/gossipd.h>
 #include <gossipd/gossipd_wiregen.h>
 #include <gossipd/gossmap_manage.h>
@@ -245,7 +243,7 @@ static void enable_gossip_stream(struct seeker *seeker, struct peer *peer,
 		start = 0;
 	} else {
 		/* Just in case they care */
-		start = time_now().ts.tv_sec - GOSSIP_SEEKER_INTERVAL(seeker) * 10;
+		start = clock_time().ts.tv_sec - GOSSIP_SEEKER_INTERVAL(seeker) * 10;
 	}
 
 	status_peer_debug(&peer->id, "seeker: starting gossip (%s)",

@@ -1,7 +1,6 @@
 #ifndef LIGHTNING_BITCOIN_SHORT_CHANNEL_ID_H
 #define LIGHTNING_BITCOIN_SHORT_CHANNEL_ID_H
 #include "config.h"
-#include <ccan/compiler/compiler.h>
 #include <ccan/short_types/short_types.h>
 #include <ccan/tal/tal.h>
 #include <common/gossip_constants.h>
@@ -18,7 +17,7 @@ static inline bool short_channel_id_eq(struct short_channel_id a,
 	return a.u64 == b.u64;
 }
 
-static inline size_t short_channel_id_hash(struct short_channel_id scid)
+static inline size_t hash_scid(struct short_channel_id scid)
 {
 	/* scids cost money to generate, so simple hash works here */
 	return (scid.u64 >> 32) ^ (scid.u64 >> 16) ^ scid.u64;
@@ -45,6 +44,12 @@ static inline bool short_channel_id_dir_eq(const struct short_channel_id_dir *a,
 					   const struct short_channel_id_dir *b)
 {
 	return short_channel_id_eq(a->scid, b->scid) && a->dir == b->dir;
+}
+
+static inline size_t hash_scidd(const struct short_channel_id_dir *scidd)
+{
+	/* Bottom bit is common, so use bit 4 for direction */
+	return hash_scid(scidd->scid) | (scidd->dir << 4);
 }
 
 static inline u32 short_channel_id_blocknum(struct short_channel_id scid)
@@ -98,4 +103,6 @@ void towire_short_channel_id(u8 **pptr,
 			     struct short_channel_id short_channel_id);
 struct short_channel_id fromwire_short_channel_id(const u8 **cursor, size_t *max);
 
+/* Set to random bytes */
+struct short_channel_id random_scid(void);
 #endif /* LIGHTNING_BITCOIN_SHORT_CHANNEL_ID_H */

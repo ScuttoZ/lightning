@@ -16,7 +16,7 @@ on:
 jobs:
   deploy:
     name: Build and publish ${{ matrix.package }} 🐍
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
     strategy:
       fail-fast: true
@@ -64,38 +64,33 @@ jobs:
       with:
         python-version: '3.10'
 
-    - name: Install Poetry
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Update pyln versions
+      id: update-versions
       run: |
-        curl -sSL https://install.python-poetry.org | python3 -
-        echo "$HOME/.local/bin" >> $GITHUB_PATH
-        echo "PATH=$HOME/.local/bin:$PATH"
+        export VERSION=$(git describe --tags --abbrev=0)
+        echo "Pyln VERSION: $VERSION"
+        make update-pyln-versions NEW_VERSION=$VERSION
 
     - name: Publish distribution 📦 to Test PyPI
       if: github.repository == 'ElementsProject/lightning' && steps.set-values.outputs.DISTLOCATION == 'test'
       env:
-        POETRY_PYPI_TOKEN_TESTPYPI: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        UV_PUBLISH_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
         WORKDIR: ${{ matrix.WORKDIR }}
       run: |
-        echo "POETRY VERSION TEST: $(poetry --version)"
         echo "Pyln VERSION: $VERSION"
-        cd ${{ env.WORKDIR }}
-        python3 -m pip config set global.timeout 150
-        poetry config repositories.testpypi https://test.pypi.org/legacy/
-        make upgrade-version NEW_VERSION=$VERSION
-        poetry build  --no-interaction
-        poetry publish --repository testpypi --no-interaction --skip-existing
+        uv build --package ${{ matrix.PACKAGE }}
+        uv publish --publish-url https://test.pypi.org/legacy/ --check-url https://test.pypi.org/simple/
 
     - name: Publish distribution 📦 to PyPI
       if: github.repository == 'ElementsProject/lightning' && steps.set-values.outputs.DISTLOCATION == 'prod'
       env:
-        POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_API_TOKEN }}
+        UV_PUBLISH_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         WORKDIR: ${{ matrix.WORKDIR }}
       run: |
-        echo "POETRY VERSION PUBLISH: $(poetry --version)"
-        cd ${{ env.WORKDIR }}
-        export VERSION=$(git describe --tags --abbrev=0)
+        echo "UV VERSION PUBLISH: $(uv --version)"
         echo "Pyln VERSION: $VERSION"
-        make upgrade-version NEW_VERSION=$VERSION
-        python3 -m pip config set global.timeout 150
-        poetry build  --no-interaction
-        poetry publish --no-interaction
+        uv build --package ${{ matrix.PACKAGE }}
+        uv publish

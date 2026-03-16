@@ -1,8 +1,6 @@
 #ifndef LIGHTNING_LIGHTNINGD_OPENING_COMMON_H
 #define LIGHTNING_LIGHTNINGD_OPENING_COMMON_H
 #include "config.h"
-#include <bitcoin/pubkey.h>
-#include <common/amount.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
 #include <common/derive_basepoints.h>
@@ -103,6 +101,12 @@ struct funding_channel {
 	/* Place to stash the per-peer-state while we wait
 	 * for them to get back to us with signatures */
 	struct peer_fd *peer_fd;
+
+	/* Were we the one to publish the commitment/splicing tx? */
+	const struct wally_psbt *funding_psbt;
+
+	/* Were we told to withhold the commitment tx? */
+	bool withheld;
 };
 
 struct uncommitted_channel *new_uncommitted_channel(struct peer *peer);

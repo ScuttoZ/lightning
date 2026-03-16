@@ -1,5 +1,5 @@
 #! /usr/bin/make
-TOOLS := tools/hsmtool tools/check-bolt
+TOOLS := tools/lightning-hsmtool tools/lightning-downgrade
 TOOLS_SRC := $(TOOLS:=.c)
 TOOLS_OBJ := $(TOOLS_SRC:.c=.o)
 
@@ -8,24 +8,34 @@ ALL_C_SOURCES += $(TOOLS_SRC)
 ALL_C_HEADERS +=
 ALL_PROGRAMS += $(TOOLS)
 
-TOOLS_COMMON_OBJS = common/utils.o
-
 # We force make to relink this every time, to detect version changes.
 # Do it atomically, otherwise parallel builds can get upset!
 tools/headerversions: $(FORCE) tools/headerversions.o libccan.a
 	@trap "rm -f $@.tmp.$$$$" EXIT; $(LINK.o) tools/headerversions.o libccan.a $(LOADLIBES) $(LDLIBS) -o $@.tmp.$$$$ && mv -f $@.tmp.$$$$ $@
 
+$(TOOLS): libcommon.a
+
 tools/headerversions.o: ccan/config.h
-tools/check-bolt: tools/check-bolt.o $(TOOLS_COMMON_OBJS)
+tools/lightning-hsmtool: tools/lightning-hsmtool.o
+tools/lightning-downgrade.o: CFLAGS:=$(CFLAGS) -DCLN_PREV_VERSION=$(CLN_PREV_VERSION)
 
-tools/hsmtool: tools/hsmtool.o $(TOOLS_COMMON_OBJS) $(BITCOIN_OBJS) common/amount.o common/autodata.o common/bech32.o common/bech32_util.o common/bigsize.o common/codex32.o common/configdir.o common/configvar.o common/derive_basepoints.o common/descriptor_checksum.o common/hsm_encryption.o common/node_id.o common/version.o wire/fromwire.o wire/towire.o
+tools/lightning-downgrade:			\
+	db/exec.o				\
+	db/bindings.o				\
+	db/utils.o				\
+	wallet/datastore.o			\
+	wallet/migrations.o			\
+	plugins/askrene/datastore_wire.o	\
+	$(DB_OBJS)				\
+	$(WALLET_DB_QUERIES:.c=.o)		\
+	tools/lightning-downgrade.o
 
-tools/lightning-hsmtool: tools/hsmtool
-	cp $< $@
+update-mocks: $(tools/lightning-downgrade.c:%=update-mocks/%.c)
 
 clean: tools-clean
 
 tools-clean:
+	$(RM) $(TOOLS) $(TOOLS_OBJ)
 	$(RM) tools/headerversions
 	$(RM) tools/headerversions.o
 

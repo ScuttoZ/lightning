@@ -3,10 +3,19 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 export RUST_VERSION=stable
 
-sudo useradd -ms /bin/bash tester
-sudo apt-get update -qq
+sudo mkdir -p /var/cache/apt/archives
+mkdir -p ~/ci-cache/apt/
+sudo cp -a ~/ci-cache/apt/. /var/cache/apt/archives/ 2>/dev/null || true
 
-sudo apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
+sudo apt-get update
+
+# Install eatmydata, then use it for the rest.
+sudo apt-get install --no-install-recommends --allow-unauthenticated -yy \
+     -o APT::Keep-Downloaded-Packages=true \
+     eatmydata
+
+sudo eatmydata apt-get install --no-install-recommends --allow-unauthenticated -yy \
+    -o APT::Keep-Downloaded-Packages=true \
      autoconf \
      automake \
      binfmt-support \
@@ -14,7 +23,6 @@ sudo apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
      clang \
      cppcheck \
      docbook-xml \
-     eatmydata \
      gcc-aarch64-linux-gnu \
      gcc-arm-linux-gnueabihf \
      gcc-arm-none-eabi \
@@ -30,19 +38,21 @@ sudo apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
      libicu-dev \
      libpq-dev \
      libprotobuf-c-dev \
+     libsodium-dev \
      libsqlite3-dev \
      libssl-dev \
+     pkg-config \
      libtool \
      libxml2-utils \
      locales \
+     lowdown \
      net-tools \
      postgresql \
-     python-pkg-resources \
      python3 \
      python3-dev \
      python3-pip \
      python3-setuptools \
-     qemu \
+     qemu-system \
      qemu-system-arm \
      qemu-user-static \
      shellcheck \
@@ -50,9 +60,11 @@ sudo apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
      sudo \
      tcl \
      tclsh \
+     tshark \
      unzip \
      valgrind \
      wget \
+     wireshark-common \
      xsltproc \
      systemtap-sdt-dev \
      zlib1g-dev
@@ -60,10 +72,14 @@ sudo apt-get -qq install --no-install-recommends --allow-unauthenticated -yy \
 echo "tester ALL=(root) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/tester
 sudo chmod 0440 /etc/sudoers.d/tester
 
-"$(dirname "$0")"/install-bitcoind.sh
+"$(dirname "$0")"/install-bitcoind.sh ~/ci-cache/
 
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
      -y --default-toolchain ${RUST_VERSION}
+
+uv sync --all-extras --all-groups
+# required for reckless till poetry to uv migration
+uv tool install poetry
 
 # We also need a relatively recent protobuf-compiler, at least 3.12.0,
 # in order to support the experimental `optional` flag.
@@ -72,25 +88,41 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- \
 # which comes from the same tree.  Makes sense!
 
 # And
-#   grpcio-tools-1.54.0` requires `protobuf = ">=4.21.6,<5.0dev"`
+#   grpcio-tools-1.69.0` requires `protobuf = ">=5.26.1,<6.0dev"`
 
 # Now, protoc changed to date-based releases, BUT Python protobuf
 # didn't, so Python protobuf 4.21.12 (in Ubuntu 23.04) corresponds to
 # protoc 21.12 (which, FYI, is packaged in Ubuntu as version 3.21.12).
 
-# So we're going to nail these versions as 21.12, which is what recent
-# Ubuntu has, and hopefully everyone else can get.  And this means that
-# When CI checks that no files have changed under regeneration, you won't
-# get a fail just because the dev's protoc is a different version.
+# In general protobuf version x.y.z corresponds to protoc version y.z
 
 # Honorable mention go to Matt Whitlock for spelunking this horror with me!
 
-PROTOC_VERSION=21.12
+PROTOC_VERSION=29.4
 PB_REL="https://github.com/protocolbuffers/protobuf/releases"
-curl -LO $PB_REL/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip
-sudo unzip protoc-${PROTOC_VERSION}-linux-x86_64.zip -d /usr/local/
+PROTOC_ZIP=protoc-${PROTOC_VERSION}-linux-x86_64.zip
+if [ ! -f ~/ci-cache/$PROTOC_ZIP ]; then
+    curl -LO $PB_REL/download/v${PROTOC_VERSION}/$PROTOC_ZIP
+    # Check it before we commit it to the cache!
+    unzip -t $PROTOC_ZIP
+    cp $PROTOC_ZIP ~/ci-cache/
+fi
+sudo unzip ~/ci-cache/$PROTOC_ZIP -d /usr/local/
 sudo chmod a+x /usr/local/bin/protoc
 export PROTOC=/usr/local/bin/protoc
 export PATH=$PATH:/usr/local/bin
 env
 ls -lha /usr/local/bin
+
+# wireshark-common normally does this, but GH runners are special, so we
+# do it explicitly
+sudo groupadd -f wireshark
+sudo chgrp wireshark /usr/bin/dumpcap
+sudo chmod 750 /usr/bin/dumpcap
+sudo setcap cap_net_raw,cap_net_admin=eip /usr/bin/dumpcap
+
+# Add ourselves to the wireshark group (still need "sg wireshark..." for it to take effect)
+sudo usermod -aG wireshark "$(id -nu)"
+
+# Copy archives back for caching
+cp /var/cache/apt/archives/*.deb ~/ci-cache/apt/ || true

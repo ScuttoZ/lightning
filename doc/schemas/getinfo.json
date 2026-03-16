@@ -376,7 +376,7 @@
     "- -32602: Error in given parameters or some error happened during the command process."
   ],
   "author": [
-    "Vincenzo Palazzo <<vincenzo.palazzo@protonmail.com>> wrote the initial version of this man page,",
+    "Vincenzo Palazzo [vincenzo.palazzo@protonmail.com](mailto:vincenzo.palazzo@protonmail.com) wrote the initial version of this man page,",
     "but many others did the hard work of actually implementing this rpc command."
   ],
   "see_also": [
@@ -385,7 +385,7 @@
     "lightning-listconfigs(7)"
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {
@@ -410,14 +410,14 @@
             "port": 19735
           }
         ],
-        "version": "v25.02",
+        "version": "v25.05",
         "blockheight": 110,
         "network": "regtest",
         "fees_collected_msat": 0,
         "lightning-dir": "/tmp/.lightning/regtest",
         "our_features": {
-          "init": "08a0882a8a59a1",
-          "node": "88a0882a8a59a1",
+          "init": "0898882a8a59a1",
+          "node": "8898882a8a59a1",
           "channel": "",
           "invoice": "02000002024100"
         }

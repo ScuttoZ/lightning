@@ -1,27 +1,20 @@
 #include "config.h"
-#include <bitcoin/chainparams.h>
 #include <ccan/array_size/array_size.h>
-#include <ccan/asort/asort.h>
 #include <ccan/cast/cast.h>
-#include <ccan/crypto/siphash24/siphash24.h>
-#include <ccan/htable/htable_type.h>
-#include <ccan/json_out/json_out.h>
-#include <ccan/str/hex/hex.h>
 #include <ccan/tal/str/str.h>
 #include <common/bolt12_merkle.h>
+#include <common/clock_time.h>
+#include <common/features.h>
 #include <common/gossmap.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
-#include <common/pseudorand.h>
 #include <plugins/channel_hint.h>
 #include <plugins/libplugin-pay.h>
-#include <plugins/libplugin.h>
 #include <stdio.h>
 
 /* Public key of this node. */
 static struct node_id my_id;
-static unsigned int maxdelay_default;
 static bool disablempp = false;
 static struct channel_hint_set *global_hints;
 
@@ -150,7 +143,7 @@ static void paystatus_add_payment(struct json_stream *s, const struct payment *p
 		json_add_string(s, "strategy", p->why);
 	json_add_string(s, "start_time", timestr);
 	json_add_u64(s, "age_in_seconds",
-		     time_to_sec(time_between(time_now(), p->start_time)));
+		     time_to_sec(time_between(clock_time(), p->start_time)));
 
 	/* Any final state will have an end time. */
 	if (p->step >= PAYMENT_STEP_SPLIT) {
@@ -633,22 +626,7 @@ static const char *init(struct command *init_cmd,
 	rpc_scan(init_cmd, "getinfo", take(json_out_obj(NULL, NULL, NULL)),
 		 "{id:%}", JSON_SCAN(json_to_node_id, &my_id));
 
-	/* BOLT #4:
-	 * ## `max_htlc_cltv` Selection
-	 *
-	 * This ... value is defined as 2016 blocks, based on historical value
-	 * deployed by Lightning implementations.
-	 */
-	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
-	maxdelay_default = 2016;
-
 	global_hints = notleak_with_children(channel_hint_set_new(init_cmd->plugin));
-
-	/* max-locktime-blocks deprecated in v24.05, but still grab it! */
-	rpc_scan(init_cmd, "listconfigs", take(json_out_obj(NULL, NULL, NULL)),
-		 "{configs:"
-		 "{max-locktime-blocks?:{value_int:%}}}",
-		 JSON_SCAN(json_to_number, &maxdelay_default));
 
 	plugin_set_memleak_handler(init_cmd->plugin, memleak_mark_payments);
 	return NULL;
@@ -1300,6 +1278,13 @@ static struct command_result *json_pay(struct command *cmd,
 	/* If any of the modifiers need to add params to the JSON-RPC call we
 	 * would add them to the `param()` call below, and have them be
 	 * initialized directly that way. */
+	/* BOLT #4:
+	 * ## `max_htlc_cltv` Selection
+	 *
+	 * This ... value is defined as 2016 blocks, based on historical value
+	 * deployed by Lightning implementations.
+	 */
+	/* FIXME: Typo in spec for CLTV in descripton!  But it breaks our spelling check, so we omit it above */
 	if (!param_check(cmd, buf, params,
 		   /* FIXME: parameter should be invstring now */
 		   p_req("bolt11", param_invstring, &b11str),
@@ -1311,7 +1296,7 @@ static struct command_result *json_pay(struct command *cmd,
 			 &maxfee_pct_millionths),
 		   p_opt_def("retry_for", param_number, &retryfor, 60),
 		   p_opt_def("maxdelay", param_number, &maxdelay,
-			     maxdelay_default),
+			     2016),
 		   p_opt("exemptfee", param_msat, &exemptfee),
 		   p_opt("localinvreqid", param_sha256, &local_invreq_id),
 		   p_opt("exclude", param_route_exclusion_array, &exclusions),
@@ -1424,7 +1409,7 @@ static struct command_result *json_pay(struct command *cmd,
 		p->payment_secret = NULL;
 	}
 
-	if (time_now().ts.tv_sec > invexpiry)
+	if (clock_time().ts.tv_sec > invexpiry)
 		return command_fail(cmd, PAY_INVOICE_EXPIRED, "Invoice expired");
 
 	if (invmsat) {
@@ -1475,12 +1460,10 @@ static struct command_result *json_pay(struct command *cmd,
 	}
 
 	p->local_id = &my_id;
-	p->json_buffer = buf;
-	p->json_toks = params;
 	p->why = "Initial attempt";
 	p->constraints.cltv_budget = *maxdelay;
 	tal_free(maxdelay);
-	p->deadline = timeabs_add(time_now(), time_from_sec(*retryfor));
+	p->deadline = timemono_add(time_mono(), time_from_sec(*retryfor));
 	tal_free(retryfor);
 	p->getroute->riskfactorppm = *riskfactor_millionths;
 	tal_free(riskfactor_millionths);
@@ -1549,7 +1532,7 @@ static struct command_result *handle_channel_hint_update(struct command *cmd,
 		   fmt_amount_msat(tmpctx, hint->estimated_capacity),
 		   fmt_amount_msat(tmpctx, hint->capacity)
 	);
-	channel_hint_set_add(global_hints, time_now().ts.tv_sec, &hint->scid,
+	channel_hint_set_add(global_hints, clock_time().ts.tv_sec, &hint->scid,
 			     hint->enabled, &hint->estimated_capacity,
 			     hint->capacity, NULL);
 	tal_free(hint);

@@ -19,15 +19,12 @@
 #include <ccan/tal/str/str.h>
 #include <common/billboard.h>
 #include <common/blockheight_states.h>
-#include <common/channel_type.h>
-#include <common/gossip_store.h>
 #include <common/initial_channel.h>
 #include <common/lease_rates.h>
 #include <common/memleak.h>
 #include <common/peer_billboard.h>
 #include <common/peer_failed.h>
 #include <common/peer_io.h>
-#include <common/peer_status_wiregen.h>
 #include <common/per_peer_state.h>
 #include <common/psbt_internal.h>
 #include <common/psbt_open.h>
@@ -38,9 +35,11 @@
 #include <common/wire_error.h>
 #include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
+#include <inttypes.h>
 #include <openingd/common.h>
 #include <openingd/dualopend_wiregen.h>
 #include <unistd.h>
+#include <wally_script.h>
 #include <wire/wire_sync.h>
 
 /* stdin == lightningd, 3 == peer, 4 = hsmd */
@@ -1673,6 +1672,8 @@ static u8 *opening_negotiate_msg(const tal_t *ctx, struct state *state)
 		case WIRE_UPDATE_FULFILL_HTLC:
 		case WIRE_UPDATE_FAIL_HTLC:
 		case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+		case WIRE_PROTOCOL_BATCH_ELEMENT:
+		case WIRE_START_BATCH:
 		case WIRE_COMMITMENT_SIGNED:
 		case WIRE_REVOKE_AND_ACK:
 		case WIRE_UPDATE_FEE:
@@ -2057,6 +2058,8 @@ static bool run_tx_interactive(struct state *state,
 		case WIRE_UPDATE_FULFILL_HTLC:
 		case WIRE_UPDATE_FAIL_HTLC:
 		case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+		case WIRE_PROTOCOL_BATCH_ELEMENT:
+		case WIRE_START_BATCH:
 		case WIRE_COMMITMENT_SIGNED:
 		case WIRE_REVOKE_AND_ACK:
 		case WIRE_UPDATE_FEE:
@@ -2434,30 +2437,30 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 	 *     - if `type` is not suitable.
 	 *     - if `type` includes `option_zeroconf` and it does not trust the sender to open an unconfirmed channel.
 	 */
-	if (open_tlv->channel_type) {
-		state->channel_type =
-			channel_type_accept(state,
-					    open_tlv->channel_type,
-					    state->our_features);
-		if (!state->channel_type) {
-			if (state->dev_accept_any_channel_type) {
-				status_unusual("dev-any-channel-type: accepting %s",
-					       fmt_featurebits(tmpctx,
-							       open_tlv->channel_type));
-				state->channel_type = channel_type_from(state, open_tlv->channel_type);
-			} else {
-				negotiation_failed(state,
-						   "Did not support channel_type [%s]",
-						   fmt_featurebits(tmpctx,
-								   open_tlv->channel_type));
-				return;
-			}
+	if (!open_tlv->channel_type) {
+		negotiation_failed(state,
+				   "open_channel2 missing channel_type");
+		return;
+	}
+
+	state->channel_type =
+		channel_type_accept(state,
+				    open_tlv->channel_type,
+				    state->our_features);
+	if (!state->channel_type) {
+		if (state->dev_accept_any_channel_type) {
+			status_unusual("dev-any-channel-type: accepting %s",
+				       fmt_featurebits(tmpctx,
+						       open_tlv->channel_type));
+			state->channel_type = channel_type_from(state, open_tlv->channel_type);
+		} else {
+			negotiation_failed(state,
+					   "Did not support channel_type [%s]",
+					   fmt_featurebits(tmpctx,
+							   open_tlv->channel_type));
+			return;
 		}
-	} else
-		state->channel_type
-			= default_channel_type(state,
-					       state->our_features,
-					       state->their_features);
+	}
 
 	/* Since anchor outputs are optional, we
 	 * only support liquidity ads if those are enabled. */
@@ -2528,7 +2531,8 @@ static void accepter_start(struct state *state, const u8 *oc2_msg)
 					 state->upfront_shutdown_script[REMOTE],
 					 state->requested_lease,
 					 tx_state->blockheight,
-					 state->require_confirmed_inputs[REMOTE]);
+					 state->require_confirmed_inputs[REMOTE],
+					 state->channel_type);
 
 	wire_sync_write(REQ_FD, take(msg));
 	msg = wire_sync_read(tmpctx, REQ_FD);
@@ -2790,7 +2794,6 @@ static u8 *opener_commits(struct state *state,
 			  struct amount_sat total,
 			  char **err_reason)
 {
-	struct channel_id cid;
 	struct amount_msat our_msats;
 	struct penalty_base *pbase;
 	struct bitcoin_tx *local_commit;
@@ -2849,7 +2852,7 @@ static u8 *opener_commits(struct state *state,
 
 	tal_free(state->channel);
 	state->channel = new_initial_channel(state,
-					     &cid,
+					     &state->channel_id,
 					     &tx_state->funding,
 					     state->minimum_depth,
 					     take(new_height_states(NULL, LOCAL,
@@ -2961,7 +2964,6 @@ static void opener_start(struct state *state, u8 *msg)
 	struct amount_sat *requested_lease;
 	size_t locktime;
 	u32 nonanchor_feerate, anchor_feerate;
-	struct channel_type *ctype;
 
 	if (!fromwire_dualopend_opener_init(state, msg,
 					    &tx_state->psbt,
@@ -2975,7 +2977,7 @@ static void opener_start(struct state *state, u8 *msg)
 					    &requested_lease,
 					    &tx_state->blockheight,
 					    &dry_run,
-					    &ctype,
+					    &state->channel_type,
 					    &expected_rates))
 		master_badmsg(WIRE_DUALOPEND_OPENER_INIT, msg);
 
@@ -2983,22 +2985,6 @@ static void opener_start(struct state *state, u8 *msg)
 	wally_psbt_get_locktime(tx_state->psbt, &locktime);
 	tx_state->tx_locktime = locktime;
 	open_tlv = tlv_opening_tlvs_new(tmpctx);
-
-	/* BOLT #2:
-	 *  - if it includes `channel_type`:
-	 *     - MUST set it to a defined type representing the type it wants.
-	 *     - MUST use the smallest bitmap possible to represent the channel
-	 *       type.
-	 *     - SHOULD NOT set it to a type containing a feature which was not
-	 *       negotiated.
-	 */
-	if (ctype) {
-		state->channel_type = ctype;
-	} else {
-		state->channel_type = default_channel_type(state,
-							   state->our_features,
-							   state->their_features);
-	}
 	open_tlv->channel_type = state->channel_type->features;
 
 	/* Given channel type, which feerate do we use? */
@@ -3164,9 +3150,13 @@ static void opener_start(struct state *state, u8 *msg)
 	 *   `open_channel`, and they are not equal types:
 	 *    - MUST fail the channel.
 	 */
-	if (a_tlv->channel_type
-	    && !featurebits_eq(a_tlv->channel_type,
-			       state->channel_type->features)) {
+	if (!a_tlv->channel_type) {
+		negotiation_failed(state,
+				   "Missing channel_type in accept_channel2");
+		return;
+	}
+	if (!featurebits_eq(a_tlv->channel_type,
+			    state->channel_type->features)) {
 		negotiation_failed(state,
 				   "Return unoffered channel_type: %s",
 				   fmt_featurebits(tmpctx,
@@ -3995,8 +3985,11 @@ static void do_reconnect_dance(struct state *state)
 	 *   - MUST NOT set `next_funding_txid`.
 	 */
 	tlvs = tlv_channel_reestablish_tlvs_new(tmpctx);
-	if (!tx_state->remote_funding_sigs_rcvd)
-		tlvs->next_funding = &tx_state->funding.txid;
+	if (!tx_state->remote_funding_sigs_rcvd) {
+		tlvs->next_funding = talz(tlvs, struct tlv_channel_reestablish_tlvs_next_funding);
+		tlvs->next_funding->next_funding_txid = tx_state->funding.txid;
+		tlvs->next_funding->retransmit_flags = 1; /* COMMITMENT_SIGNED */
+	}
 
 	msg = towire_channel_reestablish
 		(NULL, &state->channel_id, 1, 0,
@@ -4069,7 +4062,7 @@ static void do_reconnect_dance(struct state *state)
 	 */
 	if (tlvs->next_funding) {
 		/* Does this match ours? */
-		if (bitcoin_txid_eq(tlvs->next_funding, &tx_state->funding.txid)) {
+		if (bitcoin_txid_eq(&tlvs->next_funding->next_funding_txid, &tx_state->funding.txid)) {
 			bool send_our_sigs = true;
 			char *err;
 			/* We haven't gotten their tx_sigs */
@@ -4098,7 +4091,7 @@ static void do_reconnect_dance(struct state *state)
 			open_abort(state, "Sent next_funding_txid %s doesn't match ours %s",
 
 				   fmt_bitcoin_txid(tmpctx,
-						    tlvs->next_funding),
+						    &tlvs->next_funding->next_funding_txid),
 				   fmt_bitcoin_txid(tmpctx,
 						    &tx_state->funding.txid));
 			return;
@@ -4177,10 +4170,31 @@ static u8 *handle_master_in(struct state *state)
 	case WIRE_DUALOPEND_VALIDATE_LEASE:
 	case WIRE_DUALOPEND_VALIDATE_INPUTS:
 	case WIRE_DUALOPEND_UPDATE_REQUIRE_CONFIRMED:
+	case WIRE_DUALOPEND_GOT_ANNOUNCEMENT:
 		break;
 	}
 	status_failed(STATUS_FAIL_MASTER_IO,
 		      "Unknown msg %s", tal_hex(tmpctx, msg));
+}
+
+static void handle_announcement_signatures(struct state *state, const u8 *msg)
+{
+	struct channel_id chanid;
+	struct short_channel_id remote_scid;
+	secp256k1_ecdsa_signature remote_node_sig, remote_bitcoin_sig;
+
+	if (!fromwire_announcement_signatures(msg,
+					      &chanid,
+					      &remote_scid,
+					      &remote_node_sig,
+					      &remote_bitcoin_sig))
+		open_err_fatal(state, "Bad announcement_signatures %s", tal_hex(msg, msg));
+
+	wire_sync_write(REQ_FD,
+			take(towire_dualopend_got_announcement(NULL,
+							       remote_scid,
+							       &remote_node_sig,
+							       &remote_bitcoin_sig)));
 }
 
 /*~ Standard "peer sent a message, handle it" demuxer.  Though it really only
@@ -4209,6 +4223,9 @@ static u8 *handle_peer_in(struct state *state)
 		}
 		accepter_start(state, msg);
 		return NULL;
+	case WIRE_START_BATCH:
+		/* We ignore batch messages as we dont need them */
+		return NULL;
 	case WIRE_COMMITMENT_SIGNED:
 		handle_commit_signed(state, msg);
 		return NULL;
@@ -4225,6 +4242,9 @@ static u8 *handle_peer_in(struct state *state)
 		return NULL;
 	case WIRE_TX_ABORT:
 		handle_tx_abort(state, msg);
+		return NULL;
+	case WIRE_ANNOUNCEMENT_SIGNATURES:
+		handle_announcement_signatures(state, msg);
 		return NULL;
 		/* Otherwise we fall through */
 	case WIRE_INIT:
@@ -4244,7 +4264,6 @@ static u8 *handle_peer_in(struct state *state)
 	case WIRE_UPDATE_FEE:
 	case WIRE_UPDATE_BLOCKHEIGHT:
 	case WIRE_CHANNEL_REESTABLISH:
-	case WIRE_ANNOUNCEMENT_SIGNATURES:
 	case WIRE_GOSSIP_TIMESTAMP_FILTER:
 	case WIRE_ONION_MESSAGE:
 	case WIRE_ACCEPT_CHANNEL2:
@@ -4270,6 +4289,7 @@ static u8 *handle_peer_in(struct state *state)
 	case WIRE_SPLICE:
 	case WIRE_SPLICE_ACK:
 	case WIRE_SPLICE_LOCKED:
+	case WIRE_PROTOCOL_BATCH_ELEMENT:
 		break;
 	}
 
@@ -4316,7 +4336,7 @@ static void fetch_per_commitment_point(u32 point_count,
 
 int main(int argc, char *argv[])
 {
-	common_setup(argv[0]);
+	setup_locale();
 
 	struct pollfd pollfd[2];
 	struct state *state = tal(NULL, struct state);

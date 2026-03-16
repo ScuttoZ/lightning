@@ -263,6 +263,18 @@ WARN_UNUSED_RESULT bool amount_msat_accumulate(struct amount_msat *a,
 	return amount_msat_add(a, *a, b);
 }
 
+WARN_UNUSED_RESULT bool amount_msat_deduct(struct amount_msat *a,
+					       struct amount_msat b)
+{
+	return amount_msat_sub(a, *a, b);
+}
+
+WARN_UNUSED_RESULT bool amount_msat_deduct_sat(struct amount_msat *a,
+					       struct amount_sat b)
+{
+	return amount_msat_sub_sat(a, *a, b);
+}
+
 WARN_UNUSED_RESULT bool amount_msat_sub(struct amount_msat *val,
 					struct amount_msat a,
 					struct amount_msat b)
@@ -336,6 +348,9 @@ WARN_UNUSED_RESULT bool amount_msat_scale(struct amount_msat *val,
 					  struct amount_msat msat,
 					  double scale)
 {
+	if (scale != scale || scale < 0)
+		return false;
+
 	double scaled = msat.millisatoshis * scale;
 
 	/* If mantissa is < 64 bits, a naive "if (scaled >
@@ -350,6 +365,9 @@ WARN_UNUSED_RESULT bool amount_sat_scale(struct amount_sat *val,
 					 struct amount_sat sat,
 					 double scale)
 {
+	if (scale != scale || scale < 0)
+		return false;
+
 	double scaled = sat.satoshis * scale;
 
 	/* If mantissa is < 64 bits, a naive "if (scaled >
@@ -529,6 +547,13 @@ u64 amount_msat_ratio_ceil(struct amount_msat a, struct amount_msat b)
 struct amount_msat amount_msat_div(struct amount_msat msat, u64 div)
 {
 	msat.millisatoshis /= div;
+	return msat;
+}
+
+struct amount_msat amount_msat_div_ceil(struct amount_msat msat, u64 div)
+{
+	u64 res = msat.millisatoshis / div;
+	msat.millisatoshis = res + (div * res == msat.millisatoshis ? 0 : 1);
 	return msat;
 }
 

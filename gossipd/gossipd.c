@@ -1,38 +1,32 @@
 /*~ Welcome to the gossip daemon: keeper of maps!
  *
- * This is the last "global" daemon; it has three purposes.
+ * This is the last "global" daemon; it has one main purpose: to
+ * maintain the append-only gossip_store file for other daemons and
+ * plugins to read the global network map.
  *
- * 1. To determine routes for payments when lightningd asks.
- * 2. The second purpose is to receive gossip from peers (via their
- *    per-peer daemons) and send it out to them.
- * 3. Talk to `connectd` to to answer address queries for nodes.
+ * To do this, it gets gossip messages forwarded from connectd, makes
+ * gossip queries to peers, and can ask connect out to random peers to
+ * get more gossip.
  *
  * The gossip protocol itself is fairly simple, but has some twists which
  * add complexity to this daemon.
  */
 #include "config.h"
-#include <ccan/cast/cast.h>
 #include <ccan/tal/str/str.h>
+#include <common/clock_time.h>
 #include <common/daemon_conn.h>
-#include <common/ecdh_hsmd.h>
-#include <common/lease_rates.h>
 #include <common/memleak.h>
-#include <common/pseudorand.h>
 #include <common/status.h>
 #include <common/subdaemon.h>
 #include <common/timeout.h>
+#include <common/utils.h>
 #include <common/wire_error.h>
-#include <common/wireaddr.h>
 #include <connectd/connectd_gossipd_wiregen.h>
-#include <errno.h>
-#include <gossipd/gossip_store.h>
-#include <gossipd/gossip_store_wiregen.h>
 #include <gossipd/gossipd.h>
 #include <gossipd/gossipd_wiregen.h>
 #include <gossipd/gossmap_manage.h>
 #include <gossipd/queries.h>
 #include <gossipd/seeker.h>
-#include <sodium/crypto_aead_chacha20poly1305.h>
 
 const struct node_id *peer_node_id(const struct peer *peer)
 {
@@ -244,6 +238,8 @@ static void handle_recv_gossip(struct daemon *daemon, const u8 *outermsg)
 	case WIRE_UPDATE_FULFILL_HTLC:
 	case WIRE_UPDATE_FAIL_HTLC:
 	case WIRE_UPDATE_FAIL_MALFORMED_HTLC:
+	case WIRE_PROTOCOL_BATCH_ELEMENT:
+	case WIRE_START_BATCH:
 	case WIRE_COMMITMENT_SIGNED:
 	case WIRE_REVOKE_AND_ACK:
 	case WIRE_UPDATE_FEE:
@@ -286,6 +282,8 @@ handled_msg_errmsg:
 handled_msg:
 	if (err)
 		queue_peer_msg(daemon, &source, take(err));
+	/* We need to keep gossmap to reasonable size */
+	gossmap_manage_maybe_compact(daemon->gm);
 }
 
 /*~ connectd's input handler is very simple. */
@@ -372,51 +370,18 @@ static void master_or_connectd_gone(struct daemon_conn *dc UNUSED)
 	exit(2);
 }
 
-struct timeabs gossip_time_now(const struct daemon *daemon)
-{
-	if (daemon->dev_gossip_time)
-		return *daemon->dev_gossip_time;
-
-	return time_now();
-}
-
-/* We don't check this when loading from the gossip_store: that would break
- * our canned tests, and usually old gossip is better than no gossip */
-bool timestamp_reasonable(const struct daemon *daemon, u32 timestamp)
-{
-	u64 now = gossip_time_now(daemon).ts.tv_sec;
-
-	/* More than one day ahead? */
-	if (timestamp > now + 24*60*60)
-		return false;
-	/* More than 2 weeks behind? */
-	if (timestamp < now - GOSSIP_PRUNE_INTERVAL(daemon->dev_fast_gossip_prune))
-		return false;
-	return true;
-}
-
 /*~ Parse init message from lightningd: starts the daemon properly. */
 static void gossip_init(struct daemon *daemon, const u8 *msg)
 {
-	u32 *dev_gossip_time;
-
 	if (!fromwire_gossipd_init(daemon, msg,
-				     &chainparams,
-				     &daemon->our_features,
-				     &daemon->id,
-				     &dev_gossip_time,
-				     &daemon->dev_fast_gossip,
-				     &daemon->dev_fast_gossip_prune,
-				     &daemon->autoconnect_seeker_peers)) {
+				   &chainparams,
+				   &daemon->our_features,
+				   &daemon->id,
+				   &daemon->autoconnect_seeker_peers,
+				   &daemon->compactd_helper,
+				   &daemon->dev_fast_gossip,
+				   &daemon->dev_fast_gossip_prune)) {
 		master_badmsg(WIRE_GOSSIPD_INIT, msg);
-	}
-
-	if (dev_gossip_time) {
-		assert(daemon->developer);
-		daemon->dev_gossip_time = tal(daemon, struct timeabs);
-		daemon->dev_gossip_time->ts.tv_sec = *dev_gossip_time;
-		daemon->dev_gossip_time->ts.tv_nsec = 0;
-		tal_free(dev_gossip_time);
 	}
 
 	/* Gossmap manager starts up */
@@ -477,7 +442,6 @@ static void dev_gossip_memleak(struct daemon *daemon, const u8 *msg)
 	memleak_ptr(memtable, msg);
 	/* Now delete daemon and those which it has pointers to. */
 	memleak_scan_obj(memtable, daemon);
-	memleak_scan_htable(memtable, &daemon->peers->raw);
 	dev_seeker_memleak(memtable, daemon->seeker);
 	gossmap_manage_memleak(memtable, daemon->gm);
 
@@ -485,18 +449,6 @@ static void dev_gossip_memleak(struct daemon *daemon, const u8 *msg)
 	daemon_conn_send(daemon->master,
 			 take(towire_gossipd_dev_memleak_reply(NULL,
 							      found_leak)));
-}
-
-static void dev_gossip_set_time(struct daemon *daemon, const u8 *msg)
-{
-	u32 time;
-
-	if (!fromwire_gossipd_dev_set_time(msg, &time))
-		master_badmsg(WIRE_GOSSIPD_DEV_SET_TIME, msg);
-	if (!daemon->dev_gossip_time)
-		daemon->dev_gossip_time = tal(daemon, struct timeabs);
-	daemon->dev_gossip_time->ts.tv_sec = time;
-	daemon->dev_gossip_time->ts.tv_nsec = 0;
 }
 
 /*~ lightningd tells us when about a gossip message directly, when told to by
@@ -590,9 +542,9 @@ static struct io_plan *recv_req(struct io_conn *conn,
 			goto done;
 		}
 		/* fall thru */
-	case WIRE_GOSSIPD_DEV_SET_TIME:
+	case WIRE_GOSSIPD_DEV_COMPACT_STORE:
 		if (daemon->developer) {
-			dev_gossip_set_time(daemon, msg);
+			gossmap_manage_handle_dev_compact_store(daemon->gm, msg);
 			goto done;
 		}
 		/* fall thru */
@@ -603,6 +555,7 @@ static struct io_plan *recv_req(struct io_conn *conn,
 	case WIRE_GOSSIPD_INIT_REPLY:
 	case WIRE_GOSSIPD_GET_TXOUT:
 	case WIRE_GOSSIPD_DEV_MEMLEAK_REPLY:
+	case WIRE_GOSSIPD_DEV_COMPACT_STORE_REPLY:
 	case WIRE_GOSSIPD_ADDGOSSIP_REPLY:
 	case WIRE_GOSSIPD_NEW_BLOCKHEIGHT_REPLY:
 	case WIRE_GOSSIPD_REMOTE_CHANNEL_UPDATE:
@@ -629,19 +582,14 @@ int main(int argc, char *argv[])
 
 	daemon = tal(NULL, struct daemon);
 	daemon->developer = developer;
-	daemon->dev_gossip_time = NULL;
-	daemon->peers = tal(daemon, struct peer_node_id_map);
-	peer_node_id_map_init(daemon->peers);
+	daemon->peers = new_htable(daemon, peer_node_id_map);
 	daemon->deferred_txouts = tal_arr(daemon, struct short_channel_id, 0);
 	daemon->current_blockheight = 0; /* i.e. unknown */
-
-	/* Tell the ecdh() function how to talk to hsmd */
-	ecdh_hsmd_setup(HSM_FD, status_failed);
 
 	/* Note the use of time_mono() here.  That's a monotonic clock, which
 	 * is really useful: it can only be used to measure relative events
 	 * (there's no correspondence to time-since-Ken-grew-a-beard or
-	 * anything), but unlike time_now(), this will never jump backwards by
+	 * anything), but unlike time_now, this will never jump backwards by
 	 * half a second and leave me wondering how my tests failed CI! */
 	timers_init(&daemon->timers, time_mono());
 
@@ -664,8 +612,9 @@ int main(int argc, char *argv[])
 	}
 }
 
-/*~ Note that the actual routing stuff is in routing.c; you might want to
- * check that out later.
+/*~ Note that the production of the gossip_store file is in gossmap_manage.c
+ * and gossip_store.c, and the (highly optimized!)  read side is in
+ * common/gossmap.c; you might want to check those out later.
  *
  * But that's the last of the global daemons.  We now move on to the first of
  * the per-peer daemons: openingd/openingd.c.

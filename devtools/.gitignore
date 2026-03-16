@@ -21,3 +21,6 @@ fp16
 rune
 gossmap-compress
 bip137-verifysignature
+convert-gossmap
+features
+check-bolt

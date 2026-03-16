@@ -2,11 +2,6 @@
 #define LIGHTNING_PLUGINS_CHANNEL_HINT_H
 
 #include "config.h"
-#include <bitcoin/short_channel_id.h>
-#include <ccan/short_types/short_types.h>
-#include <ccan/time/time.h>
-#include <common/amount.h>
-#include <common/json_stream.h>
 #include <plugins/libplugin.h>
 
 /* Information about channels we inferred from a) looking at our channels, and
@@ -45,15 +40,13 @@ struct channel_hint {
 	struct amount_msat capacity;
 };
 
-size_t channel_hint_hash(const struct short_channel_id_dir *out);
-
 const struct short_channel_id_dir *channel_hint_keyof(const struct channel_hint *out);
 
 bool channel_hint_eq(const struct channel_hint *a,
 		     const struct short_channel_id_dir *b);
 
 HTABLE_DEFINE_NODUPS_TYPE(struct channel_hint, channel_hint_keyof,
-			  channel_hint_hash, channel_hint_eq, channel_hint_map)
+			  hash_scidd, channel_hint_eq, channel_hint_map)
 
 /* A collection of channel_hint instances, allowing us to handle and
  * update them more easily. */

@@ -3,6 +3,7 @@
 #include <ccan/bitmap/bitmap.h>
 #include <common/amount.h>
 #include <common/bolt11.h>
+#include <common/clock_time.h>
 #include <common/gossmods_listpeerchannels.h>
 #include <common/json_stream.h>
 #include <plugins/renepay/json.h>
@@ -679,7 +680,7 @@ static struct command_result *compute_routes_cb(struct payment *payment)
 			   __func__);
 
 	/* Remaining fee budget. */
-	if (!amount_msat_sub(&feebudget, feebudget, fees_spent))
+	if (!amount_msat_deduct(&feebudget, fees_spent))
 		feebudget = AMOUNT_MSAT(0);
 
 	/* How much are we still trying to send? */
@@ -752,10 +753,30 @@ REGISTER_PAYMENT_MODIFIER(compute_routes, compute_routes_cb);
  * request calling sendpay.
  */
 
-static struct command_result *send_routes_cb(struct payment *payment)
+static struct command_result *waitblockheight_done(struct command *cmd,
+						   const char *method UNUSED,
+						   const char *buf,
+						   const jsmntok_t *result,
+						   struct payment *payment)
 {
-	assert(payment);
-	struct routetracker *routetracker = payment->routetracker;
+	const char *err;
+	struct command *aux_cmd;
+	struct route *route;
+	struct routetracker *routetracker;
+
+	err = json_scan(tmpctx, buf, result, "{blockheight:%}",
+			JSON_SCAN(json_to_u32, &payment->blockheight));
+	payment->blockheight += 1;
+
+	if (err) {
+		plugin_err(pay_plugin->plugin,
+			   "Failed to read blockheight from waitblockheight "
+			   "response: %s",
+			   err);
+		return payment_continue(payment);
+	}
+
+	routetracker = payment->routetracker;
 	assert(routetracker);
 	if (!routetracker->computed_routes ||
 	    tal_count(routetracker->computed_routes) == 0) {
@@ -764,12 +785,11 @@ static struct command_result *send_routes_cb(struct payment *payment)
 			   __func__);
 		return payment_continue(payment);
 	}
-	struct command *cmd = payment_command(payment);
-	assert(cmd);
 	for (size_t i = 0; i < tal_count(routetracker->computed_routes); i++) {
-		struct route *route = routetracker->computed_routes[i];
+		aux_cmd = aux_command(cmd);
+		route = routetracker->computed_routes[i];
 
-		route_sendpay_request(cmd, take(route), payment);
+		route_sendpay_request(aux_cmd, take(route), payment);
 
 		payment_note(payment, LOG_INFORM,
 			     "Sent route request: partid=%" PRIu64
@@ -782,6 +802,22 @@ static struct command_result *send_routes_cb(struct payment *payment)
 	}
 	tal_resize(&routetracker->computed_routes, 0);
 	return payment_continue(payment);
+}
+
+static struct command_result *send_routes_cb(struct payment *payment)
+{
+	struct command *cmd;
+	struct out_req *req;
+	assert(payment);
+	cmd = payment_command(payment);
+	if (!cmd)
+		plugin_err(pay_plugin->plugin,
+			   "send_routes_pay_mod: cannot get a valid cmd.");
+	req =
+	    jsonrpc_request_start(cmd, "waitblockheight", waitblockheight_done,
+				  payment_rpc_failure, payment);
+	json_add_num(req->js, "blockheight", 0);
+	return send_outreq(req);
 }
 
 REGISTER_PAYMENT_MODIFIER(send_routes, send_routes_cb);
@@ -917,7 +953,7 @@ REGISTER_PAYMENT_MODIFIER(end, end_cb);
 
 static struct command_result *checktimeout_cb(struct payment *payment)
 {
-	if (time_after(time_now(), payment->payment_info.stop_time)) {
+	if (time_after(clock_time(), payment->payment_info.stop_time)) {
 		return payment_fail(payment, PAY_STOPPED_RETRYING, "Timed out");
 	}
 	return payment_continue(payment);
@@ -1129,7 +1165,7 @@ REGISTER_PAYMENT_MODIFIER(pendingsendpays, pendingsendpays_cb);
 
 static struct command_result *knowledgerelax_cb(struct payment *payment)
 {
-	const u64 now_sec = time_now().ts.tv_sec;
+	const u64 now_sec = clock_time().ts.tv_sec;
 	enum renepay_errorcode err = uncertainty_relax(
 	    pay_plugin->uncertainty, now_sec - pay_plugin->last_time);
 	if (err)

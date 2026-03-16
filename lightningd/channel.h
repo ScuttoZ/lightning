@@ -1,6 +1,8 @@
 #ifndef LIGHTNING_LIGHTNINGD_CHANNEL_H
 #define LIGHTNING_LIGHTNINGD_CHANNEL_H
 #include "config.h"
+#include <bitcoin/signature.h>
+#include <ccan/htable/htable_type.h>
 #include <common/channel_config.h>
 #include <common/channel_id.h>
 #include <common/channel_type.h>
@@ -85,6 +87,9 @@ struct channel_inflight {
 	 * for splices that need to coordinate `splice_locked` with their
 	 * peer through reconnect flows. */
 	struct short_channel_id *locked_scid;
+
+	/* Have I sent my peer my sigs? */
+	bool i_sent_sigs;
 
 	/* Note: This field is not stored in the database.
 	 *
@@ -214,6 +219,8 @@ struct channel {
 	bool remote_channel_ready;
 	/* Channel if locked locally. */
 	struct short_channel_id *scid;
+	/* Old scids if we were spliced */
+	struct short_channel_id *old_scids;
 
 	/* Alias used for option_zeroconf, or option_scid_alias, if
 	 * present. LOCAL are all the alias we told the peer about and
@@ -288,7 +295,7 @@ struct channel {
 	u32 feerate_base, feerate_ppm;
 
 	/* But allow these feerates/htlcs up until this time. */
-	struct timeabs old_feerate_timeout;
+	struct timemono old_feerate_timeout;
 	u32 old_feerate_base, old_feerate_ppm;
 	struct amount_msat old_htlc_minimum_msat, old_htlc_maximum_msat;
 
@@ -337,10 +344,6 @@ struct channel {
 	/* Lease commited max part per thousandth channel fee (ppm * 1000) */
 	u16 lease_chan_max_ppt;
 
-	/* `Channel-shell` of this channel
-	 * (Minimum information required to backup this channel). */
-	struct modern_scb_chan *scb;
-
 	/* Do we allow the peer to set any fee it wants? */
 	bool ignore_fee_limits;
 
@@ -353,6 +356,12 @@ struct channel {
 
 	/* Our change history. */
 	struct channel_state_change **state_changes;
+
+	/* Unsigned PSBT if we initiated the open channel */
+	const struct wally_psbt *funding_psbt;
+
+	/* Are we not broadcasting the open tx? */
+	bool withheld;
 };
 
 /* Is channel owned (and should be talking to peer) */
@@ -387,8 +396,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct amount_sat our_funds,
 			    bool remote_channel_ready,
 			    /* NULL or stolen */
-			    struct short_channel_id *scid STEALS,
-			    struct short_channel_id *alias_local STEALS,
+			    struct short_channel_id *scid TAKES,
+			    struct short_channel_id *old_scids TAKES,
+			    struct short_channel_id alias_local,
 			    struct short_channel_id *alias_remote STEALS,
 			    struct channel_id *cid,
 			    struct amount_msat our_msatoshi,
@@ -437,7 +447,9 @@ struct channel *new_channel(struct peer *peer, u64 dbid,
 			    struct peer_update *peer_update STEALS,
 			    u64 last_stable_connection,
 			    const struct channel_stats *stats,
-			    struct channel_state_change **state_changes STEALS);
+			    struct channel_state_change **state_changes STEALS,
+			    const struct wally_psbt *funding_psbt STEALS,
+			    bool withheld);
 
 /* new_inflight - Create a new channel_inflight for a channel */
 struct channel_inflight *new_inflight(struct channel *channel,
@@ -456,7 +468,8 @@ struct channel_inflight *new_inflight(struct channel *channel,
 	     const struct amount_sat lease_amt,
 	     s64 splice_amnt,
 	     bool i_am_initiator,
-	     bool force_sign_first);
+	     bool force_sign_first,
+	     bool i_sent_sigs);
 
 struct channel_state_change *new_channel_state_change(const tal_t *ctx,
 						      struct timeabs timestamp,
@@ -485,7 +498,12 @@ channel_current_inflight(const struct channel *channel);
 u32 channel_last_funding_feerate(const struct channel *channel);
 
 /* Only set completely_eliminate for never-existed channels */
-void delete_channel(struct channel *channel STEALS, bool completely_eliminate);
+void delete_channel(struct channel *channel STEALS,
+		    bool completely_eliminate);
+
+/* Add a historic (public) short_channel_id to this channel */
+void channel_add_old_scid(struct channel *channel,
+			  struct short_channel_id old_scid);
 
 const char *channel_state_name(const struct channel *channel);
 const char *channel_state_str(enum channel_state state);
@@ -772,6 +790,27 @@ static inline bool channel_state_open_uncommitted(enum channel_state state)
 	abort();
 }
 
+static inline size_t channel_dbid_hash(u64 dbid)
+{
+	return siphash24(siphash_seed(), &dbid, sizeof(dbid));
+}
+
+static u64 channel_dbid(const struct channel *channel)
+{
+	assert(channel->dbid);
+	return channel->dbid;
+}
+
+static bool channel_dbid_eq(const struct channel *channel, u64 dbid)
+{
+	return channel->dbid == dbid;
+}
+/* Defines struct channel_dbid_map */
+HTABLE_DEFINE_NODUPS_TYPE(struct channel,
+			  channel_dbid, channel_dbid_hash, channel_dbid_eq,
+			  channel_dbid_map);
+
+void add_channel_to_dbid_map(struct lightningd *ld, struct channel *channel);
 
 void channel_set_owner(struct channel *channel, struct subd *owner);
 
@@ -832,6 +871,35 @@ struct channel *peer_any_channel_bystate(struct peer *peer,
 					 bool *others);
 
 struct channel *channel_by_dbid(struct lightningd *ld, const u64 dbid);
+
+struct scid_to_channel {
+	struct short_channel_id scid;
+	struct channel *channel;
+};
+
+static inline const struct short_channel_id scid_to_channel_key(const struct scid_to_channel *scidchan)
+{
+	return scidchan->scid;
+}
+
+static inline bool scid_to_channel_eq_scid(const struct scid_to_channel *scidchan,
+					   struct short_channel_id scid)
+{
+	return short_channel_id_eq(scidchan->scid, scid);
+}
+
+/* Define channel_scid_map */
+HTABLE_DEFINE_NODUPS_TYPE(struct scid_to_channel,
+			  scid_to_channel_key,
+			  hash_scid,
+			  scid_to_channel_eq_scid,
+			  channel_scid_map);
+
+/* The only allowed way to set channel->scid */
+void channel_set_scid(struct channel *channel, const struct short_channel_id *new_scid);
+
+/* The only allowed way to set channel->alias[LOCAL] */
+void channel_set_local_alias(struct channel *channel, struct short_channel_id alias_scid);
 
 /* Includes both real scids and aliases.  If !privacy_leak_ok, then private
  * channels' real scids are not included. */
@@ -899,5 +967,9 @@ const u8 *channel_update_for_error(const tal_t *ctx,
 
 struct amount_msat htlc_max_possible_send(const struct channel *channel);
 
+/* Given features, what channel_type do we want? */
+struct channel_type *desired_channel_type(const tal_t *ctx,
+					  const struct feature_set *our_features,
+					  const u8 *their_features);
 
 #endif /* LIGHTNING_LIGHTNINGD_CHANNEL_H */

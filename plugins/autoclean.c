@@ -1,11 +1,12 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
-#include <ccan/ptrint/ptrint.h>
 #include <ccan/tal/str/str.h>
+#include <common/clock_time.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
+#include <inttypes.h>
 #include <plugins/libplugin.h>
 
 static u64 cycle_seconds = 3600;
@@ -19,7 +20,8 @@ enum subsystem_type {
 	FORWARDS,
 	PAYS,
 	INVOICES,
-#define NUM_SUBSYSTEM_TYPES (INVOICES + 1)
+	NETWORKEVENTS,
+#define NUM_SUBSYSTEM_TYPES (NETWORKEVENTS + 1)
 };
 
 enum subsystem_variant {
@@ -78,6 +80,10 @@ static struct per_variant *get_listforwards_variant(const char *buf,
 						    const jsmntok_t *t,
 						    struct per_subsystem *subsystem,
 						    u64 *timestamp);
+static struct per_variant *get_networkevent_variant(const char *buf,
+						    const jsmntok_t *t,
+						    struct per_subsystem *subsystem,
+						    u64 *timestamp);
 static void add_invoice_del_fields(struct out_req *req,
 				   const char *buf,
 				   const jsmntok_t *t);
@@ -87,6 +93,9 @@ static void add_sendpays_del_fields(struct out_req *req,
 static void add_forward_del_fields(struct out_req *req,
 				   const char *buf,
 				   const jsmntok_t *t);
+static void add_networkevent_del_fields(struct out_req *req,
+					const char *buf,
+					const jsmntok_t *t);
 
 static const struct subsystem_ops subsystem_ops[NUM_SUBSYSTEM_TYPES] = {
 	{ {"succeededforwards", "failedforwards"},
@@ -112,6 +121,14 @@ static const struct subsystem_ops subsystem_ops[NUM_SUBSYSTEM_TYPES] = {
 	  "delinvoice",
 	  get_listinvoices_variant,
 	  add_invoice_del_fields,
+	},
+	{ {"networkevents", NULL},
+	  "networkevents",
+	  "networkevents",
+	  "\"created_index\":true,\"timestamp\":true",
+	  "delnetworkevent",
+	  get_networkevent_variant,
+	  add_networkevent_del_fields,
 	},
 };
 
@@ -149,6 +166,8 @@ static bool json_to_subsystem(const char *buffer, const jsmntok_t *tok,
 {
 	*sv = first_sv();
 	do {
+		if (!subsystem_to_str(sv))
+			continue;
 		if (memeqstr(buffer + tok->start, tok->end - tok->start,
 			     subsystem_to_str(sv))) {
 			return true;
@@ -440,6 +459,23 @@ static struct per_variant *get_listforwards_variant(const char *buf,
 	return variant;
 }
 
+static struct per_variant *get_networkevent_variant(const char *buf,
+						    const jsmntok_t *t,
+						    struct per_subsystem *subsystem,
+						    u64 *timestamp)
+{
+	const jsmntok_t *timetok = json_get_member(buf, t, "timestamp");
+
+	if (!json_to_u64(buf, timetok, timestamp)) {
+		plugin_err(plugin, "Bad networkevent created_at '%.*s'",
+			   json_tok_full_len(t),
+			   json_tok_full(buf, t));
+	}
+
+	/* There's only one variant here, so use SUCCESS. */
+	return &subsystem->variants[SUCCESS];
+}
+
 static void add_invoice_del_fields(struct out_req *req,
 				   const char *buf,
 				   const jsmntok_t *t)
@@ -493,6 +529,15 @@ static void add_forward_del_fields(struct out_req *req,
 	json_add_tok(req->js, "status", status, buf);
 }
 
+static void add_networkevent_del_fields(struct out_req *req,
+					const char *buf,
+					const jsmntok_t *t)
+{
+	const jsmntok_t *created_index = json_get_member(buf, t, "created_index");
+
+	json_add_tok(req->js, "created_index", created_index, buf);
+}
+
 static struct command_result *list_done(struct command *cmd,
 					const char *method,
 					const char *buf,
@@ -502,7 +547,7 @@ static struct command_result *list_done(struct command *cmd,
 	const struct subsystem_ops *ops = get_subsystem_ops(subsystem);
 	const jsmntok_t *t, *inv = json_get_member(buf, result, ops->arr_name);
 	size_t i;
-	u64 now = time_now().ts.tv_sec;
+	u64 now = clock_time().ts.tv_sec;
 
 	json_for_each_arr(i, t, inv) {
 		struct per_variant *variant;
@@ -511,13 +556,11 @@ static struct command_result *list_done(struct command *cmd,
 
 		variant = ops->get_variant(buf, t, subsystem, &timestamp);
 		if (!variant) {
-			subsystem->num_uncleaned++;
 			continue;
 		}
 
 		/* Continue if we don't care. */
 		if (variant->age == 0) {
-			subsystem->num_uncleaned++;
 			continue;
 		}
 
@@ -688,6 +731,10 @@ static struct command_result *json_success_subsystems(struct command *cmd,
 		    (sv.type != single->type || sv.variant != single->variant))
 			continue;
 
+		/* Some don't have both success and failure */
+		if (!subsystem_to_str(&sv))
+			continue;
+
 		pv = &timer_cinfo->per_subsystem[sv.type].variants[sv.variant];
 		json_object_start(response, subsystem_to_str(&sv));
 		json_add_bool(response, "enabled", pv->age != 0);
@@ -819,6 +866,9 @@ int main(int argc, char *argv[])
 	setup_locale();
 
 	timer_cinfo = new_clean_info(NULL, NULL);
+	/* Default is 30 days for network events */
+	timer_cinfo->per_subsystem[NETWORKEVENTS].variants[SUCCESS].age
+		= 30 * 24 * 3600;
 	plugin_main(argv, init, NULL, PLUGIN_STATIC, true, NULL,
 		    commands, ARRAY_SIZE(commands),
 	            NULL, 0, NULL, 0, NULL, 0,
@@ -858,6 +908,11 @@ int main(int argc, char *argv[])
 					  "How old do expired invoices have to be before deletion (0 = never)",
 					  u64_option, u64_jsonfmt_unless_zero,
 					  &timer_cinfo->per_subsystem[INVOICES].variants[FAILURE].age),
+		    plugin_option_dynamic("autoclean-networkevents-age",
+					  "int",
+					  "How old do networkevents have to be before deletion (0 = never)",
+					  u64_option, u64_jsonfmt_unless_zero,
+					  &timer_cinfo->per_subsystem[NETWORKEVENTS].variants[SUCCESS].age),
 		    plugin_option_dev_dynamic("dev-autoclean-max-batch",
 					      "int",
 					      "Maximum cleans to do at a time",

@@ -4,6 +4,7 @@
 #include <common/amount.h>
 #include <common/json_parse.c>
 #include <common/json_parse_simple.c>
+#include <common/randbytes.h>
 #include <common/setup.h>
 
 static const char *reason;
@@ -78,9 +79,9 @@ u8 fromwire_u8(const u8 **cursor UNNEEDED, size_t *max UNNEEDED)
 /* Generated stub for fromwire_u8_array */
 void fromwire_u8_array(const u8 **cursor UNNEEDED, size_t *max UNNEEDED, u8 *arr UNNEEDED, size_t num UNNEEDED)
 { fprintf(stderr, "fromwire_u8_array called!\n"); abort(); }
-/* Generated stub for mvt_tag_str */
-const char *mvt_tag_str(enum mvt_tag tag UNNEEDED)
-{ fprintf(stderr, "mvt_tag_str called!\n"); abort(); }
+/* Generated stub for mvt_tag_parse */
+bool mvt_tag_parse(const char *buf UNNEEDED, size_t len UNNEEDED, enum mvt_tag *tag UNNEEDED)
+{ fprintf(stderr, "mvt_tag_parse called!\n"); abort(); }
 /* Generated stub for node_id_from_hexstr */
 bool node_id_from_hexstr(const char *str UNNEEDED, size_t slen UNNEEDED, struct node_id *id UNNEEDED)
 { fprintf(stderr, "node_id_from_hexstr called!\n"); abort(); }
@@ -333,8 +334,8 @@ int main(int argc, char *argv[])
 
 	common_setup(argv[0]);
 
-	lines = tal_strsplit(tmpctx, grab_file(tmpctx, tal_fmt(tmpctx, "%s.c",
-							       argv[0])),
+	lines = tal_strsplit(tmpctx, grab_file_str(tmpctx, tal_fmt(tmpctx, "%s.c",
+								   argv[0])),
 			     "\n", STR_NO_EMPTY);
 
 	for (size_t i = 0; lines[i]; i++) {

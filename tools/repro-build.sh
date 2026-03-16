@@ -9,19 +9,19 @@ export LANG LC_ALL
 for arg; do
     case "$arg" in
     --force-version=*)
-	    FORCE_VERSION=${arg#*=}
+	FORCE_VERSION=${arg#*=}
         ;;
-	--force-mtime=*)
-	    FORCE_MTIME=${arg#*=}
-	    ;;
-	--help)
-	    echo "Usage: [--force-version=<ver>] [--force-mtime=YYYY-MM-DD]"
-	    exit 0
-	    ;;
-	*)
-	    echo "Unknown arg $arg" >&2
-	    exit 1
-	    ;;
+    --force-mtime=*)
+	FORCE_MTIME=${arg#*=}
+	;;
+    --help)
+	echo "Usage: [--force-version=<ver>] [--force-mtime=YYYY-MM-DD]"
+	exit 0
+	;;
+    *)
+	echo "Unknown arg $arg" >&2
+	exit 1
+	;;
     esac
     shift
 done
@@ -56,6 +56,7 @@ fi
 ARCH=$(dpkg --print-architecture)
 PLATFORM="$OS"-"$VER"
 VERSION=${FORCE_VERSION:-$(git describe --tags --always --dirty=-modded --abbrev=7 2>/dev/null || pwd | sed -n 's,.*/clightning-\(v[0-9.rc\-]*\)$,\1,p')}
+MAKEPAR=${MAKEPAR:-1}
 
 # eg. ## [0.6.3] - 2019-01-09: "The Smallblock Conspiracy"
 # Skip 'v' here in $VERSION
@@ -117,6 +118,7 @@ adae5a301c7899c1bce8ae26b5423716a47e516df25c09d6d536607bc34853bc  /var/cache/apt
 d8b8653388e676a3ae2fcf565c2b1a42a01a1104062317f641e8d24f0eaff9c3  /var/cache/apt/archives/libpq-dev_14.2-1ubuntu1_amd64.deb
 542dcee1409c74d03ecdd4ca4a0cfd467e5d2804d9985b58e39d3c5889a409e3  /var/cache/apt/archives/libpq5_14.2-1ubuntu1_amd64.deb
 885ee09c37d0e37ef6042e8cb4a22ccbab92101f21ab0c8f51ae961e4484407c  /var/cache/apt/archives/libsodium23_1.0.18-1build2_amd64.deb
+09584c8ab2f840bf3db4a5763f6e4b450688aa8879acd4c8f4c1942375b9ca57  /var/cache/apt/archives/libsodium-dev_1.0.18-1build2_amd64.deb
 000a1d5c0df0373c75fadbfea604afb6b1325bf866a3ce637ae0138abe6d556d  /var/cache/apt/archives/libsqlite3-0_3.37.2-2_amd64.deb
 1b2a93020593c9e94a25f750ce442da5a6e8ff48a20f52cec92dfc3fa35336d8  /var/cache/apt/archives/linux-libc-dev_5.15.0-25.25_amd64.deb
 572a544d2c18bf49d25c465720c570cd8e6e38731386ac9c0a7f29bed2486f3e  /var/cache/apt/archives/m4_1.4.18-5ubuntu2_amd64.deb
@@ -132,8 +134,8 @@ EOF
 cc3f9f7a1e576173fb59c36652c0a67c6426feae752b352404ba92dfcb1b26c9  /var/cache/apt/archives/autoconf_2.71-3_all.deb
 5ae9a98e73545002cd891f028859941af2a3c760cb6190e635c7ef36953912de  /var/cache/apt/archives/automake_1%3a1.16.5-1.3ubuntu1_all.deb
 0e0bb8b25153ed1c44ab92bc219eed469fcb5820c5c0bc6454b2fd366a33d3ee  /var/cache/apt/archives/gcc_4%3a13.2.0-7ubuntu1_amd64.deb
-f11b4d687a305dd7ee47a384d82a9bf04de913362df9efa67d2a029ae65051a9  /var/cache/apt/archives/libsodium-dev_1.0.18-1build3_amd64.deb
-ce9a34ae09d8f3c8ec13c9e23372c029894e840f3fa1ce5d6bb41f58e9164d91  /var/cache/apt/archives/libsqlite3-dev_3.45.1-1ubuntu2.1_amd64.deb
+bd3e8cd6ab8cf731d8a8a15333831b9081a94ebefe22236fc8713975fe7a6d3a  /var/cache/apt/archives/libsodium-dev_1.0.18-1ubuntu0.24.04.1_amd64.deb
+5131ce3d7cdb7193bcef1b402741a0e0f436e25a50e65443fffcc7064e2cd780  /var/cache/apt/archives/libsqlite3-dev_3.45.1-1ubuntu2.5_amd64.deb
 9d1d707179675d38e024bb13613b1d99e0d33fa6c45e5f3bcba19340781781d3  /var/cache/apt/archives/libtool_2.4.7-7build1_all.deb
 1fe6a815b56c7b6e9ce4086a363f09444bbd0a0d30e230c453d0b78e44b57a99  /var/cache/apt/archives/make_4.3-4.1build2_amd64.deb
 023cbe9dbf0af87f10e54e342c67571874e412b9950d89c6cd7b010be2e67c3c  /var/cache/apt/archives/zlib1g-dev_1%3a1.3.dfsg-3.1ubuntu2.1_amd64.deb
@@ -160,8 +162,8 @@ $INST $(cut -c66- < /tmp/SHASUMS)
 # Once everyone has gcc8, we can use CC="gcc -ffile-prefix-map=$(pwd)=/home/clightning"
 ./configure --prefix=/usr CC="gcc -fdebug-prefix-map=$(pwd)=/home/clightning"
 # libwally wants "python".  Seems to work to force it here.
-make PYTHON_VERSION=3 VERSION="$VERSION"
-make install DESTDIR=inst/
+make -j"$MAKEPAR" PYTHON_VERSION=3 VERSION="$VERSION"
+make -j"$MAKEPAR" install DESTDIR=inst/
 
 cd inst && tar --sort=name \
       --mtime="$MTIME 00:00Z" \

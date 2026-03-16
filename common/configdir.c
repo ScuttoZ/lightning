@@ -1,7 +1,6 @@
 #include "config.h"
 #include <assert.h>
 #include <bitcoin/chainparams.h>
-#include <ccan/cast/cast.h>
 #include <ccan/err/err.h>
 #include <ccan/opt/opt.h>
 #include <ccan/opt/private.h>
@@ -10,6 +9,7 @@
 #include <ccan/tal/str/str.h>
 #include <common/configdir.h>
 #include <common/configvar.h>
+#include <common/memleak.h>
 #include <common/utils.h>
 #include <common/version.h>
 
@@ -36,8 +36,7 @@ static char *opt_set_abspath(const char *arg, char **p)
 /* Tal wrappers for opt. */
 static void *opt_allocfn(size_t size)
 {
-	return tal_arr_label(NULL, char, size,
-			     TAL_LABEL(opt_allocfn_notleak, ""));
+	return notleak(tal_arr(NULL, char, size));
 }
 
 static void *tal_reallocfn(void *ptr, size_t size)
@@ -63,7 +62,7 @@ static struct configvar **gather_file_configvars(const tal_t *ctx,
 	char *contents, **lines;
 	struct configvar **cvs = tal_arr(ctx, struct configvar *, 0);
 
-	contents = grab_file(tmpctx, filename);
+	contents = grab_file_str(tmpctx, filename);
 
 	/* The default config doesn't have to exist, but if the config was
 	 * specified on the command line it has to exist. */
@@ -342,7 +341,7 @@ struct configvar **initial_config_opts(const tal_t *ctx,
 	opt_register_early_arg("--network", opt_set_network, opt_show_network,
 			       NULL,
 			       "Select the network parameters (bitcoin, testnet,"
-			       " signet, regtest, litecoin or litecoin-testnet)");
+			       " signet, or regtest)");
 	opt_register_early_noarg("--testnet",
 				 opt_set_specific_network, "testnet",
 				 "Alias for --network=testnet");

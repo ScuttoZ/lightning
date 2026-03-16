@@ -2,9 +2,7 @@
 #define LIGHTNING_COMMON_JSON_PARSE_H
 #include "config.h"
 #include <bitcoin/short_channel_id.h>
-#include <ccan/crypto/sha256/sha256.h>
 #include <common/coin_mvt.h>
-#include <common/errcode.h>
 /* Simple helpers are here: this file contains heavier ones */
 #include <common/json_parse_simple.h>
 #include <common/jsonrpc_errors.h>
@@ -136,6 +134,13 @@ const char *json_scan(const tal_t *ctx,
 		      const jsmntok_t *tok,
 		      const char *guide,
 		      ...);
+
+/* Duplicate the tok(s) and buffer required (don't assume they're tal objects!) */
+void json_dup_contents(const tal_t *ctx,
+		       const char *buffer,
+		       const jsmntok_t *tok,
+		       const char **new_buffer,
+		       const jsmntok_t **new_toks);
 
 /* eg. JSON_SCAN(json_to_bool, &boolvar) */
 #define JSON_SCAN(fmt, var)						\

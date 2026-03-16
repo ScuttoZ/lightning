@@ -1,28 +1,20 @@
 #include "config.h"
-#include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/io/io.h>
 #include <ccan/tal/str/str.h>
-#include <common/configdir.h>
 #include <common/htlc_tx.h>
-#include <common/json_command.h>
-#include <common/json_param.h>
 #include <common/memleak.h>
 #include <common/timeout.h>
 #include <common/trace.h>
 #include <db/exec.h>
-#include <lightningd/bitcoind.h>
 #include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/coin_mvts.h>
+#include <lightningd/feerate.h>
 #include <lightningd/gossip_control.h>
 #include <lightningd/invoice.h>
 #include <lightningd/io_loop_with_timers.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/lightningd.h>
-#include <lightningd/log.h>
 #include <lightningd/notification.h>
 #include <math.h>
 #include <wallet/txfilter.h>
@@ -353,6 +345,37 @@ static void watch_for_utxo_reconfirmation(struct chain_topology *topo,
 			   &unconfirmed[i]->outpoint.txid,
 			   closeinfo_txid_confirmed, NULL);
 	}
+}
+
+static enum watch_result tx_confirmed(struct lightningd *ld,
+				      const struct bitcoin_txid *txid,
+				      const struct bitcoin_tx *tx,
+				      unsigned int depth,
+				      void *unused)
+{
+	/* We don't actually need to do anything here: the fact that we were
+	 * watching the tx made chaintopology.c update the transaction depth */
+	if (depth != 0)
+		return DELETE_WATCH;
+	return KEEP_WATCHING;
+}
+
+void watch_unconfirmed_txid(struct lightningd *ld,
+			    struct chain_topology *topo,
+			    const struct bitcoin_txid *txid)
+{
+	watch_txid(ld->wallet, topo, txid, tx_confirmed, NULL);
+}
+
+static void watch_for_unconfirmed_txs(struct lightningd *ld,
+				      struct chain_topology *topo)
+{
+	struct bitcoin_txid *txids;
+
+	txids = wallet_transactions_by_height(tmpctx, ld->wallet, 0);
+	log_debug(ld->log, "Got %zu unconfirmed transactions", tal_count(txids));
+	for (size_t i = 0; i < tal_count(txids); i++)
+		watch_unconfirmed_txid(ld, topo, &txids[i]);
 }
 
 /* Mutual recursion via timer. */
@@ -865,8 +888,8 @@ static void updates_complete(struct chain_topology *topo)
 }
 
 static void record_wallet_spend(struct lightningd *ld,
-				struct bitcoin_outpoint *outpoint,
-				struct bitcoin_txid *txid,
+				const struct bitcoin_outpoint *outpoint,
+				const struct bitcoin_txid *txid,
 				u32 tx_blockheight)
 {
 	struct utxo *utxo;
@@ -880,20 +903,23 @@ static void record_wallet_spend(struct lightningd *ld,
 		return;
 	}
 
-	notify_chain_mvt(ld, new_coin_wallet_withdraw(tmpctx, txid, outpoint,
+	wallet_save_chain_mvt(ld, new_coin_wallet_withdraw(tmpctx, txid, outpoint,
 						      tx_blockheight,
-						      utxo->amount, WITHDRAWAL));
+						      utxo->amount, mk_mvt_tags(MVT_WITHDRAWAL)));
 }
 
 /**
  * topo_update_spends -- Tell the wallet about all spent outpoints
  */
-static void topo_update_spends(struct chain_topology *topo, struct block *b)
+static void topo_update_spends(struct chain_topology *topo,
+			       struct bitcoin_tx **txs,
+			       const struct bitcoin_txid *txids,
+			       u32 blockheight)
 {
 	const struct short_channel_id *spent_scids;
-	const size_t num_txs = tal_count(b->full_txs);
+	const size_t num_txs = tal_count(txs);
 	for (size_t i = 0; i < num_txs; i++) {
-		const struct bitcoin_tx *tx = b->full_txs[i];
+		const struct bitcoin_tx *tx = txs[i];
 
 		for (size_t j = 0; j < tx->wtx->num_inputs; j++) {
 			struct bitcoin_outpoint outpoint;
@@ -901,9 +927,9 @@ static void topo_update_spends(struct chain_topology *topo, struct block *b)
 			bitcoin_tx_input_get_outpoint(tx, j, &outpoint);
 
 			if (wallet_outpoint_spend(tmpctx, topo->ld->wallet,
-						  b->height, &outpoint))
+						  blockheight, &outpoint))
 				record_wallet_spend(topo->ld, &outpoint,
-						    &b->txids[i], b->height);
+						    &txids[i], blockheight);
 
 		}
 	}
@@ -911,8 +937,8 @@ static void topo_update_spends(struct chain_topology *topo, struct block *b)
 	/* Retrieve all potential channel closes from the UTXO set and
 	 * tell gossipd about them. */
 	spent_scids =
-	    wallet_utxoset_get_spent(tmpctx, topo->ld->wallet, b->height);
-	gossipd_notify_spends(topo->bitcoind->ld, b->height, spent_scids);
+	    wallet_utxoset_get_spent(tmpctx, topo->ld->wallet, blockheight);
+	gossipd_notify_spends(topo->bitcoind->ld, blockheight, spent_scids);
 }
 
 static void topo_add_utxos(struct chain_topology *topo, struct block *b)
@@ -959,7 +985,7 @@ static void add_tip(struct chain_topology *topo, struct block *b)
 	trace_span_end(b);
 
 	trace_span_start("topo_update_spends", b);
-	topo_update_spends(topo, b);
+	topo_update_spends(topo, b->full_txs, b->txids, b->height);
 	trace_span_end(b);
 
 	/* Only keep the transactions we care about. */
@@ -1027,6 +1053,7 @@ static void remove_tip(struct chain_topology *topo)
 
 	/* This may have unconfirmed txs: reconfirm as we add blocks. */
 	watch_for_utxo_reconfirmation(topo, topo->ld->wallet);
+
 	block_map_del(topo->block_map, b);
 
 	/* These no longer exist, so gossipd drops any reference to them just
@@ -1196,14 +1223,10 @@ struct chain_topology *new_topology(struct lightningd *ld, struct logger *log)
 	struct chain_topology *topo = tal(ld, struct chain_topology);
 
 	topo->ld = ld;
-	topo->block_map = tal(topo, struct block_map);
-	block_map_init(topo->block_map);
-	topo->outgoing_txs = tal(topo, struct outgoing_tx_map);
-	outgoing_tx_map_init(topo->outgoing_txs);
-	topo->txwatches = tal(topo, struct txwatch_hash);
-	txwatch_hash_init(topo->txwatches);
-	topo->txowatches = tal(topo, struct txowatch_hash);
-	txowatch_hash_init(topo->txowatches);
+	topo->block_map = new_htable(topo, block_map);
+	topo->outgoing_txs = new_htable(topo, outgoing_tx_map);
+	topo->txwatches = new_htable(topo, txwatch_hash);
+	topo->txowatches = new_htable(topo, txowatch_hash);
 	topo->log = log;
 	topo->bitcoind = new_bitcoind(topo, ld, log);
 	topo->poll_seconds = 30;
@@ -1368,6 +1391,7 @@ void setup_topology(struct chain_topology *topo)
 	struct bitcoin_block *blk;
 	bool blockscan_start_set;
 	u32 blockscan_start;
+	s64 fixup;
 
 	/* This waits for bitcoind. */
 	bitcoind_check_commands(topo->bitcoind);
@@ -1393,6 +1417,15 @@ void setup_topology(struct chain_topology *topo)
 			blockscan_start = blocknum_reduce(blockscan_start, topo->ld->config.rescan);
 	}
 
+	fixup = db_get_intvar(topo->ld->wallet->db, "fixup_block_scan", -1);
+	if (fixup == -1) {
+		/* Never done fixup: this is set to non-zero if we have blocks. */
+		topo->old_block_scan = wallet_blocks_contig_minheight(topo->ld->wallet);
+		db_set_intvar(topo->ld->wallet->db, "fixup_block_scan",
+			      topo->old_block_scan);
+	} else {
+		topo->old_block_scan = fixup;
+	}
 	db_commit_transaction(topo->ld->wallet->db);
 
 	/* Sanity checks, then topology initialization. */
@@ -1477,11 +1510,54 @@ void setup_topology(struct chain_topology *topo)
 
 	/* May have unconfirmed txs: reconfirm as we add blocks. */
 	watch_for_utxo_reconfirmation(topo, topo->ld->wallet);
+
+	/* We usually watch txs because we have outputs coming to us, or they're
+	 * related to a channel.  But not if they're created by sendpsbt without any
+	 * outputs to us. */
+	watch_for_unconfirmed_txs(topo->ld, topo);
 	db_commit_transaction(topo->ld->wallet->db);
 
 	tal_free(local_ctx);
 
 	tal_add_destructor(topo, destroy_chain_topology);
+}
+
+static void fixup_scan_block(struct bitcoind *bitcoind,
+			     u32 height,
+			     struct bitcoin_blkid *blkid,
+			     struct bitcoin_block *blk,
+			     struct chain_topology *topo)
+{
+	/* Can't scan the block?  We will try again next restart */
+	if (!blk) {
+		log_unusual(topo->ld->log,
+			    "fixup_scan: could not load block %u, will retry next restart",
+			    height);
+		return;
+	}
+
+	log_debug(topo->ld->log, "fixup_scan: block %u with %zu txs", height, tal_count(blk->tx));
+	topo_update_spends(topo, blk->tx, blk->txids, height);
+
+	/* Caught up. */
+	if (height == get_block_height(topo)) {
+		log_info(topo->ld->log, "Scanning for missed UTXOs finished");
+		db_set_intvar(topo->ld->wallet->db, "fixup_block_scan", 0);
+		return;
+	}
+
+	db_set_intvar(topo->ld->wallet->db, "fixup_block_scan", ++topo->old_block_scan);
+	bitcoind_getrawblockbyheight(topo, topo->bitcoind,
+				     topo->old_block_scan,
+				     fixup_scan_block, topo);
+}
+
+static void fixup_scan(struct chain_topology *topo)
+{
+	log_info(topo->ld->log, "Scanning for missed UTXOs from block %u", topo->old_block_scan);
+	bitcoind_getrawblockbyheight(topo, topo->bitcoind,
+				     topo->old_block_scan,
+				     fixup_scan_block, topo);
 }
 
 void begin_topology(struct chain_topology *topo)
@@ -1493,6 +1569,9 @@ void begin_topology(struct chain_topology *topo)
 	start_fee_estimate(topo);
 	/* Regular block updates */
 	try_extend_tip(topo);
+
+	if (topo->old_block_scan)
+		fixup_scan(topo);
 }
 
 void stop_topology(struct chain_topology *topo)

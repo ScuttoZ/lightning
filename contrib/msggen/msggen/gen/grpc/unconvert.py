@@ -56,6 +56,7 @@ class GrpcUnconverterGenerator(GrpcConverterGenerator):
                     "short_channel_id": f"cln_rpc::primitives::ShortChannelId::from_str(&s).unwrap()",
                     "short_channel_id_dir": f"cln_rpc::primitives::ShortChannelIdDir::from_str(&s).unwrap()",
                     "pubkey": f"PublicKey::from_slice(&s).unwrap()",
+                    "txid": f"hex::encode(s)",
                 }.get(typ, f"s.into()")
 
                 # TODO fix properly
@@ -131,6 +132,8 @@ class GrpcUnconverterGenerator(GrpcConverterGenerator):
                     "hash?": f"c.{name}.map(|v| Sha256::from_slice(&v).unwrap())",
                     "txid": f"hex::encode(&c.{name})",
                     "TlvStream?": f"c.{name}.map(|s| s.into())",
+                    "string_map": f"c.{name}.unwrap()",
+                    "string_map?": f"Some(c.{name})",
                 }.get(
                     typ, f"c.{name}"  # default to just assignment
                 )

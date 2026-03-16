@@ -6,7 +6,6 @@
 
 #include "config.h"
 
-#include <common/errcode.h>
 
 enum jsonrpc_errcode {
 	/* Standard errors defined by JSON-RPC 2.0 standard */
@@ -117,6 +116,7 @@ enum jsonrpc_errcode {
 	OFFER_BAD_INVREQ_REPLY = 1004,
 	OFFER_TIMEOUT = 1005,
 	OFFER_ALREADY_ENABLED = 1006,
+	OFFER_USED_SINGLE_USE = 1007,
 
 	/* Errors from datastore command */
 	DATASTORE_DEL_DOES_NOT_EXIST = 1200,
@@ -130,8 +130,9 @@ enum jsonrpc_errcode {
 	/* Errors from signmessage command */
 	SIGNMESSAGE_PUBKEY_NOT_FOUND = 1301,
 
-	/* Errors from delforward command */
+	/* Errors from del commands */
 	DELFORWARD_NOT_FOUND = 1401,
+	DELNETWORKEVENT_NOT_FOUND = 1402,
 
 	/* Errors from runes */
 	RUNE_NOT_AUTHORIZED = 1501,

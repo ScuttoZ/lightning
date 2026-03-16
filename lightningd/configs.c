@@ -10,12 +10,8 @@
 #include <common/configdir.h>
 #include <common/configvar.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/version.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/options.h>
 #include <lightningd/plugin.h>
 #include <unistd.h>
 
@@ -361,7 +357,7 @@ static size_t append_to_file(struct lightningd *ld,
 	}
 
 	/* Note: always nul terminates */
-	buffer = grab_fd(tmpctx, fd);
+	buffer = grab_fd_str(tmpctx, fd);
 	if (!buffer)
 		fatal("Error reading %s: %s", fname, strerror(errno));
 
@@ -391,7 +387,7 @@ static const char *grab_and_check(const tal_t *ctx,
 {
 	char *contents;
 
-	contents = grab_file(tmpctx, fname);
+	contents = grab_file_str(tmpctx, fname);
 	if (!contents)
 		return tal_fmt(ctx, "Could not load configfile %s: %s",
 			       fname, strerror(errno));

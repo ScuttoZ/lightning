@@ -315,7 +315,7 @@ def start_channels(connections):
     bitcoind = nodes[0].bitcoin
     # If we got here, we want to fund channels
     for src, dst, fundamount in connections:
-        addr = src.rpc.newaddr()["bech32"]
+        addr = src.rpc.newaddr('bech32')["bech32"]
         bitcoind.rpc.sendtoaddress(addr, (fundamount + 1000000) / 10**8)
 
     bitcoind.generate_block(1)
@@ -379,18 +379,10 @@ def test_hardmpp(node_factory):
         ]
     )
 
-    with open("/tmp/l1-chans.txt", "w") as f:
-        print(json.dumps(l1.rpc.listchannels()), file=f)
-
     inv = l4.rpc.invoice("any", "any", "description")
     l2.rpc.call("pay", {"bolt11": inv["bolt11"], "amount_msat": 2000000000})
     l2.wait_for_htlcs()
     assert l4.rpc.listinvoices()["invoices"][0]["amount_received_msat"] == 2000000000
-
-    with open("/tmp/l2-peerchan.txt", "w") as f:
-        print(json.dumps(l2.rpc.listpeerchannels()), file=f)
-    with open("/tmp/l3-peerchan.txt", "w") as f:
-        print(json.dumps(l3.rpc.listpeerchannels()), file=f)
 
     inv2 = l6.rpc.invoice("1800000sat", "inv2", "description")
 
@@ -415,6 +407,7 @@ def test_hardmpp(node_factory):
     assert invoice["amount_received_msat"] >= Millisatoshi("1800000sat")
 
 
+@pytest.mark.flaky(reruns=2)
 def test_self_pay(node_factory):
     l1, l2 = node_factory.line_graph(2, wait_for_announce=True)
 

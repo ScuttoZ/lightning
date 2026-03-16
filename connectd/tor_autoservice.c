@@ -12,6 +12,7 @@
 #include <netdb.h>
 #include <unistd.h>
 
+int tor_service_fd = -1;
 
 static void *buf_resize(struct membuf *mb, void *buf, size_t len)
 {
@@ -231,18 +232,15 @@ static void negotiate_auth(struct rbuf *rbuf, const char *tor_password)
 
 			/* If we can't access this, try other methods */
 			cookiefile = tal_strdup(tmpctx, p);
-			contents = grab_file(tmpctx, p);
+			contents = grab_file_raw(tmpctx, p);
 			if (!contents) {
 				cookiefileerrno = errno;
 				continue;
 			}
-			assert(tal_count(contents) != 0);
 			discard_remaining_response(rbuf);
 			tor_send_cmd(rbuf,
 				     tal_fmt(tmpctx, "AUTHENTICATE %s",
-					     tal_hexstr(tmpctx,
-							contents,
-							tal_count(contents)-1)));
+					     tal_hex(tmpctx, contents)));
 			discard_remaining_response(rbuf);
 			return;
 		}
@@ -334,5 +332,6 @@ struct wireaddr *tor_fixed_service(const tal_t *ctx,
 	* read_partial to keep it open until LN drops
 	* DO NOT CLOSE FD TO KEEP ADDRESS ALIVE AS WE DO NOT DETACH WITH STATIC ADDRESS
 	*/
+	tor_service_fd = fd;
 	return onion;
 }

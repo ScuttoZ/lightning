@@ -255,14 +255,14 @@
     "- -32602: Error in given parameters."
   ],
   "author": [
-    "Vincenzo Palazzo <<vincenzo.palazzo@protonmail.com>> wrote the initial version of this man page,",
+    "Vincenzo Palazzo [vincenzo.palazzo@protonmail.com](mailto:vincenzo.palazzo@protonmail.com) wrote the initial version of this man page,",
     "but many others did the hard work of actually implementing this rpc command."
   ],
   "see_also": [
     "lightning-listchannels(7)"
   ],
   "resources": [
-    "Main web site: <https://github.com/ElementsProject/lightning>"
+    "Main web site: [https://github.com/ElementsProject/lightning](https://github.com/ElementsProject/lightning)"
   ],
   "examples": [
     {
@@ -280,7 +280,7 @@
             "alias": "HOPPINGFIRE",
             "color": "035d2b",
             "last_timestamp": 1738000000,
-            "features": "88a0882a8a59a1",
+            "features": "8898882a8a59a1",
             "addresses": []
           }
         ]
@@ -299,7 +299,7 @@
             "alias": "SILENTARTIST",
             "color": "022d22",
             "last_timestamp": 1738000000,
-            "features": "88a0882a8a59a1",
+            "features": "8898882a8a59a1",
             "addresses": []
           },
           {
@@ -307,7 +307,7 @@
             "alias": "JUNIORBEAM",
             "color": "0266e4",
             "last_timestamp": 1738010000,
-            "features": "88a0882a8a59a1",
+            "features": "8898882a8a59a1",
             "addresses": []
           },
           {
@@ -315,7 +315,7 @@
             "alias": "HOPPINGFIRE",
             "color": "035d2b",
             "last_timestamp": 1738020000,
-            "features": "88a0882a8a59a1",
+            "features": "8898882a8a59a1",
             "addresses": []
           },
           {
@@ -323,7 +323,7 @@
             "alias": "JUNIORFELONY",
             "color": "0382ce",
             "last_timestamp": 1738030000,
-            "features": "88a0882a8a59a1",
+            "features": "8898882a8a59a1",
             "addresses": []
           }
         ]

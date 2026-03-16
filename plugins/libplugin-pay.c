@@ -1,22 +1,24 @@
 #include "config.h"
-#include <ccan/array_size/array_size.h>
 #include <ccan/mem/mem.h>
 #include <ccan/tal/str/str.h>
 #include <common/blindedpay.h>
+#include <common/bolt11.h>
+#include <common/clock_time.h>
 #include <common/daemon.h>
 #include <common/dijkstra.h>
+#include <common/features.h>
 #include <common/gossmap.h>
 #include <common/gossmods_listpeerchannels.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
-#include <common/pseudorand.h>
 #include <common/random_select.h>
+#include <common/route.h>
 #include <common/trace.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
+#include <plugins/channel_hint.h>
 #include <plugins/libplugin-pay.h>
-#include <stdio.h>
-#include <sys/types.h>
 #include <wire/peer_wire.h>
 
 static struct gossmap *global_gossmap;
@@ -87,7 +89,7 @@ struct payment *payment_new(tal_t *ctx, struct command *cmd,
 	p->modifiers = mods;
 	p->cmd = cmd;
 	p->finished = false;
-	p->start_time = time_now();
+	p->start_time = clock_time();
 	p->result = NULL;
 	p->why = NULL;
 	p->getroute = tal(p, struct getroute_request);
@@ -383,15 +385,32 @@ void payment_start(struct payment *p)
      * We share the channel_hints across payments, and across plugins, in order
      * to maximize the context they have when performing payments.
      */
+static void channel_hint_notify_core(struct plugin *plugin,
+				     struct json_stream *js,
+				     const char *fieldname,
+				     const struct channel_hint *hint)
+{
+	/* The timestamp used to decay the observation over time. */
+	channel_hint_to_json(fieldname, hint, js);
+}
+
 static void channel_hint_notify(struct plugin *plugin,
 				const struct channel_hint *hint)
 {
 	struct json_stream *js =
-	    plugin_notification_start(plugin, "channel_hint_update");
+	    plugin_notification_start_obs(plugin, "channel_hint_update");
 
-	/* The timestamp used to decay the observation over time. */
-	channel_hint_to_json("channel_hint", hint, js);
-	plugin_notification_end(plugin, js);
+	/* Fake up the old "payload" style, *and* the old unwrapped style */
+	if (notification_deprecated_out_ok(plugin, "notification", "payload",
+					   "v25.09", "v26.09")) {
+		json_add_string(js, "origin", "pay");
+		json_object_start(js, "payload");
+		channel_hint_notify_core(plugin, js, "channel_hint", hint);
+		json_object_end(js);
+	}
+
+	channel_hint_notify_core(plugin, js, "channel_hint_update", hint);
+	plugin_notification_end_obs(plugin, js);
 }
 
 static void channel_hints_update(struct payment *p,
@@ -411,7 +430,7 @@ static void channel_hints_update(struct payment *p,
 	/* Local channels must have an HTLC budget */
 	assert(!local || htlc_budget != NULL);
 
-	channel_hint_set_add(root->hints, time_now().ts.tv_sec, scidd, enabled,
+	channel_hint_set_add(root->hints, clock_time().ts.tv_sec, scidd, enabled,
 			     estimated_capacity, overall_capacity, htlc_budget);
 
 	hint = channel_hint_set_find(root->hints, scidd);
@@ -432,7 +451,7 @@ static void channel_hints_update(struct payment *p,
 			   "estimated capacity %s",
 			   fmt_short_channel_id_dir(tmpctx, &hint->scid),
 			   hint->enabled ? "true" : "false",
-			   fmt_amount_msat(tmpctx, hint->estimated_capacity));
+			   hint->enabled ? fmt_amount_msat(tmpctx, hint->estimated_capacity) : "UNKNOWN");
 		channel_hint_notify(p->plugin, hint);
 	}
 }
@@ -464,7 +483,7 @@ payment_constraints_update(struct payment_constraints *cons,
 		return false;
 
 	/* amount_msat_sub performs a check before actually subtracting. */
-	if (!amount_msat_sub(&cons->fee_budget, cons->fee_budget, delta_fee))
+	if (!amount_msat_deduct(&cons->fee_budget, delta_fee))
 		return false;
 
 	cons->cltv_budget -= delta_cltv;
@@ -553,9 +572,8 @@ static bool payment_chanhints_apply_route(struct payment *p)
 			curhint->local->htlc_budget--;
 		}
 
-		if (!amount_msat_sub(&curhint->estimated_capacity,
-				     curhint->estimated_capacity,
-				     curhop->amount)) {
+		if (!amount_msat_deduct(&curhint->estimated_capacity,
+					curhop->amount)) {
 			/* Given our preemptive test
 			 * above, this should never
 			 * happen either. */
@@ -766,7 +784,7 @@ static u64 route_score(struct amount_msat fee,
 	 */
 	score = (capacity_bias(global_gossmap, c, dir, total) + 1)
 		* msat.millisatoshis; /* Raw: Weird math */
-	if (score > 0xFFFFFFFF)
+	if (score != score || score > 0xFFFFFFFF)
 		return 0xFFFFFFFF;
 
 	/* Cast unnecessary, but be explicit! */
@@ -1178,12 +1196,15 @@ static void payment_result_infer(struct route_hop *route,
 
 	len = tal_count(route);
 	i = *r->erring_index;
-	assert(i <= len);
+	/* This can actually be greater than the route length?  Perhaps
+	 * multi-hop routehints?  Ignore. */
+	if (i > len)
+		return;
 
 	if (r->erring_node == NULL)
 		r->erring_node = &route[i-1].node_id;
 
-	/* The above assert was enough for the erring_node, but might be off
+	/* The above check was enough for the erring_node, but might be off
 	 * by one on channel and direction, in case the destination failed on
 	 * us. */
 	if (i == len)
@@ -1429,7 +1450,7 @@ handle_intermediate_failure(struct command *cmd,
 		 * work. This allows us to then allow on equality, this is for
 		 * example necessary for local channels where exact matches
 		 * should be allowed. */
-		if (!amount_msat_sub(&estimated, estimated, AMOUNT_MSAT(1)))
+		if (!amount_msat_deduct(&estimated, AMOUNT_MSAT(1)))
 			abort();
 
 		/* These are an indication that the capacity was insufficient,
@@ -1620,7 +1641,7 @@ payment_waitsendpay_finished(struct command *cmd,
 
 	assert(p->route != NULL);
 
-	p->end_time = time_now();
+	p->end_time = clock_time();
 	p->result = tal_sendpay_result_from_json(p, buffer, toks);
 
 	if (p->result == NULL) {
@@ -1684,6 +1705,11 @@ static struct command_result *payment_sendonion_success(struct command *cmd,
 							struct payment *p)
 {
 	struct out_req *req;
+	struct payment *root = payment_root(p);
+
+	if (p->invstring)
+		root->invstring_used = true;
+
 	req = jsonrpc_request_start(payment_cmd(p), "waitsendpay",
 				    payment_waitsendpay_finished,
 				    payment_waitsendpay_finished, p);
@@ -1746,8 +1772,6 @@ static struct command_result *payment_createonion_success(struct command *cmd,
 
 		if (p->description)
 			json_add_string(req->js, "description", p->description);
-
-		root->invstring_used = true;
 	}
 
 	if (p->pay_destination)
@@ -2077,12 +2101,11 @@ static void payment_json_add_attempts(struct json_stream *s,
 	json_array_end(s);
 }
 
-static void payment_notify_failure(struct payment *p, const char *error_message)
+static void payment_failure_notify_core(struct payment *p,
+					struct json_stream *n,
+					const char *error_message)
 {
 	struct payment *root = payment_root(p);
-	struct json_stream *n;
-
-	n = plugin_notification_start(p->plugin, "pay_failure");
 	json_add_sha256(n, "payment_hash", p->payment_hash);
 	if (root->invstring != NULL)
 		json_add_string(n, "bolt11", root->invstring);
@@ -2090,8 +2113,26 @@ static void payment_notify_failure(struct payment *p, const char *error_message)
 	json_object_start(n, "error");
 	json_add_string(n, "message", error_message);
 	json_object_end(n); /* .error */
+}
 
-	plugin_notification_end(p->plugin, n);
+static void payment_notify_failure(struct payment *p, const char *error_message)
+{
+	struct json_stream *n;
+
+	n = plugin_notification_start_obs(p->plugin, "pay_failure");
+	/* Fake up the old "payload" style, *and* the old unwrapped style */
+	if (notification_deprecated_out_ok(p->plugin, "notification", "payload",
+					   "v25.09", "v26.09")) {
+		json_add_string(n, "origin", "pay");
+		json_object_start(n, "payload");
+		payment_failure_notify_core(p, n, error_message);
+		json_object_end(n);
+	}
+
+	json_object_start(n, "pay_failure");
+	payment_failure_notify_core(p, n, error_message);
+	json_object_end(n);
+	plugin_notification_end_obs(p->plugin, n);
 }
 
 /* Code shared by selfpay fast-path: populate JSON output for successful
@@ -2126,11 +2167,24 @@ void json_add_payment_success(struct json_stream *js,
 	json_add_preimage(js, "payment_preimage", preimage);
 	json_add_string(js, "status", "complete");
 
-	n = plugin_notification_start(p->plugin, "pay_success");
+	n = plugin_notification_start_obs(p->plugin, "pay_success");
+	/* Fake up the old "payload" style, *and* the old unwrapped style */
+	if (notification_deprecated_out_ok(p->plugin, "notification", "payload",
+					   "v25.09", "v26.09")) {
+		json_add_string(n, "origin", "pay");
+		json_object_start(n, "payload");
+		json_add_sha256(n, "payment_hash", p->payment_hash);
+		if (root->invstring != NULL)
+			json_add_string(n, "bolt11", root->invstring);
+		json_object_end(n);
+	}
+
+	json_object_start(n, "pay_success");
 	json_add_sha256(n, "payment_hash", p->payment_hash);
 	if (root->invstring != NULL)
 		json_add_string(n, "bolt11", root->invstring);
-	plugin_notification_end(p->plugin, n);
+	json_object_end(n);
+	plugin_notification_end_obs(p->plugin, n);
 }
 
 /* This function is called whenever a payment ends up in a final state, or all
@@ -2285,7 +2339,7 @@ void payment_set_step(struct payment *p, enum payment_step newstep)
 
 	/* Any final state needs an end_time */
 	if (p->step >= PAYMENT_STEP_SPLIT)
-		p->end_time = time_now();
+		p->end_time = clock_time();
 }
 
 struct command_result *payment_continue(struct payment *p)
@@ -2344,7 +2398,7 @@ struct command_result *payment_abort(struct payment *p, enum jsonrpc_errcode cod
 	va_list ap;
 	struct payment *root = payment_root(p);
 	payment_set_step(p, PAYMENT_STEP_FAILED);
-	p->end_time = time_now();
+	p->end_time = clock_time();
 
 	/* We can fail twice, it seems. */
 	tal_free(p->failreason);
@@ -2371,7 +2425,7 @@ struct command_result *payment_abort(struct payment *p, enum jsonrpc_errcode cod
 struct command_result *payment_fail(struct payment *p, const char *fmt, ...)
 {
 	va_list ap;
-	p->end_time = time_now();
+	p->end_time = clock_time();
 	payment_set_step(p, PAYMENT_STEP_FAILED);
 	/* We can fail twice, it seems. */
 	tal_free(p->failreason);
@@ -2478,12 +2532,12 @@ static struct command_result *retry_step_cb(struct retry_mod_data *rd,
 {
 	struct payment *subpayment, *root = payment_root(p);
 	struct retry_mod_data *rdata = payment_mod_retry_get_data(p);
-	struct timeabs now = time_now();
+	struct timemono now = time_mono();
 
 	if (p->step != PAYMENT_STEP_FAILED)
 		return payment_continue(p);
 
-	if (time_after(now, p->deadline)) {
+	if (timemono_after(now, p->deadline)) {
 		paymod_log(
 		    p, LOG_INFORM,
 		    "Payment deadline expired, not retrying (partial-)payment "
@@ -2597,7 +2651,7 @@ local_channel_hints_listpeerchannels(struct command *cmd,
 	 * observations, and should re-enable some channels that would
 	 * otherwise start out as excluded and remain so until
 	 * forever. */
-	channel_hint_set_update(payment_root(p)->hints, time_now());
+	channel_hint_set_update(payment_root(p)->hints, clock_time());
 	p->mods = gossmods_from_listpeerchannels(
 	    p, p->local_id, buffer, toks, true, gossmod_add_localchan, NULL);
 
@@ -3359,10 +3413,8 @@ static struct command_result *shadow_route_listchannels(struct command *cmd,
 		 * destination could otherwise cause the route to be too
 		 * expensive, while really being ok. If any of these fail then
 		 * the above checks are insufficient. */
-		if (!amount_msat_sub(&d->constraints.fee_budget,
-				     d->constraints.fee_budget, best_fee) ||
-		    !amount_msat_sub(&p->constraints.fee_budget,
-				     p->constraints.fee_budget, best_fee))
+		if (!amount_msat_deduct(&d->constraints.fee_budget, best_fee) ||
+		    !amount_msat_deduct(&p->constraints.fee_budget, best_fee))
 			paymod_err(p,
 				   "Could not update fee constraints "
 				   "for shadow route extension. "
@@ -3430,6 +3482,15 @@ static struct command_result *direct_pay_override(struct payment *p)
 	hint = channel_hint_set_find(root->hints, d->chan);
 	if (hint && hint->enabled &&
 	    amount_msat_greater(hint->estimated_capacity, p->our_amount)) {
+		if (p->getroute->cltv > p->constraints.cltv_budget) {
+			paymod_log(p, LOG_DBG,
+				   "Direct channel (%s) skipped: "
+				   "CLTV delay %u exceeds budget %u.",
+				   fmt_short_channel_id_dir(tmpctx, &hint->scid),
+				   p->getroute->cltv, p->constraints.cltv_budget);
+			return payment_continue(p);
+		}
+
 		/* Now build a route that consists only of this single hop */
 		p->route = tal_arr(p, struct route_hop, 1);
 		p->route[0].amount = p->our_amount;

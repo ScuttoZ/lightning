@@ -2,36 +2,29 @@
 #include <ccan/array_size/array_size.h>
 #include <ccan/cast/cast.h>
 #include <ccan/err/err.h>
-#include <ccan/json_escape/json_escape.h>
-#include <ccan/mem/mem.h>
 #include <ccan/noerr/noerr.h>
 #include <ccan/opt/opt.h>
-#include <ccan/opt/private.h>
 #include <ccan/read_write_all/read_write_all.h>
 #include <ccan/str/hex/hex.h>
-#include <ccan/tal/grab_file/grab_file.h>
 #include <ccan/tal/path/path.h>
 #include <ccan/tal/str/str.h>
 #include <common/codex32.h>
 #include <common/configdir.h>
 #include <common/configvar.h>
-#include <common/features.h>
-#include <common/hsm_encryption.h>
-#include <common/json_command.h>
-#include <common/json_param.h>
+#include <common/errcode.h>
+#include <common/hsm_secret.h>
 #include <common/version.h>
-#include <common/wireaddr.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <hsmd/hsmd_wiregen.h>
 #include <lightningd/chaintopology.h>
-#include <lightningd/hsm_control.h>
+#include <lightningd/feerate.h>
 #include <lightningd/options.h>
 #include <lightningd/plugin.h>
 #include <lightningd/subd.h>
-#include <sys/stat.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 /* FIXME: Put into ccan/time. */
 #define TIME_FROM_SEC(sec) { { .tv_nsec = 0, .tv_sec = sec } }
@@ -559,19 +552,65 @@ static void prompt(struct lightningd *ld, const char *str)
 	fflush(stdout);
 }
 
+/* Read HSM passphrase from user input */
+static char *read_hsm_passphrase(struct lightningd *ld)
+{
+	const char *passphrase, *passphrase_confirmation;
+	enum hsm_secret_error err;
+
+	prompt(ld, "The hsm_secret requires a passphrase. In order to "
+	       "access it and start the node you must provide the passphrase.");
+	prompt(ld, "Enter hsm_secret passphrase:");
+
+	passphrase = read_stdin_pass(tmpctx, &err);
+	if (err != HSM_SECRET_OK) {
+		opt_exitcode = EXITCODE_HSM_PASSWORD_INPUT_ERR;
+		return tal_strdup(tmpctx, hsm_secret_error_str(err));
+	}
+
+	/* We need confirmation if the hsm_secret file doesn't exist yet */
+	if (!path_is_file("hsm_secret")) {
+		prompt(ld, "Confirm hsm_secret passphrase:");
+		fflush(stdout);
+		passphrase_confirmation = read_stdin_pass(tmpctx, &err);
+		if (err != HSM_SECRET_OK) {
+			opt_exitcode = EXITCODE_HSM_PASSWORD_INPUT_ERR;
+			return tal_strdup(tmpctx, hsm_secret_error_str(err));
+		}
+
+		if (!streq(passphrase, passphrase_confirmation)) {
+			opt_exitcode = EXITCODE_HSM_BAD_PASSWORD;
+			return "Passphrase confirmation mismatch.";
+		}
+	}
+
+	/* Store passphrase in lightningd struct */
+	ld->hsm_passphrase = tal_strdup(ld, passphrase);
+
+	/* Encryption key derivation is handled by hsmd internally */
+
+	return NULL;
+}
+
 /* Prompt the user to enter a password, from which will be derived the key used
  * for `hsm_secret` encryption.
  * The algorithm used to derive the key is Argon2(id), to which libsodium
  * defaults. However argon2id-specific constants are used in case someone runs it
  * with a libsodium version which default constants differs (typically <1.0.9).
+ *
+ * DEPRECATED: Use --hsm-passphrase instead.
  */
 static char *opt_set_hsm_password(struct lightningd *ld)
 {
-	char *passwd, *passwd_confirmation;
-	const char *err_msg;
 	int is_encrypted;
 
-        is_encrypted = is_hsm_secret_encrypted("hsm_secret");
+	/* Show deprecation warning */
+	if (!opt_deprecated_ok(ld, "encrypted_hsm",
+			      "Use --hsm-passphrase instead",
+			      "v25.12", "v26.12"))
+		return "--encrypted-hsm was removed, use --hsm-passphrase instead";
+
+        is_encrypted = is_legacy_hsm_secret_encrypted("hsm_secret");
 	/* While lightningd is performing the first initialization
 	 * this check is always true because the file does not exist.
 	 *
@@ -582,48 +621,17 @@ static char *opt_set_hsm_password(struct lightningd *ld)
 		log_info(ld->log, "'hsm_secret' does not exist (%s)",
 			 strerror(errno));
 
-	prompt(ld, "The hsm_secret is encrypted with a password. In order to "
-	       "decrypt it and start the node you must provide the password.");
-	prompt(ld, "Enter hsm_secret password:");
-
-	passwd = read_stdin_pass_with_exit_code(&err_msg, &opt_exitcode);
-	if (!passwd)
-		return cast_const(char *, err_msg);
-	if (!is_encrypted) {
-		prompt(ld, "Confirm hsm_secret password:");
-		fflush(stdout);
-		passwd_confirmation = read_stdin_pass_with_exit_code(&err_msg, &opt_exitcode);
-		if (!passwd_confirmation)
-			return cast_const(char *, err_msg);
-
-		if (!streq(passwd, passwd_confirmation)) {
-			opt_exitcode = EXITCODE_HSM_BAD_PASSWORD;
-			return "Passwords confirmation mismatch.";
-		}
-		free(passwd_confirmation);
-	}
-	prompt(ld, "");
-
-	ld->config.keypass = tal(NULL, struct secret);
-
-	opt_exitcode = hsm_secret_encryption_key_with_exitcode(passwd, ld->config.keypass, &err_msg);
-	if (opt_exitcode > 0)
-		return cast_const(char *, err_msg);
-
-	ld->encrypted_hsm = true;
-	free(passwd);
-
-	return NULL;
+	return read_hsm_passphrase(ld);
 }
 
-static char *opt_set_max_htlc_cltv(const char *arg, struct lightningd *ld)
+/* Set flag to indicate hsm_secret needs a passphrase.
+ * This replaces the old --encrypted-hsm option which was for legacy encrypted secrets.
+ */
+static char *opt_set_hsm_passphrase(struct lightningd *ld)
 {
-	if (!opt_deprecated_ok(ld, "max-locktime-blocks", NULL,
-			       "v24.05", "v24.11"))
-		return "--max-locktime-blocks has been deprecated (BOLT #4 says 2016)";
-
-	return opt_set_u32(arg, &ld->config.max_htlc_cltv);
+	return read_hsm_passphrase(ld);
 }
+
 
 static char *opt_force_privkey(const char *optarg, struct lightningd *ld)
 {
@@ -816,10 +824,6 @@ static void dev_register_opts(struct lightningd *ld)
 		     opt_set_bool,
 		     &ld->dev_fast_gossip_prune,
 		     "Make gossip pruning 120 seconds");
-	clnopt_witharg("--dev-gossip-time", OPT_DEV|OPT_SHOWINT,
-		       opt_set_u32, opt_show_u32,
-		       &ld->dev_gossip_time,
-		       "UNIX time to override gossipd to use.");
 	clnopt_witharg("--dev-force-privkey", OPT_DEV,
 		       opt_force_privkey, NULL, ld,
 		       "Force HSM to use this as node private key");
@@ -940,6 +944,14 @@ static void dev_register_opts(struct lightningd *ld)
 		       opt_set_bool,
 		       &ld->dev_hsmd_warn_on_overgrind,
 		       "Warn if we create signatures that are not exactly 71 bytes.");
+	clnopt_witharg("--dev-save-plugin-io", OPT_DEV,
+		       opt_set_charp, opt_show_charp,
+		       &ld->plugins->dev_save_io,
+		       "Directory to place all plugin notifications/hooks JSON into.");
+	clnopt_noarg("--dev-keep-nagle", OPT_DEV,
+		       opt_set_bool,
+		       &ld->dev_keep_nagle,
+		       "Tell connectd not to set TCP_NODELAY.");
 	/* This is handled directly in daemon_developer_mode(), so we ignore it here */
 	clnopt_noarg("--dev-debug-self", OPT_DEV,
 		     opt_ignore,
@@ -1242,14 +1254,6 @@ static char *opt_set_splicing(struct lightningd *ld)
 	return NULL;
 }
 
-static char *opt_set_onion_messages(struct lightningd *ld)
-{
-	if (!opt_deprecated_ok(ld, "experimental-onion-messages", NULL,
-			       "v24.08", "v25.02"))
-		return "--experimental-onion-message is now enabled by default";
-	return NULL;
-}
-
 static char *opt_set_shutdown_wrong_funding(struct lightningd *ld)
 {
 	feature_set_or(ld->our_features,
@@ -1261,33 +1265,8 @@ static char *opt_set_shutdown_wrong_funding(struct lightningd *ld)
 static char *opt_set_peer_storage(struct lightningd *ld)
 {
 	if (!opt_deprecated_ok(ld, "experimental-peer-storage", NULL,
-			       "v25.05", "v25.11"))
+			       "v25.05", "v25.12"))
 		return "--experimental-peer-storage is now enabled by default";
-	return NULL;
-}
-
-static char *opt_set_quiesce(struct lightningd *ld)
-{
-	if (!opt_deprecated_ok(ld, "experimental-quiesce", NULL,
-			       "v24.11", "v25.05"))
-		return "--experimental-quiesce is now enabled by default";
-	return NULL;
-}
-
-static char *opt_set_anchor_zero_fee_htlc_tx(struct lightningd *ld)
-{
-	if (!opt_deprecated_ok(ld, "experimental-anchors", NULL,
-			       "v24.02", "v25.02"))
-		return "--experimental-anchors is now enabled by default";
-	return NULL;
-}
-
-static char *opt_set_offers(struct lightningd *ld)
-{
-	if (!opt_deprecated_ok(ld, "experimental-offers", NULL,
-			       "v24.11", "v25.05"))
-		return "--experimental-offers has been deprecated (now the default)";
-
 	return NULL;
 }
 
@@ -1303,43 +1282,65 @@ static char *opt_add_api_beg(const char *arg, struct lightningd *ld)
 	return NULL;
 }
 
+static char *opt_add_node_id(const char *arg, struct node_id **arr)
+{
+	struct node_id n;
+	if (!node_id_from_hexstr(arg, strlen(arg), &n))
+		return "Unparsable nodeid";
+
+	tal_arr_expand(arr, n);
+	return NULL;
+}
+
 char *hsm_secret_arg(const tal_t *ctx,
 		     const char *arg,
-		     const u8 **hsm_secret)
+		     const struct hsm_secret **hsm_secret)
 {
 	char *codex32_fail;
 	struct codex32 *codex32;
+	struct hsm_secret *hsms = tal(tmpctx, struct hsm_secret);
 
 	/* We accept hex, or codex32.  hex is very very very unlikely to
 	 * give a valid codex32, so try that first */
 	codex32 = codex32_decode(tmpctx, "cl", arg, &codex32_fail);
 	if (codex32) {
-		*hsm_secret = tal_steal(ctx, codex32->payload);
+		hsms->type = HSM_SECRET_PLAIN;
+		hsms->secret_data = tal_steal(hsms, codex32->payload);
 		if (codex32->threshold != 0
 		    || codex32->type != CODEX32_ENCODING_SECRET) {
 			return "This is only one share of codex32!";
 		}
+		if (tal_count(hsms->secret_data) != 32)
+			return "Invalid length: must be 32 bytes";
+	/* Not codex32, was it hex? */
+	} else if ((hsms->secret_data = tal_hexdata(hsms, arg, strlen(arg))) != NULL) {
+		hsms->type = HSM_SECRET_PLAIN;
+		if (tal_count(hsms->secret_data) != 32)
+			return "Invalid length: must be 32 bytes";
+	/* Not hex, is is a mnemonic? */
 	} else {
-		/* Not codex32, was it hex? */
-		*hsm_secret = tal_hexdata(ctx, arg, strlen(arg));
-		if (!*hsm_secret) {
-			/* It's not hex!  So give codex32 error */
- 			return codex32_fail;
+		enum hsm_secret_error err = validate_mnemonic(arg);
+		if (err != HSM_SECRET_OK) {
+			/* If it looks kinda like a codex32, give that error. */
+			if (strstarts(arg, "cl"))
+				return codex32_fail;
+			else
+				return "Not a valid mnemonic, hex, or codex32 string";
 		}
+		hsms->type = HSM_SECRET_MNEMONIC_NO_PASS;
+		hsms->mnemonic = tal_strdup(hsms, arg);
 	}
 
-	if (tal_count(*hsm_secret) != 32)
-		return "Invalid length: must be 32 bytes";
-
+	*hsm_secret = tal_steal(ctx, hsms);
 	return NULL;
 }
 
-static char *opt_set_codex32_or_hex(const char *arg, struct lightningd *ld)
+static char *opt_set_hsm_secret(const char *arg, struct lightningd *ld)
 {
 	char *err;
-	const u8 *payload;
+	const struct hsm_secret *hsm_secret;
 
-	err = hsm_secret_arg(tmpctx, arg, &payload);
+	err = hsm_secret_arg(tmpctx, arg, &hsm_secret);
 	if (err)
 		return err;
 
@@ -1354,10 +1355,36 @@ static char *opt_set_codex32_or_hex(const char *arg, struct lightningd *ld)
 			       strerror(errno));
 	}
 
-	if (!write_all(fd, payload, tal_count(payload))) {
+	switch (hsm_secret->type) {
+	case HSM_SECRET_PLAIN:
+		/* Legacy 32-byte format */
+		if (!write_all(fd, hsm_secret->secret_data, tal_count(hsm_secret->secret_data))) {
+			unlink_noerr("hsm_secret");
+			return tal_fmt(tmpctx, "Writing HSM: %s",
+				       strerror(errno));
+		}
+		break;
+	case HSM_SECRET_ENCRYPTED:
+	case HSM_SECRET_MNEMONIC_WITH_PASS:
+		return tal_fmt(tmpctx, "Recovery of encrypted/passworded secrets not supported");
+	case HSM_SECRET_MNEMONIC_NO_PASS: {
+		struct sha256 seed_hash;
+		if (!derive_seed_hash(hsm_secret->mnemonic, NULL, &seed_hash)) {
+			unlink_noerr("hsm_secret");
+			return tal_fmt(tmpctx, "Deriving from mnemonic failed!");
+		}
+		/* Write seed hash (32 bytes) + mnemonic */
+		if (!write_all(fd, &seed_hash, sizeof(seed_hash))
+		    || !write_all(fd, hsm_secret->mnemonic, strlen(hsm_secret->mnemonic))) {
+			unlink_noerr("hsm_secret");
+			return tal_fmt(tmpctx, "Error writing to hsm_secret file: %s", strerror(errno));
+		}
+		break;
+	}
+	case HSM_SECRET_INVALID:
+		/* Shouldn't happen? */
 		unlink_noerr("hsm_secret");
-		return tal_fmt(tmpctx, "Writing HSM: %s",
-			   strerror(errno));
+		return tal_fmt(tmpctx, "invalid hsm secret?");
 	}
 
 	/*~ fsync (mostly!) ensures that the file has reached the disk. */
@@ -1439,9 +1466,9 @@ static void register_opts(struct lightningd *ld)
 			       &ld->wallet_dsn,
 			       "Location of the wallet database.");
 
-	opt_register_early_arg("--recover", opt_set_codex32_or_hex, NULL,
+	opt_register_early_arg("--recover", opt_set_hsm_secret, NULL,
 				ld,
-				"Populate hsm_secret with the given codex32 secret"
+				"Populate hsm_secret with the given codex32/hex/mnemonic secret"
 				" and starts the node in `offline` mode.");
 
 	/* This affects our features, so set early. */
@@ -1461,24 +1488,11 @@ static void register_opts(struct lightningd *ld)
 				 " channels using splicing");
 
 	/* This affects our features, so set early. */
-	opt_register_early_noarg("--experimental-onion-messages",
-				 opt_set_onion_messages, ld,
-				 opt_hidden);
-	opt_register_early_noarg("--experimental-offers",
-				 opt_set_offers, ld,
-				 opt_hidden);
 	opt_register_early_noarg("--experimental-shutdown-wrong-funding",
 				 opt_set_shutdown_wrong_funding, ld,
 				 "EXPERIMENTAL: allow shutdown with alternate txids");
 	opt_register_early_noarg("--experimental-peer-storage",
 				 opt_set_peer_storage, ld,
-				 opt_hidden);
-	opt_register_early_noarg("--experimental-quiesce",
-				 opt_set_quiesce, ld,
-				 "experimental: Advertise ability to quiesce"
-				 " channels.");
-	opt_register_early_noarg("--experimental-anchors",
-				 opt_set_anchor_zero_fee_htlc_tx, ld,
 				 opt_hidden);
 
 	clnopt_noarg("--help|-h", OPT_EXITS,
@@ -1498,8 +1512,6 @@ static void register_opts(struct lightningd *ld)
 	clnopt_witharg("--watchtime-blocks", OPT_SHOWINT, opt_set_u32, opt_show_u32,
 			 &ld->config.locktime_blocks,
 			 "Blocks before peer can unilaterally spend funds");
-	opt_register_arg("--max-locktime-blocks", opt_set_max_htlc_cltv, NULL,
-			 ld, opt_hidden);
 	clnopt_witharg("--funding-confirms", OPT_SHOWINT, opt_set_u32, opt_show_u32,
 			 &ld->config.funding_confirms,
 			 "Confirmations required for funding transaction");
@@ -1583,9 +1595,12 @@ static void register_opts(struct lightningd *ld)
 	opt_register_early_noarg("--disable-dns", opt_set_invbool, &ld->config.use_dns,
 				 "Disable DNS lookups of peers");
 
+	/* Deprecated: use --hsm-passphrase instead */
 	opt_register_noarg("--encrypted-hsm", opt_set_hsm_password, ld,
-					  "Set the password to encrypt hsm_secret with. If no password is passed through command line, "
-					  "you will be prompted to enter it.");
+					  opt_hidden);
+
+	opt_register_noarg("--hsm-passphrase", opt_set_hsm_passphrase, ld,
+			 "Prompt for passphrase for encrypted hsm_secret (replaces --encrypted-hsm)");
 
 	opt_register_arg("--rpc-file-mode", &opt_set_mode, &opt_show_mode,
 			 &ld->rpc_filemode,
@@ -1618,9 +1633,6 @@ static void register_opts(struct lightningd *ld)
 		       "--subdaemon=hsmd:remote_signer "
 		       "would use a hypothetical remote signing subdaemon.");
 
-	opt_register_noarg("--experimental-upgrade-protocol",
-			   opt_set_bool, &ld->experimental_upgrade_protocol,
-			   "experimental: allow channel types to be upgraded on reconnect");
 	opt_register_noarg("--invoices-onchain-fallback",
 			   opt_set_bool, &ld->unified_invoices,
 			   "Include an onchain address in invoices and mark them as paid if payment is received on-chain");
@@ -1634,6 +1646,20 @@ static void register_opts(struct lightningd *ld)
 		       ld,
 		       "Re-enable a long-deprecated API (which will be removed entirely next version!)");
 	opt_register_logging(ld);
+	clnopt_witharg("--payment-fronting-node",
+		       OPT_MULTI,
+		       opt_add_node_id, NULL,
+		       &ld->fronting_nodes, "Put this node in all invoices and offers, and use blinded path (bolt12) or route hints (bolt11) to route to this node.  Must be a neighboring node.  Can be specified multiple times.");
+
+	/* Old bookkeeper migration flags. */
+	opt_register_early_arg("--bookkeeper-dir",
+			       opt_set_talstr, NULL,
+			       &ld->old_bookkeeper_dir,
+			       opt_hidden);
+	opt_register_early_arg("--bookkeeper-db",
+			       opt_set_talstr, NULL,
+			       &ld->old_bookkeeper_db,
+			       opt_hidden);
 
 	dev_register_opts(ld);
 }
@@ -1844,48 +1870,8 @@ void handle_early_opts(struct lightningd *ld, int argc, char *argv[])
 	logging_options_parsed(ld->log_book);
 }
 
-/* Free *str, set *str to copy with `cln` prepended */
-static void prefix_cln(char **str STEALS)
-{
-	char *newstr = tal_fmt(tal_parent(*str), "cln%s", *str);
-	tal_free(*str);
-	*str = newstr;
-}
-
-/* Due to a conflict between the widely-deployed clightning-rest plugin and
- * our own clnrest plugin, and people wanting to run both, in v23.11 we
- * renamed some options.  This breaks perfectly working v23.08 deployments who
- * don't care about clightning-rest, so we work around it here. */
-static void fixup_clnrest_options(struct lightningd *ld)
-{
-	for (size_t i = 0; i < tal_count(ld->configvars); i++) {
-		struct configvar *cv = ld->configvars[i];
-
-		/* These worked for v23.08 */
-		if (!strstarts(cv->configline, "rest-port=")
-		    && !strstarts(cv->configline, "rest-protocol=")
-		    && !strstarts(cv->configline, "rest-host=")
-		    && !strstarts(cv->configline, "rest-certs="))
-			continue;
-		/* Did some (plugin) claim it? */
-		if (opt_find_long(cv->configline, cast_const2(const char **, &cv->optarg)))
-			continue;
-		if (!opt_deprecated_ok(ld,
-				       tal_strndup(tmpctx, cv->configline,
-						   strcspn(cv->configline, "=")),
-				       "clnrest-prefix",
-				       "v23.11", "v24.11"))
-			continue;
-		log_unusual(ld->log, "Option %s deprecated in v23.11, renaming to cln%s",
-			    cv->configline, cv->configline);
-		prefix_cln(&cv->configline);
-	}
-}
-
 void handle_opts(struct lightningd *ld)
 {
-	fixup_clnrest_options(ld);
-
 	/* Now we know all the options, finish parsing and finish
 	 * populating ld->configvars with cmdline. */
 	parse_configvars_final(ld->configvars, true, ld->developer);
@@ -1926,13 +1912,15 @@ bool is_known_opt_cb_arg(char *(*cb_arg)(const char *, void *))
 		|| cb_arg == (void *)opt_set_db_upgrade
 		|| cb_arg == (void *)arg_log_to_file
 		|| cb_arg == (void *)opt_add_accept_htlc_tlv
-		|| cb_arg == (void *)opt_set_codex32_or_hex
+		|| cb_arg == (void *)opt_set_hsm_secret
 		|| cb_arg == (void *)opt_subd_dev_disconnect
 		|| cb_arg == (void *)opt_set_crash_timeout
 		|| cb_arg == (void *)opt_add_api_beg
+		|| cb_arg == (void *)opt_add_node_id
 		|| cb_arg == (void *)opt_force_featureset
 		|| cb_arg == (void *)opt_force_privkey
 		|| cb_arg == (void *)opt_force_bip32_seed
 		|| cb_arg == (void *)opt_force_channel_secrets
-		|| cb_arg == (void *)opt_force_tmp_channel_id;
+		|| cb_arg == (void *)opt_force_tmp_channel_id
+		|| cb_arg == (void *)opt_set_hsm_passphrase;
 }

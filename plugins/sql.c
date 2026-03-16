@@ -2,22 +2,20 @@
 #include "config.h"
 #include <ccan/array_size/array_size.h>
 #include <ccan/err/err.h>
-#include <ccan/strmap/strmap.h>
 #include <ccan/tal/str/str.h>
 #include <common/deprecation.h>
 #include <common/gossip_store.h>
+#include <common/gossip_store_wiregen.h>
 #include <common/json_param.h>
 #include <common/json_stream.h>
 #include <common/memleak.h>
 #include <common/setup.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <gossipd/gossip_store_wiregen.h>
+#include <inttypes.h>
 #include <plugins/libplugin.h>
 #include <sqlite3.h>
 #include <stdio.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 /* Minimized schemas.  C23 #embed, Where Art Thou? */
@@ -27,11 +25,10 @@ static const char schemas[] =
 
 /* TODO:
  * 2. Refresh time in API.
- * 6. test on mainnet.
- * 7. Some cool query for documentation.
  * 8. time_msec fields.
- * 10. Pagination API
- */
+ * 10. General pagination API (not just chainmoves and channelmoves)
+ * 11. Normalize account_id fields into another table, as they are highly duplicate, and use views to maintain the current API.
+*/
 enum fieldtype {
 	/* Hex variants */
 	FIELD_HEX,
@@ -51,6 +48,7 @@ enum fieldtype {
 	FIELD_NUMBER,
 	FIELD_STRING,
 	FIELD_SCID,
+	FIELD_OUTPOINT,
 };
 
 struct fieldtypemap {
@@ -74,6 +72,7 @@ static const struct fieldtypemap fieldtypemap[] = {
 	{ "number", "REAL" }, /* FIELD_NUMBER */
 	{ "string", "TEXT" }, /* FIELD_STRING */
 	{ "short_channel_id", "TEXT" }, /* FIELD_SCID */
+	{ "outpoint", "TEXT" }, /* FIELD_OUTPOINT */
 };
 
 struct column {
@@ -94,6 +93,15 @@ struct db_query {
 	struct table_desc **tables;
 	const char *authfail;
 	bool has_wildcard;
+	/* Update *last_created_index */
+	u64 *last_created_index;
+};
+
+/* Waiting for another command to refresh table */
+struct refresh_waiter {
+	struct list_node list;
+	struct command *cmd;
+	struct db_query *dbq;
 };
 
 struct table_desc {
@@ -104,24 +112,48 @@ struct table_desc {
 	const char *name;
 	/* e.g. "payments" for listsendpays */
 	const char *arrname;
+	/* name if we need to wait for changes */
+	const char *waitname;
 	struct column **columns;
 	char *update_stmt;
 	/* If we are a subtable */
 	struct table_desc *parent;
 	/* Is this a sub object (otherwise, subarray if parent is true) */
 	bool is_subobject;
+	/* Do we use created_index as primary key?  Otherwise we create rowid. */
+	bool has_created_index;
+	/* Have we created our sql indexes yet? */
+	bool indices_created;
 	/* function to refresh it. */
 	struct command_result *(*refresh)(struct command *cmd,
 					  const struct table_desc *td,
 					  struct db_query *dbq);
+	/* some refresh functions maintain changed and created indexes */
+	u64 last_created_index;
+	/* Do we need a refresh? */
+	bool needs_refresh;
+	/* Are we refreshing now? */
+	bool refreshing;
+	/* When did we start refreshing? */
+	struct timemono refresh_start;
+	/* Any other commands waiting for the refresh completion */
+	struct list_head refresh_waiters;
 };
-static STRMAP(struct table_desc *) tablemap;
-static size_t max_dbmem = 500000000;
-static struct sqlite3 *db;
-static char *dbfilename;
-static int gosstore_fd = -1;
-static size_t gosstore_nodes_off = 0, gosstore_channels_off = 0;
-static u64 next_rowid = 1;
+
+typedef STRMAP(struct table_desc *) tablemap;
+struct sql {
+	tablemap tablemap;
+	struct sqlite3 *db;
+	char *dbfilename;
+	int gosstore_fd ;
+	size_t gosstore_nodes_off, gosstore_channels_off;
+	u64 next_rowid;
+};
+
+static struct sql *sql_of(struct plugin *plugin)
+{
+	return plugin_get_data(plugin, struct sql);
+}
 
 /* It was tempting to put these in the schema, but they're really
  * just for our usage.  Though that would allow us to autogen the
@@ -171,6 +203,18 @@ static const struct index indices[] = {
 		"transactions",
 		{ "hash", NULL },
 	},
+	{
+		"chainmoves",
+		{ "account_id", NULL },
+	},
+	{
+		"channelmoves",
+		{ "account_id", NULL },
+	},
+	{
+		"channelmoves",
+		{ "payment_hash", NULL },
+	},
 };
 
 static enum fieldtype find_fieldtype(const jsmntok_t *name)
@@ -188,9 +232,10 @@ static struct sqlite3 *sqlite_setup(struct plugin *plugin)
 	int err;
 	struct sqlite3 *db;
 	char *errmsg;
+	struct sql *sql = sql_of(plugin);
 
-	if (dbfilename) {
-		err = sqlite3_open_v2(dbfilename, &db,
+	if (sql->dbfilename) {
+		err = sqlite3_open_v2(sql->dbfilename, &db,
 				      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
 				      NULL);
 	} else {
@@ -223,16 +268,20 @@ static struct sqlite3 *sqlite_setup(struct plugin *plugin)
 	sqlite3_limit(db, SQLITE_LIMIT_TRIGGER_DEPTH, 1);
 	sqlite3_limit(db, SQLITE_LIMIT_WORKER_THREADS, 1);
 
-	/* Default is now 4k pages, so allow 500MB */
-	err = sqlite3_exec(db, tal_fmt(tmpctx, "PRAGMA max_page_count = %zu;",
-				       max_dbmem / 4096),
-			   NULL, NULL, &errmsg);
-	if (err != SQLITE_OK)
-		plugin_err(plugin, "Could not set max_page_count: %s", errmsg);
-
 	err = sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, &errmsg);
 	if (err != SQLITE_OK)
 		plugin_err(plugin, "Could not set foreign_keys: %s", errmsg);
+
+	if (sql->dbfilename) {
+		err = sqlite3_exec(db,
+				   "PRAGMA synchronous = OFF;"
+				   "PRAGMA journal_mode = OFF;"
+				   "PRAGMA temp_store = MEMORY;"
+				   , NULL, NULL,
+				   &errmsg);
+		if (err != SQLITE_OK)
+			plugin_err(plugin, "Could not disable sync: %s", errmsg);
+	}
 
 	return db;
 }
@@ -270,7 +319,8 @@ static int sqlite_authorize(void *dbq_, int code,
 
 	/* You can do a column read: takes a table name, column name */
 	if (code == SQLITE_READ) {
-		struct table_desc *td = strmap_get(&tablemap, a);
+		struct sql *sql = sql_of(dbq->cmd->plugin);
+		struct table_desc *td = strmap_get(&sql->tablemap, a);
 		struct column *col;
 		if (!td) {
 			dbq->authfail = tal_fmt(dbq, "Unknown table %s", a);
@@ -352,6 +402,10 @@ static int sqlite_authorize(void *dbq_, int code,
 			return SQLITE_OK;
 		if (streq(b, "unixepoch"))
 			return SQLITE_OK;
+		if (streq(b, "json_object"))
+			return SQLITE_OK;
+		if (streq(b, "json_group_array"))
+			return SQLITE_OK;
 	}
 
 	/* See https://www.sqlite.org/c3ref/c_alter_table.html to decode these! */
@@ -367,6 +421,7 @@ static int sqlite_authorize(void *dbq_, int code,
 static struct command_result *refresh_complete(struct command *cmd,
 					       struct db_query *dbq)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	char *errmsg;
 	int err, num_cols;
 	size_t num_rows;
@@ -431,7 +486,7 @@ static struct command_result *refresh_complete(struct command *cmd,
 	}
 	if (err != SQLITE_DONE)
 		errmsg = tal_fmt(cmd, "Executing statement: %s",
-				 sqlite3_errmsg(db));
+				 sqlite3_errmsg(sql->db));
 
 	sqlite3_finalize(dbq->stmt);
 
@@ -456,16 +511,113 @@ static struct command_result *refresh_complete(struct command *cmd,
 	return command_finished(cmd, ret);
 }
 
+static void init_indices(struct plugin *plugin, const struct table_desc *td)
+{
+	struct sql *sql = sql_of(plugin);
+
+	for (size_t i = 0; i < ARRAY_SIZE(indices); i++) {
+		char *errmsg, *cmd;
+		int err;
+
+		if (!streq(indices[i].tablename, td->name))
+			continue;
+
+		cmd = tal_fmt(tmpctx, "CREATE INDEX %s_%zu_idx ON %s (%s",
+			      indices[i].tablename, i,
+			      indices[i].tablename,
+			      indices[i].fields[0]);
+		if (indices[i].fields[1])
+			tal_append_fmt(&cmd, ", %s", indices[i].fields[1]);
+		tal_append_fmt(&cmd, ");");
+		err = sqlite3_exec(sql->db, cmd, NULL, NULL, &errmsg);
+		if (err != SQLITE_OK)
+			plugin_err(plugin, "Failed '%s': %s", cmd, errmsg);
+	}
+}
+
 /* Recursion */
 static struct command_result *refresh_tables(struct command *cmd,
 					     struct db_query *dbq);
 
-static struct command_result *one_refresh_done(struct command *cmd,
-					       struct db_query *dbq)
+static struct command_result *next_refresh(struct command *cmd,
+					   struct db_query *dbq)
 {
 	/* Remove that, iterate */
 	tal_arr_remove(&dbq->tables, 0);
 	return refresh_tables(cmd, dbq);
+}
+
+static struct command_result *wait_done(struct command *cmd,
+					const char *method,
+					const char *buf,
+					const jsmntok_t *result,
+					struct table_desc *td)
+{
+	td->needs_refresh = true;
+	return aux_command_done(cmd);
+}
+
+static struct command_result *one_refresh_done(struct command *cmd,
+					       struct db_query *dbq,
+					       bool was_limited)
+{
+	struct table_desc *td = dbq->tables[0];
+	struct list_head waiters;
+	struct refresh_waiter *rw;
+	struct timerel refresh_duration = timemono_since(td->refresh_start);
+
+	/* If we may have more, keep going. */
+	if (was_limited)
+		return td->refresh(cmd, dbq->tables[0], dbq);
+
+	/* We are no longer refreshing */
+	assert(td->refreshing);
+	td->refreshing = false;
+	plugin_log(cmd->plugin, LOG_DBG,
+		   "Time to refresh %s: %"PRIu64".%09"PRIu64" seconds (last=%"PRIu64")",
+		   td->name,
+		   (u64)refresh_duration.ts.tv_sec,
+		   (u64)refresh_duration.ts.tv_nsec,
+		   td->last_created_index);
+
+	if (!td->indices_created) {
+		init_indices(cmd->plugin, td);
+		td->indices_created = 1;
+		refresh_duration = timemono_since(td->refresh_start);
+		plugin_log(cmd->plugin, LOG_DBG,
+			   "Time to refresh + create indices for %s: %"PRIu64".%09"PRIu64" seconds",
+			   td->name,
+			   (u64)refresh_duration.ts.tv_sec,
+			   (u64)refresh_duration.ts.tv_nsec);
+	}
+
+	/* We put in a wait command to we get told when we need to refresh */
+	if (td->waitname) {
+		struct out_req *req;
+		td->needs_refresh = false;
+		req = jsonrpc_request_start(aux_command(cmd), "wait", wait_done,
+					    plugin_broken_cb, td);
+		json_add_string(req->js, "subsystem", td->waitname);
+		json_add_string(req->js, "indexname", "created");
+		json_add_u64(req->js, "nextvalue", td->last_created_index+1);
+		send_outreq(req);
+	}
+
+	/* Transfer refresh waiters onto local list */
+	list_head_init(&waiters);
+	list_append_list(&waiters, &td->refresh_waiters);
+
+	while ((rw = list_pop(&waiters, struct refresh_waiter, list)) != NULL) {
+		struct command *rwcmd = rw->cmd;
+		struct db_query *rwdbq = rw->dbq;
+		tal_free(rw);
+
+		/* Remove that one, and refresh the rest */
+		assert(rwdbq->tables[0] == td);
+		tal_arr_remove(&rwdbq->tables, 0);
+		refresh_tables(rwcmd, rwdbq);
+	}
+	return next_refresh(cmd, dbq);
 }
 
 /* Mutual recursion */
@@ -473,14 +625,16 @@ static struct command_result *process_json_list(struct command *cmd,
 						const char *buf,
 						const jsmntok_t *arr,
 						const u64 *rowid,
-						const struct table_desc *td);
+						const struct table_desc *td,
+						u64 *last_created_index);
 
 /* Process all subobject columns */
 static struct command_result *process_json_subobjs(struct command *cmd,
 						   const char *buf,
 						   const jsmntok_t *t,
 						   const struct table_desc *td,
-						   u64 this_rowid)
+						   u64 this_rowid,
+						   u64 *last_created_index)
 {
 	for (size_t i = 0; i < tal_count(td->columns); i++) {
 		const struct column *col = td->columns[i];
@@ -497,10 +651,10 @@ static struct command_result *process_json_subobjs(struct command *cmd,
 		/* If it's an array, use process_json_list */
 		if (!col->sub->is_subobject) {
 			ret = process_json_list(cmd, buf, coltok, &this_rowid,
-						col->sub);
+						col->sub, last_created_index);
 		} else {
 			ret = process_json_subobjs(cmd, buf, coltok, col->sub,
-						   this_rowid);
+						   this_rowid, last_created_index);
 		}
 		if (ret)
 			return ret;
@@ -517,8 +671,10 @@ static struct command_result *process_json_obj(struct command *cmd,
 					       u64 this_rowid,
 					       const u64 *parent_rowid,
 					       size_t *sqloff,
-					       sqlite3_stmt *stmt)
+					       sqlite3_stmt *stmt,
+					       u64 *last_created_index)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	int err;
 
 	/* Subtables have row, arrindex as first two columns. */
@@ -544,7 +700,7 @@ static struct command_result *process_json_obj(struct command *cmd,
 			else
 				coltok = json_get_member(buf, t, col->jsonname);
 			ret = process_json_obj(cmd, buf, coltok, col->sub, row, this_rowid,
-					       NULL, sqloff, stmt);
+					       NULL, sqloff, stmt, last_created_index);
 			if (ret)
 				return ret;
 			continue;
@@ -589,6 +745,11 @@ static struct command_result *process_json_obj(struct command *cmd,
 							    json_tok_full(buf, coltok));
 				}
 				sqlite3_bind_int64(stmt, (*sqloff)++, val64);
+				/* created_index -> last_created_index */
+				if (streq(col->dbname, "created_index")
+				    && val64 > *last_created_index) {
+					*last_created_index = val64;
+				}
 				break;
 			case FIELD_BOOL:
 				if (!json_to_bool(buf, coltok, &valbool)) {
@@ -622,6 +783,7 @@ static struct command_result *process_json_obj(struct command *cmd,
 				break;
 			case FIELD_SCID:
 			case FIELD_STRING:
+			case FIELD_OUTPOINT:
 				sqlite3_bind_text(stmt, (*sqloff)++, buf + coltok->start,
 						  coltok->end - coltok->start,
 						  SQLITE_STATIC);
@@ -656,10 +818,10 @@ static struct command_result *process_json_obj(struct command *cmd,
 				    "Error executing %s on row %zu: %s",
 				    td->update_stmt,
 				    row,
-				    sqlite3_errmsg(db));
+				    sqlite3_errmsg(sql->db));
 	}
 
-	return process_json_subobjs(cmd, buf, t, td, this_rowid);
+	return process_json_subobjs(cmd, buf, t, td, this_rowid, last_created_index);
 }
 
 /* A list, such as in the top-level reply, or for a sub-table */
@@ -667,29 +829,42 @@ static struct command_result *process_json_list(struct command *cmd,
 						const char *buf,
 						const jsmntok_t *arr,
 						const u64 *parent_rowid,
-						const struct table_desc *td)
+						const struct table_desc *td,
+						u64 *last_created_index)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	size_t i;
 	const jsmntok_t *t;
 	int err;
 	sqlite3_stmt *stmt;
 	struct command_result *ret = NULL;
 
-	err = sqlite3_prepare_v2(db, td->update_stmt, -1, &stmt, NULL);
+	err = sqlite3_prepare_v2(sql->db, td->update_stmt, -1, &stmt, NULL);
 	if (err != SQLITE_OK) {
 		return command_fail(cmd, LIGHTNINGD, "preparing '%s' failed: %s",
 				    td->update_stmt,
-				    sqlite3_errmsg(db));
+				    sqlite3_errmsg(sql->db));
 	}
 
 	json_for_each_arr(i, t, arr) {
 		/* sqlite3 columns are 1-based! */
 		size_t off = 1;
-		u64 this_rowid = next_rowid++;
+		u64 this_rowid;
 
-		/* First entry is always the rowid */
-		sqlite3_bind_int64(stmt, off++, this_rowid);
-		ret = process_json_obj(cmd, buf, t, td, i, this_rowid, parent_rowid, &off, stmt);
+		if (!td->has_created_index) {
+			this_rowid = sql->next_rowid++;
+			/* First entry is always the rowid */
+			sqlite3_bind_int64(stmt, off++, this_rowid);
+		} else {
+			if (!json_to_u64(buf,
+					 json_get_member(buf, t, "created_index"),
+					 &this_rowid))
+				return command_fail(cmd, LIGHTNINGD, "No created_index in %s? '%.*s'",
+						    td->cmdname,
+						    json_tok_full_len(t),
+						    json_tok_full(buf, t));
+		}
+		ret = process_json_obj(cmd, buf, t, td, i, this_rowid, parent_rowid, &off, stmt, last_created_index);
 		if (ret)
 			break;
 		sqlite3_reset(stmt);
@@ -702,11 +877,21 @@ static struct command_result *process_json_list(struct command *cmd,
 static struct command_result *process_json_result(struct command *cmd,
 						  const char *buf,
 						  const jsmntok_t *result,
-						  const struct table_desc *td)
+						  const struct table_desc *td,
+						  u64 *last_created_index,
+						  size_t *num_entries)
 {
-	return process_json_list(cmd, buf,
-				 json_get_member(buf, result, td->arrname),
-				 NULL, td);
+	const jsmntok_t *arr;
+	struct timerel so_far = timemono_since(td->refresh_start);
+	plugin_log(cmd->plugin, LOG_DBG,
+		   "Time to call %s: %"PRIu64".%09"PRIu64" seconds",
+		   td->cmdname,
+		   (u64)so_far.ts.tv_sec, (u64)so_far.ts.tv_nsec);
+
+	arr = json_get_member(buf, result, td->arrname);
+	if (num_entries)
+		*num_entries = arr->size;
+	return process_json_list(cmd, buf, arr, NULL, td, last_created_index);
 }
 
 static struct command_result *default_list_done(struct command *cmd,
@@ -715,24 +900,25 @@ static struct command_result *default_list_done(struct command *cmd,
 						const jsmntok_t *result,
 						struct db_query *dbq)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	const struct table_desc *td = dbq->tables[0];
 	struct command_result *ret;
 	int err;
 	char *errmsg;
 
 	/* FIXME: this is where a wait / pagination API is useful! */
-	err = sqlite3_exec(db, tal_fmt(tmpctx, "DELETE FROM %s;", td->name),
+	err = sqlite3_exec(sql->db, tal_fmt(tmpctx, "DELETE FROM %s;", td->name),
 			   NULL, NULL, &errmsg);
 	if (err != SQLITE_OK) {
 		return command_fail(cmd, LIGHTNINGD, "cleaning '%s' failed: %s",
 				    td->name, errmsg);
 	}
 
-	ret = process_json_result(cmd, buf, result, td);
+	ret = process_json_result(cmd, buf, result, td, dbq->last_created_index, NULL);
 	if (ret)
 		return ret;
 
-	return one_refresh_done(cmd, dbq);
+	return one_refresh_done(cmd, dbq, false);
 }
 
 static struct command_result *default_refresh(struct command *cmd,
@@ -783,10 +969,11 @@ static bool extract_scid(int gosstore_fd, size_t off, u16 type,
 static void delete_channel_from_db(struct command *cmd,
 				   struct short_channel_id scid)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	int err;
 	char *errmsg;
 
-	err = sqlite3_exec(db,
+	err = sqlite3_exec(sql->db,
 			   tal_fmt(tmpctx,
 				   "DELETE FROM channels"
 				   " WHERE short_channel_id = '%s'",
@@ -810,7 +997,7 @@ static struct command_result *listchannels_one_done(struct command *cmd,
 	const struct table_desc *td = dbq->tables[0];
 	struct command_result *ret;
 
-	ret = process_json_result(cmd, buf, result, td);
+	ret = process_json_result(cmd, buf, result, td, dbq->last_created_index, NULL);
 	if (ret)
 		return ret;
 
@@ -822,42 +1009,43 @@ static struct command_result *channels_refresh(struct command *cmd,
 						const struct table_desc *td,
 						struct db_query *dbq)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	struct out_req *req;
 	size_t msglen;
 	u16 type, flags;
 
-	if (gosstore_fd == -1) {
-		gosstore_fd = open("gossip_store", O_RDONLY);
-		if (gosstore_fd == -1)
+	if (sql->gosstore_fd == -1) {
+		sql->gosstore_fd = open("gossip_store", O_RDONLY);
+		if (sql->gosstore_fd == -1)
 			plugin_err(cmd->plugin, "Could not open gossip_store: %s",
 				   strerror(errno));
 	}
 
 	/* First time, set off to end and load from scratch */
-	if (gosstore_channels_off == 0) {
-		gosstore_channels_off = find_gossip_store_end(gosstore_fd, 1);
+	if (sql->gosstore_channels_off == 0) {
+		sql->gosstore_channels_off = find_gossip_store_end(sql->gosstore_fd, 1);
 		return default_refresh(cmd, td, dbq);
 	}
 
 	plugin_log(cmd->plugin, LOG_DBG, "Refreshing channels @%zu...",
-		   gosstore_channels_off);
+		   sql->gosstore_channels_off);
 
 	/* OK, try catching up! */
-	while (gossip_store_readhdr(gosstore_fd, gosstore_channels_off,
+	while (gossip_store_readhdr(sql->gosstore_fd, sql->gosstore_channels_off,
 				    &msglen, NULL, &flags, &type)) {
 		struct short_channel_id scid;
-		size_t off = gosstore_channels_off;
+		size_t off = sql->gosstore_channels_off;
 
-		gosstore_channels_off += sizeof(struct gossip_hdr) + msglen;
+		sql->gosstore_channels_off += sizeof(struct gossip_hdr) + msglen;
 
 		if (flags & GOSSIP_STORE_DELETED_BIT)
 			continue;
 
 		if (type == WIRE_GOSSIP_STORE_ENDED) {
 			/* Force a reopen */
-			gosstore_channels_off = gosstore_nodes_off = 0;
-			close(gosstore_fd);
-			gosstore_fd = -1;
+			sql->gosstore_channels_off = sql->gosstore_nodes_off = 0;
+			close(sql->gosstore_fd);
+			sql->gosstore_fd = -1;
 			return channels_refresh(cmd, td, dbq);
 		}
 
@@ -866,15 +1054,15 @@ static struct command_result *channels_refresh(struct command *cmd,
 		if (type == WIRE_CHANNEL_UPDATE
 		    || type == WIRE_GOSSIP_STORE_PRIVATE_UPDATE_OBS) {
 			/* This can fail if entry not fully written yet. */
-			if (!extract_scid(gosstore_fd, off, type, &scid)) {
-				gosstore_channels_off = off;
+			if (!extract_scid(sql->gosstore_fd, off, type, &scid)) {
+				sql->gosstore_channels_off = off;
 				break;
 			}
 
 			plugin_log(cmd->plugin, LOG_DBG, "Refreshing channel: %s",
 				   fmt_short_channel_id(tmpctx, scid));
-			/* FIXME: sqlite 3.24.0 (2018-06-04) added UPSERT, but
-			 * we don't require it. */
+			/* FIXME: sqlite3 version 3.24.0 (2018-06-04) added
+			 * UPSERT, but we don't require it. */
 			delete_channel_from_db(cmd, scid);
 			req = jsonrpc_request_start(cmd, "listchannels",
 						    listchannels_one_done,
@@ -884,8 +1072,8 @@ static struct command_result *channels_refresh(struct command *cmd,
 			return send_outreq(req);
 		} else if (type == WIRE_GOSSIP_STORE_DELETE_CHAN) {
 			/* This can fail if entry not fully written yet. */
-			if (!extract_scid(gosstore_fd, off, type, &scid)) {
-				gosstore_channels_off = off;
+			if (!extract_scid(sql->gosstore_fd, off, type, &scid)) {
+				sql->gosstore_channels_off = off;
 				break;
 			}
 			plugin_log(cmd->plugin, LOG_DBG, "Deleting channel: %s",
@@ -894,7 +1082,7 @@ static struct command_result *channels_refresh(struct command *cmd,
 		}
 	}
 
-	return one_refresh_done(cmd, dbq);
+	return one_refresh_done(cmd, dbq, false);
 }
 
 static struct command_result *nodes_refresh(struct command *cmd,
@@ -910,7 +1098,7 @@ static struct command_result *listnodes_one_done(struct command *cmd,
 	const struct table_desc *td = dbq->tables[0];
 	struct command_result *ret;
 
-	ret = process_json_result(cmd, buf, result, td);
+	ret = process_json_result(cmd, buf, result, td, dbq->last_created_index, NULL);
 	if (ret)
 		return ret;
 
@@ -921,10 +1109,11 @@ static struct command_result *listnodes_one_done(struct command *cmd,
 static void delete_node_from_db(struct command *cmd,
 				const struct node_id *id)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	int err;
 	char *errmsg;
 
-	err = sqlite3_exec(db,
+	err = sqlite3_exec(sql->db,
 			   tal_fmt(tmpctx,
 				   "DELETE FROM nodes"
 				   " WHERE nodeid = X'%s'",
@@ -968,46 +1157,47 @@ static struct command_result *nodes_refresh(struct command *cmd,
 					    const struct table_desc *td,
 					    struct db_query *dbq)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	struct out_req *req;
 	size_t msglen;
 	u16 type, flags;
 
-	if (gosstore_fd == -1) {
-		gosstore_fd = open("gossip_store", O_RDONLY);
-		if (gosstore_fd == -1)
+	if (sql->gosstore_fd == -1) {
+		sql->gosstore_fd = open("gossip_store", O_RDONLY);
+		if (sql->gosstore_fd == -1)
 			plugin_err(cmd->plugin, "Could not open gossip_store: %s",
 				   strerror(errno));
 	}
 
 	/* First time, set off to end and load from scratch */
-	if (gosstore_nodes_off == 0) {
-		gosstore_nodes_off = find_gossip_store_end(gosstore_fd, 1);
+	if (sql->gosstore_nodes_off == 0) {
+		sql->gosstore_nodes_off = find_gossip_store_end(sql->gosstore_fd, 1);
 		return default_refresh(cmd, td, dbq);
 	}
 
 	/* OK, try catching up! */
-	while (gossip_store_readhdr(gosstore_fd, gosstore_nodes_off,
+	while (gossip_store_readhdr(sql->gosstore_fd, sql->gosstore_nodes_off,
 				    &msglen, NULL, &flags, &type)) {
 		struct node_id id;
-		size_t off = gosstore_nodes_off;
+		size_t off = sql->gosstore_nodes_off;
 
-		gosstore_nodes_off += sizeof(struct gossip_hdr) + msglen;
+		sql->gosstore_nodes_off += sizeof(struct gossip_hdr) + msglen;
 
 		if (flags & GOSSIP_STORE_DELETED_BIT)
 			continue;
 
 		if (type == WIRE_GOSSIP_STORE_ENDED) {
 			/* Force a reopen */
-			gosstore_nodes_off = gosstore_channels_off = 0;
-			close(gosstore_fd);
-			gosstore_fd = -1;
+			sql->gosstore_nodes_off = sql->gosstore_channels_off = 0;
+			close(sql->gosstore_fd);
+			sql->gosstore_fd = -1;
 			return nodes_refresh(cmd, td, dbq);
 		}
 
 		if (type == WIRE_NODE_ANNOUNCEMENT) {
 			/* This can fail if entry not fully written yet. */
-			if (!extract_node_id(gosstore_fd, off, type, &id)) {
-				gosstore_nodes_off = off;
+			if (!extract_node_id(sql->gosstore_fd, off, type, &id)) {
+				sql->gosstore_nodes_off = off;
 				break;
 			}
 
@@ -1024,18 +1214,36 @@ static struct command_result *nodes_refresh(struct command *cmd,
 		/* FIXME: Add WIRE_GOSSIP_STORE_DELETE_NODE marker! */
 	}
 
-	return one_refresh_done(cmd, dbq);
+	return one_refresh_done(cmd, dbq, false);
 }
 
 static struct command_result *refresh_tables(struct command *cmd,
-					    struct db_query *dbq)
+					     struct db_query *dbq)
 {
-	const struct table_desc *td;
+	struct table_desc *td;
 
 	if (tal_count(dbq->tables) == 0)
 		return refresh_complete(cmd, dbq);
 
+	/* td is const, but last_created_index needs updating, so we hand
+	 * pointer in dbq. */
 	td = dbq->tables[0];
+
+	/* If it's currently being refreshed, wait */
+	if (td->refreshing) {
+		struct refresh_waiter *rw = tal(cmd, struct refresh_waiter);
+		rw->cmd = cmd;
+		rw->dbq = dbq;
+		list_add(&td->refresh_waiters, &rw->list);
+		return command_still_pending(cmd);
+	}
+
+	if (!td->needs_refresh)
+		return next_refresh(cmd, dbq);
+
+	dbq->last_created_index = &dbq->tables[0]->last_created_index;
+	td->refreshing = true;
+	td->refresh_start = time_mono();
 	return td->refresh(cmd, dbq->tables[0], dbq);
 }
 
@@ -1043,6 +1251,7 @@ static struct command_result *json_sql(struct command *cmd,
 				       const char *buffer,
 				       const jsmntok_t *params)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	struct db_query *dbq = tal(cmd, struct db_query);
 	const char *query;
 	int err;
@@ -1062,17 +1271,18 @@ static struct command_result *json_sql(struct command *cmd,
 
 	/* This both checks we're not altering, *and* tells us what
 	 * tables to refresh. */
-	err = sqlite3_set_authorizer(db, sqlite_authorize, dbq);
+	err = sqlite3_set_authorizer(sql->db, sqlite_authorize, dbq);
 	if (err != SQLITE_OK) {
 		plugin_err(cmd->plugin, "Could not set authorizer: %s",
-			   sqlite3_errmsg(db));
+			   sqlite3_errmsg(sql->db));
 	}
 
-	err = sqlite3_prepare_v2(db, query, -1, &dbq->stmt, NULL);
-	sqlite3_set_authorizer(db, NULL, NULL);
+	err = sqlite3_prepare_v2(sql->db, query, -1, &dbq->stmt, NULL);
+	sqlite3_set_authorizer(sql->db, NULL, NULL);
 
 	if (err != SQLITE_OK) {
-		char *errmsg = tal_fmt(tmpctx, "query failed with %s", sqlite3_errmsg(db));
+		char *errmsg = tal_fmt(tmpctx, "query failed with %s",
+				       sqlite3_errmsg(sql->db));
 		if (dbq->authfail)
 			tal_append_fmt(&errmsg, " (%s)", dbq->authfail);
 		return command_fail(cmd, LIGHTNINGD, "%s", errmsg);
@@ -1096,7 +1306,8 @@ static struct command_result *param_tablename(struct command *cmd,
 					      const jsmntok_t *tok,
 					      struct table_desc **td)
 {
-	*td = strmap_getn(&tablemap, buffer + tok->start,
+	struct sql *sql = sql_of(cmd->plugin);
+	*td = strmap_getn(&sql->tablemap, buffer + tok->start,
 			  tok->end - tok->start);
 	if (!*td)
 		return command_fail_badparam(cmd, name, buffer, tok,
@@ -1138,7 +1349,8 @@ static void json_add_schema(struct json_stream *js,
 	/* This needs to be an array, not a dictionary, since dicts
 	 * are often treated as unordered, and order is critical! */
 	json_array_start(js, "columns");
-	json_add_column(js, "rowid", "INTEGER");
+	if (!td->has_created_index)
+		json_add_column(js, "rowid", "INTEGER");
 	if (td->parent) {
 		json_add_column(js, "row", "INTEGER");
 		json_add_column(js, "arrindex", "INTEGER");
@@ -1178,6 +1390,7 @@ static struct command_result *json_listsqlschemas(struct command *cmd,
 						  const char *buffer,
 						  const jsmntok_t *params)
 {
+	struct sql *sql = sql_of(cmd->plugin);
 	struct table_desc *td;
 	struct json_stream *ret;
 
@@ -1191,7 +1404,7 @@ static struct command_result *json_listsqlschemas(struct command *cmd,
 	if (td)
 		json_add_schema(ret, td);
 	else
-		strmap_iterate(&tablemap, add_one_schema, ret);
+		strmap_iterate(&sql->tablemap, add_one_schema, ret);
 	json_array_end(ret);
 	return command_finished(cmd, ret);
 }
@@ -1222,9 +1435,21 @@ static void add_sub_object(char **update_stmt, char **create_stmt,
 	}
 }
 
+/* We use created_index as INTEGER PRIMARY KEY, if it exists.
+ * Otherwise, we make an explicit rowid (implicit rowids cannot be
+ * used as a foreign key). */
+static const char *primary_key_name(const struct table_desc *td)
+{
+	if (td->has_created_index)
+		return "created_index";
+
+	return "rowid";
+}
+
 /* Creates sql statements, initializes table */
 static void finish_td(struct plugin *plugin, struct table_desc *td)
 {
+	struct sql *sql = sql_of(plugin);
 	char *create_stmt;
 	int err;
 	char *errmsg;
@@ -1235,11 +1460,13 @@ static void finish_td(struct plugin *plugin, struct table_desc *td)
 		/* But it might have sub-sub objects! */
 		goto do_subtables;
 
-	/* We make an explicit rowid in each table, for subtables to access.  This is
-	 * becuase the implicit rowid can't be used as a foreign key! */
-	create_stmt = tal_fmt(tmpctx, "CREATE TABLE %s (rowid INTEGER PRIMARY KEY, ",
-			      td->name);
-	td->update_stmt = tal_fmt(td, "INSERT INTO %s VALUES (?, ", td->name);
+	create_stmt = tal_fmt(tmpctx, "CREATE TABLE %s (", td->name);
+	td->update_stmt = tal_fmt(td, "INSERT INTO %s VALUES (", td->name);
+	/* If no created_index, create explicit rowid */
+	if (!td->has_created_index) {
+		tal_append_fmt(&create_stmt, "rowid INTEGER PRIMARY KEY, ");
+		tal_append_fmt(&td->update_stmt, "?, ");
+	}
 
 	/* If we're a child array, we reference the parent column */
 	if (td->parent) {
@@ -1248,9 +1475,9 @@ static void finish_td(struct plugin *plugin, struct table_desc *td)
 		while (parent->is_subobject)
 			parent = parent->parent;
 		tal_append_fmt(&create_stmt,
-			       "row INTEGER REFERENCES %s(rowid) ON DELETE CASCADE,"
+			       "row INTEGER REFERENCES %s(%s) ON DELETE CASCADE,"
 			       " arrindex INTEGER",
-			       parent->name);
+			       parent->name, primary_key_name(parent));
 		tal_append_fmt(&td->update_stmt, "?,?");
 		sep = ",";
 	}
@@ -1268,12 +1495,15 @@ static void finish_td(struct plugin *plugin, struct table_desc *td)
 			       sep,
 			       col->dbname,
 			       fieldtypemap[col->ftype].sqltype);
+		/* created_index serves as primary key if it exists */
+		if (streq(col->dbname, "created_index"))
+			tal_append_fmt(&create_stmt, " INTEGER PRIMARY KEY");
 		sep = ",";
 	}
 	tal_append_fmt(&create_stmt, ");");
 	tal_append_fmt(&td->update_stmt, ");");
 
-	err = sqlite3_exec(db, create_stmt, NULL, NULL, &errmsg);
+	err = sqlite3_exec(sql->db, create_stmt, NULL, NULL, &errmsg);
 	if (err != SQLITE_OK)
 		plugin_err(plugin, "Could not create %s: %s", td->name, errmsg);
 
@@ -1325,7 +1555,84 @@ static const char *db_table_name(const tal_t *ctx, const char *cmdname)
 	return ret;
 }
 
+#define LIMIT_PER_LIST 10000
+
+static struct command_result *limited_list_done(struct command *cmd,
+						const char *method,
+						const char *buf,
+						const jsmntok_t *result,
+						struct db_query *dbq)
+{
+	struct table_desc *td = dbq->tables[0];
+	struct command_result *ret;
+	size_t num_entries;
+
+	ret = process_json_result(cmd, buf, result, td, dbq->last_created_index,
+				  &num_entries);
+	if (ret)
+		return ret;
+
+	/* If we got the number we asked for, we need to ask again. */
+	return one_refresh_done(cmd, dbq, num_entries == LIMIT_PER_LIST);
+}
+
+/* The simplest case: append-only lists */
+static struct command_result *refresh_by_created_index(struct command *cmd,
+						       const struct table_desc *td,
+						       struct db_query *dbq)
+{
+	struct out_req *req;
+	req = jsonrpc_request_start(cmd, td->cmdname,
+				    limited_list_done, forward_error,
+				    dbq);
+	json_add_string(req->js, "index", "created");
+	json_add_u64(req->js, "start", *dbq->last_created_index + 1);
+	json_add_u64(req->js, "limit", LIMIT_PER_LIST);
+	return send_outreq(req);
+}
+
+struct refresh_funcs {
+	const char *cmdname;
+	struct command_result *(*refresh)(struct command *cmd,
+					  const struct table_desc *td,
+					  struct db_query *dbq);
+	const char *waitname;
+};
+
+static const struct refresh_funcs refresh_funcs[] = {
+	/* These are special, using gossmap */
+	{ "listchannels", channels_refresh, NULL },
+	{ "listnodes", nodes_refresh, NULL },
+	/* FIXME: These support wait and full pagination,  but we need to watch for deletes, too! */
+	{ "listhtlcs", default_refresh, NULL },
+	{ "listforwards", default_refresh, NULL },
+	{ "listinvoices", default_refresh, NULL },
+	{ "listsendpays", default_refresh, NULL },
+	/* These are never changed or deleted */
+	{ "listchainmoves", refresh_by_created_index, "chainmoves" },
+	{ "listchannelmoves", refresh_by_created_index, "channelmoves" },
+	/* No pagination support */
+	{ "listoffers", default_refresh, NULL },
+	{ "listpeers", default_refresh, NULL },
+	{ "listpeerchannels", default_refresh, NULL },
+	{ "listclosedchannels", default_refresh, NULL },
+	{ "listtransactions", default_refresh, NULL },
+	{ "bkpr-listaccountevents", default_refresh, NULL },
+	{ "bkpr-listincome", default_refresh, NULL },
+	{ "listnetworkevents", default_refresh, NULL },
+};
+
+static const struct refresh_funcs *find_command_refresh(const char *cmdname)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(refresh_funcs); i++) {
+		if (streq(refresh_funcs[i].cmdname, cmdname))
+			return &refresh_funcs[i];
+	}
+	abort();
+}
+
 static struct table_desc *new_table_desc(const tal_t *ctx,
+					 tablemap *tablemap,
 					 struct table_desc *parent,
 					 const jsmntok_t *cmd,
 					 const jsmntok_t *arrname,
@@ -1333,6 +1640,7 @@ static struct table_desc *new_table_desc(const tal_t *ctx,
 {
 	struct table_desc *td;
 	const char *name;
+	const struct refresh_funcs *refresh_func;
 
 	td = tal(ctx, struct table_desc);
 	td->cmdname = json_strdup(td, schemas, cmd);
@@ -1345,22 +1653,30 @@ static struct table_desc *new_table_desc(const tal_t *ctx,
 	td->is_subobject = is_subobject;
 	td->arrname = json_strdup(td, schemas, arrname);
 	td->columns = tal_arr(td, struct column *, 0);
-	if (streq(td->name, "channels"))
-		td->refresh = channels_refresh;
-	else if (streq(td->name, "nodes"))
-		td->refresh = nodes_refresh;
-	else
-		td->refresh = default_refresh;
+	td->last_created_index = 0;
+	td->has_created_index = false;
+	td->needs_refresh = true;
+	td->refreshing = false;
+	td->indices_created = false;
+	list_head_init(&td->refresh_waiters);
+
+	/* Only top-levels have refresh functions */
+	if (!parent) {
+		refresh_func = find_command_refresh(td->cmdname);
+		td->refresh = refresh_func->refresh;
+		td->waitname = refresh_func->waitname;
+	}
 
 	/* sub-objects are a JSON thing, not a real table! */
 	if (!td->is_subobject)
-		strmap_add(&tablemap, td->name, td);
+		strmap_add(tablemap, td->name, td);
 
 	return td;
 }
 
 /* Recursion */
-static void add_table_object(struct table_desc *td, const jsmntok_t *tok);
+static void add_table_object(tablemap *tablemap,
+			     struct table_desc *td, const jsmntok_t *tok);
 
 /* Simple case for arrays of a simple type. */
 static void add_table_singleton(struct table_desc *td,
@@ -1407,7 +1723,8 @@ static bool add_deprecated(const char *buffer, const jsmntok_t *tok,
 	return true;
 }
 
-static void add_table_properties(struct table_desc *td,
+static void add_table_properties(tablemap *tablemap,
+				 struct table_desc *td,
 				 const jsmntok_t *properties)
 {
 	const jsmntok_t *t;
@@ -1439,15 +1756,15 @@ static void add_table_properties(struct table_desc *td,
 			items = json_get_member(schemas, t+1, "items");
 			type = json_get_member(schemas, items, "type");
 
-			col->sub = new_table_desc(col, td, t, t, false);
+			col->sub = new_table_desc(col, tablemap, td, t, t, false);
 			/* Array of primitives?  Treat as single-entry obj */
 			if (!json_tok_streq(schemas, type, "object"))
 				add_table_singleton(col->sub, t, items);
 			else
-				add_table_object(col->sub, items);
+				add_table_object(tablemap, col->sub, items);
 		} else if (json_tok_streq(schemas, type, "object")) {
-			col->sub = new_table_desc(col, td, t, t, true);
-			add_table_object(col->sub, t+1);
+			col->sub = new_table_desc(col, tablemap, td, t, t, true);
+			add_table_object(tablemap, col->sub, t+1);
 		} else {
 			col->ftype = find_fieldtype(type);
 			col->sub = NULL;
@@ -1464,7 +1781,8 @@ static void add_table_properties(struct table_desc *td,
 }
 
 /* tok is the JSON schema member for an object */
-static void add_table_object(struct table_desc *td, const jsmntok_t *tok)
+static void add_table_object(tablemap *tablemap,
+			     struct table_desc *td, const jsmntok_t *tok)
 {
 	const jsmntok_t *t, *properties, *allof, *cond;
 	size_t i;
@@ -1472,24 +1790,24 @@ static void add_table_object(struct table_desc *td, const jsmntok_t *tok)
 	/* This might not exist inside allOf, for example */
 	properties = json_get_member(schemas, tok, "properties");
 	if (properties)
-		add_table_properties(td, properties);
+		add_table_properties(tablemap, td, properties);
 
 	allof = json_get_member(schemas, tok, "allOf");
 	if (allof) {
 		json_for_each_arr(i, t, allof)
-			add_table_object(td, t);
+			add_table_object(tablemap, td, t);
 	}
 	/* We often find interesting things in then and else branches! */
 	cond = json_get_member(schemas, tok, "then");
 	if (cond)
-		add_table_object(td, cond);
+		add_table_object(tablemap, td, cond);
 	cond = json_get_member(schemas, tok, "else");
 	if (cond)
-		add_table_object(td, cond);
+		add_table_object(tablemap, td, cond);
 }
 
 /* plugin is NULL if we're just doing --print-docs */
-static void init_tablemap(struct plugin *plugin)
+static void init_tablemap(struct plugin *plugin, tablemap *tablemap)
 {
 	const jsmntok_t *toks, *t;
 	const tal_t *ctx;
@@ -1500,7 +1818,7 @@ static void init_tablemap(struct plugin *plugin)
 	else
 		ctx = tmpctx;
 
-	strmap_init(&tablemap);
+	strmap_init(tablemap);
 
 	toks = json_parse_simple(tmpctx, schemas, strlen(schemas));
 	json_for_each_obj(i, t, toks) {
@@ -1515,46 +1833,28 @@ static void init_tablemap(struct plugin *plugin)
 		type = json_get_member(schemas, items, "type");
 		assert(json_tok_streq(schemas, type, "object"));
 
-		td = new_table_desc(ctx, NULL, t, cmd, false);
-		add_table_object(td, items);
+		td = new_table_desc(ctx, tablemap, NULL, t, cmd, false);
+		add_table_object(tablemap, td, items);
+		td->has_created_index = find_column(td, "created_index");
 
 		if (plugin)
 			finish_td(plugin, td);
 	}
 }
 
-static void init_indices(struct plugin *plugin)
-{
-	for (size_t i = 0; i < ARRAY_SIZE(indices); i++) {
-		char *errmsg, *cmd;
-		int err;
-
-		cmd = tal_fmt(tmpctx, "CREATE INDEX %s_%zu_idx ON %s (%s",
-			      indices[i].tablename, i,
-			      indices[i].tablename,
-			      indices[i].fields[0]);
-		if (indices[i].fields[1])
-			tal_append_fmt(&cmd, ", %s", indices[i].fields[1]);
-		tal_append_fmt(&cmd, ");");
-		err = sqlite3_exec(db, cmd, NULL, NULL, &errmsg);
-		if (err != SQLITE_OK)
-			plugin_err(plugin, "Failed '%s': %s", cmd, errmsg);
-	}
-}
-
 static void memleak_mark_tablemap(struct plugin *p, struct htable *memtable)
 {
-	memleak_ptr(memtable, dbfilename);
-	memleak_scan_strmap(memtable, &tablemap);
+	struct sql *sql = sql_of(p);
+	memleak_scan_strmap(memtable, &sql->tablemap);
 }
 
 static const char *init(struct command *init_cmd,
 			const char *buf UNUSED, const jsmntok_t *config UNUSED)
 {
 	struct plugin *plugin = init_cmd->plugin;
-	db = sqlite_setup(plugin);
-	init_tablemap(plugin);
-	init_indices(plugin);
+	struct sql *sql = sql_of(plugin);
+	sql->db = sqlite_setup(plugin);
+	init_tablemap(plugin, &sql->tablemap);
 
 	plugin_set_memleak_handler(plugin, memleak_mark_tablemap);
 	return NULL;
@@ -1577,20 +1877,22 @@ static const char *fmt_indexes(const tal_t *ctx, const char *table)
 	for (size_t i = 0; i < ARRAY_SIZE(indices); i++) {
 		if (!streq(indices[i].tablename, table))
 			continue;
-		/* FIXME: Handle multiple indices! */
-		assert(!ret);
+		if (!ret)
+			ret = tal_fmt(ctx, " indexed by ");
+		else
+			tal_append_fmt(&ret, ", also indexed by ");
 		BUILD_ASSERT(ARRAY_SIZE(indices[i].fields) == 2);
 		if (indices[i].fields[1])
-			ret = tal_fmt(tmpctx, "%s and %s",
-				      indices[i].fields[0],
-				      indices[i].fields[1]);
+			tal_append_fmt(&ret, "`%s` and `%s`",
+				       indices[i].fields[0],
+				       indices[i].fields[1]);
 		else
-			ret = tal_fmt(tmpctx, "%s",
-				      indices[i].fields[0]);
+			tal_append_fmt(&ret, "`%s`",
+				       indices[i].fields[0]);
 	}
 	if (!ret)
 		return "";
-	return tal_fmt(ctx, " indexed by `%s`", ret);
+	return ret;
 }
 
 static const char *json_prefix(const tal_t *ctx,
@@ -1615,9 +1917,10 @@ static void print_columns(const struct table_desc *td, const char *indent,
 				subindent = tal_fmt(tmpctx, "%s  ", indent);
 				printf("%s- related table `%s`%s\n",
 				       indent, subtd->name, objsrc);
-				printf("%s- `row` (reference to `%s.rowid`, sqltype `INTEGER`)\n"
+				printf("%s- `row` (reference to `%s.%s`, sqltype `INTEGER`)\n"
 				       "%s- `arrindex` (index within array, sqltype `INTEGER`)\n",
-				       subindent, td->name, subindent);
+				       subindent, td->name, primary_key_name(td),
+				       subindent);
 				print_columns(subtd, subindent, "");
 			} else {
 				const char *subobjsrc;
@@ -1639,10 +1942,12 @@ static void print_columns(const struct table_desc *td, const char *indent,
 					 td->columns[i]->jsonname);
 		} else
 			origin = "";
-		printf("%s- `%s` (type `%s`, sqltype `%s`%s%s)\n",
+		printf("%s- `%s` (type `%s`, sqltype `%s%s`%s%s)\n",
 		       indent, td->columns[i]->dbname,
 		       fieldtypemap[td->columns[i]->ftype].name,
 		       fieldtypemap[td->columns[i]->ftype].sqltype,
+		       streq(td->columns[i]->dbname, "created_index")
+		       ? " PRIMARY KEY" : "",
 		       origin, objsrc);
 	}
 }
@@ -1664,23 +1969,32 @@ static bool print_one_table(const char *member,
 
 int main(int argc, char *argv[])
 {
+	struct sql *sql;
 	setup_locale();
 
 	if (argc == 2 && streq(argv[1], "--print-docs")) {
+		tablemap tablemap;
 		common_setup(argv[0]);
+
 		/* plugin is NULL, so just sets up tables */
-		init_tablemap(NULL);
+		init_tablemap(NULL, &tablemap);
 
 		printf("The following tables are currently supported:\n");
 		strmap_iterate(&tablemap, print_one_table, NULL);
 		common_shutdown();
 		return 0;
 	}
-	plugin_main(argv, init, NULL, PLUGIN_RESTARTABLE, true, NULL, commands, ARRAY_SIZE(commands),
+
+	sql = tal(NULL, struct sql);
+	sql->dbfilename = NULL;
+	sql->gosstore_fd = -1;
+	sql->gosstore_nodes_off = sql->gosstore_channels_off = 0;
+	sql->next_rowid = 1;
+	plugin_main(argv, init, take(sql), PLUGIN_RESTARTABLE, true, NULL, commands, ARRAY_SIZE(commands),
 	            NULL, 0, NULL, 0, NULL, 0,
 		    plugin_option_dev("dev-sqlfilename",
 				      "string",
 				      "Use on-disk sqlite3 file instead of in memory (e.g. debugging)",
-				      charp_option, NULL, &dbfilename),
+				      charp_option, NULL, &sql->dbfilename),
 		    NULL);
 }

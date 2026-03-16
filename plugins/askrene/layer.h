@@ -14,8 +14,12 @@
 #include <common/node_id.h>
 
 struct askrene;
+struct command;
 struct layer;
 struct json_stream;
+
+/* Create a layer hash table */
+struct layer_name_hash *new_layer_name_hash(const tal_t *ctx);
 
 /* Look up a layer by name. */
 struct layer *find_layer(struct askrene *askrene, const char *name);
@@ -56,11 +60,21 @@ void layer_add_local_channel(struct layer *layer,
 			     struct amount_msat capacity);
 
 /* Add/set a bias for this layer.  Returns NULL if bias_factor is 0. */
+// FIXME: add timestamp
 const struct bias *layer_set_bias(struct layer *layer,
 				  const struct short_channel_id_dir *scidd,
 				  const char *description TAKES,
 				  s8 bias_factor,
-				  bool relative);
+				  bool relative,
+				  u64 timestamp);
+
+const struct node_bias *layer_set_node_bias(struct layer *layer,
+					    const struct node_id *node,
+					    const char *description TAKES,
+					    s8 bias_factor,
+					    bool relative,
+					    bool dir_out,
+					    u64 timestamp);
 
 /* Update details on a channel (could be in this layer, or another) */
 void layer_add_update_channel(struct layer *layer,
@@ -110,7 +124,7 @@ void layer_add_disabled_node(struct layer *layer, const struct node_id *node);
 
 /* Print out a json object for this layer, or all if layer is NULL */
 void json_add_layers(struct json_stream *js,
-		     struct askrene *askrene,
+		     const struct askrene *askrene,
 		     const char *fieldname,
 		     const struct layer *layer);
 
@@ -126,6 +140,11 @@ void json_add_bias(struct json_stream *js,
 		   const struct bias *b,
 		   const struct layer *layer);
 
+void json_add_node_bias(struct json_stream *js,
+                        const char *fieldname,
+                        const struct node_bias *b,
+                        const struct layer *layer);
+
 /* For explain_failure: did this layer create this scid? */
 bool layer_created(const struct layer *layer, struct short_channel_id scid);
 
@@ -135,6 +154,4 @@ bool layer_disables_chan(const struct layer *layer, const struct short_channel_i
 /* For explain_failure: did this layer disable this node? */
 bool layer_disables_node(const struct layer *layer, const struct node_id *node);
 
-/* Scan for memleaks */
-void layer_memleak_mark(struct askrene *askrene, struct htable *memtable);
 #endif /* LIGHTNING_PLUGINS_ASKRENE_LAYER_H */

@@ -1,30 +1,20 @@
 #include "config.h"
-#include <bitcoin/base58.h>
 #include <bitcoin/script.h>
-#include <ccan/array_size/array_size.h>
-#include <ccan/cast/cast.h>
+#include <ccan/mem/mem.h>
 #include <common/addr.h>
 #include <common/base64.h>
 #include <common/bech32.h>
-#include <common/configdir.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/key_derive.h>
 #include <common/psbt_keypath.h>
 #include <common/psbt_open.h>
 #include <db/exec.h>
 #include <errno.h>
 #include <hsmd/hsmd_wiregen.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
-#include <lightningd/coin_mvts.h>
 #include <lightningd/hsm_control.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/lightningd.h>
-#include <lightningd/peer_control.h>
+#include <lightningd/notification.h>
 #include <wallet/txfilter.h>
 #include <wallet/walletrpc.h>
-#include <wally_psbt.h>
 #include <wire/wire_sync.h>
 
 /* May return NULL if encoding error occurs. */
@@ -120,21 +110,31 @@ bool WARN_UNUSED_RESULT newaddr_inner(struct command *cmd, struct pubkey *pubkey
 	s64 keyidx;
 	u8 *b32script;
 	u8 *p2tr_script;
+	bool use_bip86_base = (cmd->ld->bip86_base != NULL);
 
+	/* Get new index - wallet_get_newindex now handles both BIP32 and BIP86 */
 	keyidx = wallet_get_newindex(cmd->ld, addrtype);
-	if (keyidx < 0) {
-		// return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
-		return false;
+	if (keyidx < 0) return false;
+
+	/* Choose derivation method based on wallet type */
+	if (use_bip86_base) {
+		/* Wallet has mnemonic - use BIP86 derivation */
+		bip86_pubkey(cmd->ld, pubkey, keyidx);
+	} else {
+		/* Legacy wallet - use BIP32 derivation */
+		bip32_pubkey(cmd->ld, pubkey, keyidx);
 	}
 
-	bip32_pubkey(cmd->ld, pubkey, keyidx);
-
+	/* Generate scripts from pubkey (same logic for both wallet types) */
 	b32script = scriptpubkey_p2wpkh(tmpctx, pubkey);
 	p2tr_script = scriptpubkey_p2tr(tmpctx, pubkey);
+
+	/* Add scripts to filter based on requested address type */
 	if (addrtype & ADDR_BECH32)
 		txfilter_add_scriptpubkey(cmd->ld->owned_txfilter, b32script);
 	if (addrtype & ADDR_P2TR)
 		txfilter_add_scriptpubkey(cmd->ld->owned_txfilter, p2tr_script);
+
 	return true;
 }
 
@@ -150,14 +150,26 @@ static struct command_result *json_newaddr(struct command *cmd,
 	char *bech32, *p2tr;
 
 	if (!param(cmd, buffer, params,
-		   p_opt_def("addresstype", param_newaddr, &addrtype, ADDR_BECH32),
+		   p_opt("addresstype", param_newaddr, &addrtype),
 		   NULL))
 		return command_param_failed();
+
+	if (!addrtype) {
+		addrtype = tal(cmd, enum addrtype);
+		if (command_deprecated_in_ok(cmd, "addresstype.defaultbech32",
+					     "v25.12", "v26.12"))
+			*addrtype = ADDR_ALL;
+		else
+			*addrtype = ADDR_P2TR;
+	}
 
 	if (!newaddr_inner(cmd, &pubkey, *addrtype)) {
 		return command_fail(cmd, LIGHTNINGD, "Keys exhausted ");
 	};
 
+	response = json_stream_success(cmd);
+
+	/* Generate addresses based on requested type */
 	bech32 = encode_pubkey_to_addr(cmd, &pubkey, ADDR_BECH32, NULL);
 	p2tr = encode_pubkey_to_addr(cmd, &pubkey, ADDR_P2TR, NULL);
 	if (!bech32 || !p2tr) {
@@ -165,7 +177,6 @@ static struct command_result *json_newaddr(struct command *cmd,
 				    "p2wpkh address encoding failure.");
 	}
 
-	response = json_stream_success(cmd);
 	if (*addrtype & ADDR_BECH32)
 		json_add_string(response, "bech32", bech32);
 	if (*addrtype & ADDR_P2TR)
@@ -182,7 +193,8 @@ AUTODATA(json_command, &newaddr_command);
 static void json_add_address_details(struct json_stream *response,
 				 const u64 keyidx,
 				 const char *out_p2wpkh,
-				 const char *out_p2tr)
+				 const char *out_p2tr,
+				 enum addrtype addrtype)
 {
 	json_object_start(response, NULL);
 	json_add_u64(response, "keyidx", keyidx);
@@ -227,7 +239,14 @@ static struct command_result *json_listaddresses(struct command *cmd,
 		if (listaddrtypes[i].keyidx == BIP32_INITIAL_HARDENED_CHILD){
 			break;
 		}
-		bip32_pubkey(cmd->ld, &pubkey, listaddrtypes[i].keyidx);
+		/* Use appropriate derivation based on wallet type */
+		if (cmd->ld->bip86_base) {
+			/* Mnemonic wallet - use BIP86 derivation */
+			bip86_pubkey(cmd->ld, &pubkey, listaddrtypes[i].keyidx);
+		} else {
+			/* Legacy wallet - use BIP32 derivation */
+			bip32_pubkey(cmd->ld, &pubkey, listaddrtypes[i].keyidx);
+		}
 		char *out_p2wpkh = "";
 		char *out_p2tr = "";
 		if (listaddrtypes[i].addrtype == ADDR_BECH32 || listaddrtypes[i].addrtype == ADDR_ALL) {
@@ -250,7 +269,7 @@ static struct command_result *json_listaddresses(struct command *cmd,
 			}
 		}
 		if (!addr || streq(addr, out_p2wpkh) || streq(addr, out_p2tr)) {
-			json_add_address_details(response, listaddrtypes[i].keyidx, out_p2wpkh, out_p2tr);
+			json_add_address_details(response, listaddrtypes[i].keyidx, out_p2wpkh, out_p2tr, listaddrtypes[i].addrtype);
 			if (addr) {
 				break;
 			}
@@ -273,28 +292,40 @@ static struct command_result *json_listaddrs(struct command *cmd,
 {
 	struct json_stream *response;
 	struct pubkey pubkey;
-	u64 *bip32_max_index;
+	u64 *max_index;
+	bool use_bip86 = (cmd->ld->bip86_base != NULL);
 
 	if (!param(cmd, buffer, params,
-		   p_opt("bip32_max_index", param_u64, &bip32_max_index),
+		   p_opt("max_index", param_u64, &max_index),
 		   NULL))
 		return command_param_failed();
 
-	if (!bip32_max_index) {
-		bip32_max_index = tal(cmd, u64);
-		*bip32_max_index = db_get_intvar(cmd->ld->wallet->db,
-						 "bip32_max_index", 0);
+	if (!max_index) {
+		max_index = tal(cmd, u64);
+		/* Use bip86_max_index for BIP86 wallets, bip32_max_index for legacy */
+		if (use_bip86) {
+			*max_index = db_get_intvar(cmd->ld->wallet->db,
+						   "bip86_max_index", 0);
+		} else {
+			*max_index = db_get_intvar(cmd->ld->wallet->db,
+						   "bip32_max_index", 0);
+		}
 	}
 	response = json_stream_success(cmd);
 	json_array_start(response, "addresses");
 
-	for (s64 keyidx = 1; keyidx <= *bip32_max_index; keyidx++) {
+	for (s64 keyidx = 1; keyidx <= *max_index; keyidx++) {
 
 		if (keyidx == BIP32_INITIAL_HARDENED_CHILD){
 			break;
 		}
 
-		bip32_pubkey(cmd->ld, &pubkey, keyidx);
+		/* Use BIP86 derivation for BIP86 wallets, BIP32 for legacy */
+		if (use_bip86) {
+			bip86_pubkey(cmd->ld, &pubkey, keyidx);
+		} else {
+			bip32_pubkey(cmd->ld, &pubkey, keyidx);
+		}
 
 		// bech32 : p2wpkh
 		u8 *redeemscript_p2wpkh;
@@ -720,9 +751,11 @@ static struct command_result *match_psbt_inputs_to_utxos(struct command *cmd,
 	return NULL;
 }
 
-static void match_psbt_outputs_to_wallet(struct wally_psbt *psbt,
+static bool match_psbt_outputs_to_wallet(struct wally_psbt *psbt,
 				  struct wallet *w)
 {
+	bool ok = true;
+
 	tal_wally_start();
 	for (size_t outndx = 0; outndx < psbt->num_outputs; ++outndx) {
 		struct ext_key ext;
@@ -738,11 +771,16 @@ static void match_psbt_outputs_to_wallet(struct wally_psbt *psbt,
 			abort();
 		}
 
-		psbt_output_set_keypath(index, &ext,
-					is_p2tr(script, script_len, NULL),
-					&psbt->outputs[outndx]);
+		if (!psbt_output_set_keypath(index, &ext,
+					     is_p2tr(script, script_len, NULL),
+					     &psbt->outputs[outndx])) {
+			ok = false;
+			break;
+		}
 	}
 	tal_wally_end(psbt);
+
+	return ok;
 }
 
 static struct command_result *param_input_numbers(struct command *cmd,
@@ -824,7 +862,9 @@ static struct command_result *json_signpsbt(struct command *cmd,
 		return command_check_done(cmd);
 
 	/* Update the keypaths on any outputs that are in our wallet (change addresses). */
-	match_psbt_outputs_to_wallet(psbt, cmd->ld->wallet);
+	if (!match_psbt_outputs_to_wallet(psbt, cmd->ld->wallet))
+		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
+				    "Could not add keypaths to PSBT?");
 
 	/* FIXME: hsm will sign almost anything, but it should really
 	 * fail cleanly (not abort!) and let us report the error here. */
@@ -946,13 +986,12 @@ static void maybe_notify_new_external_send(struct lightningd *ld,
 
 	mvt = new_coin_external_deposit(NULL, &outpoint,
 					0, amount,
-					DEPOSIT);
+					mk_mvt_tags(MVT_DEPOSIT));
 
-	mvt->originating_acct = WALLET;
-	notify_chain_mvt(ld, mvt);
-	tal_free(mvt);
+	mvt->originating_acct = new_mvt_account_id(mvt,  NULL, ACCOUNT_NAME_WALLET);
+
+	wallet_save_chain_mvt(ld, take(mvt));
 }
-
 
 static void sendpsbt_done(struct bitcoind *bitcoind UNUSED,
 			  bool success, const char *msg,
@@ -985,10 +1024,14 @@ static void sendpsbt_done(struct bitcoind *bitcoind UNUSED,
 	}
 
 	wallet_transaction_add(ld->wallet, sending->wtx, 0, 0);
+	wally_txid(sending->wtx, &txid);
 
 	/* Extract the change output and add it to the DB */
-	wallet_extract_owned_outputs(ld->wallet, sending->wtx, false, NULL);
-	wally_txid(sending->wtx, &txid);
+	if (wallet_extract_owned_outputs(ld->wallet, sending->wtx, false, NULL) == 0) {
+		/* If we're not watching it for selfish reasons (i.e. pure send to
+		 * others), make sure we're watching it so we can update depth in db */
+		watch_unconfirmed_txid(ld, ld->topology, &txid);
+	}
 
 	for (size_t i = 0; i < sending->psbt->num_outputs; i++)
 		maybe_notify_new_external_send(ld, &txid, i, sending->psbt);
@@ -1035,6 +1078,85 @@ static const struct json_command dev_finalizepsbt_command = {
 };
 AUTODATA(json_command, &dev_finalizepsbt_command);
 
+/* Yuck. */
+static const u8 *psbt_input_txid(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->inputs[index].txhash;
+	return psbt->inputs[index].txhash;
+}
+
+static u32 psbt_input_index(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->inputs[index].index;
+	return psbt->inputs[index].index;
+}
+
+static u32 psbt_input_sequence(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->inputs[index].sequence;
+	return psbt->inputs[index].sequence;
+}
+
+static u64 psbt_output_amount(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->outputs[index].satoshi;
+	return psbt->outputs[index].amount;
+}
+
+static size_t psbt_output_scriptlen(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->outputs[index].script_len;
+	return psbt->outputs[index].script_len;
+}
+
+static const u8 *psbt_output_script(const struct wally_psbt *psbt, size_t index)
+{
+	if (psbt->version == WALLY_PSBT_VERSION_0)
+		return psbt->tx->outputs[index].script;
+	return psbt->outputs[index].script;
+}
+
+/* We consider two PSBTs *equivalent* if they have the same inputs and outputs */
+static bool psbt_equivalent(const struct wally_psbt *a,
+			    const struct wally_psbt *b)
+{
+	if (a->num_inputs != b->num_inputs)
+		return false;
+	if (a->num_outputs != b->num_outputs)
+		return false;
+
+	for (size_t i = 0; i < a->num_inputs; i++) {
+		if (!memeq(psbt_input_txid(a, i), WALLY_TXHASH_LEN,
+			   psbt_input_txid(b, i), WALLY_TXHASH_LEN))
+			return false;
+
+		if (psbt_input_index(a, i) != psbt_input_index(b, i))
+			return false;
+
+		if (psbt_input_sequence(a, i) != psbt_input_sequence(b, i))
+			return false;
+	}
+
+	for (size_t i = 0; i < a->num_outputs; i++) {
+		size_t a_scriptlen, b_scriptlen;
+
+		if (psbt_output_amount(a, i) != psbt_output_amount(b, i))
+			return false;
+		a_scriptlen = psbt_output_scriptlen(a, i);
+		b_scriptlen = psbt_output_scriptlen(b, i);
+		if (!memeq(psbt_output_script(a, i), a_scriptlen,
+			   psbt_output_script(b, i), b_scriptlen))
+			return false;
+	}
+
+	return true;
+}
+
 static struct command_result *json_sendpsbt(struct command *cmd,
 					    const char *buffer,
 					    const jsmntok_t *obj,
@@ -1045,6 +1167,8 @@ static struct command_result *json_sendpsbt(struct command *cmd,
 	struct wally_psbt *psbt;
 	struct lightningd *ld = cmd->ld;
 	u32 *reserve_blocks;
+	struct peer *p;
+	struct peer_node_id_map_iter it;
 
 	if (!param_check(cmd, buffer, params,
 			 p_req("psbt", param_psbt, &psbt),
@@ -1078,6 +1202,35 @@ static struct command_result *json_sendpsbt(struct command *cmd,
 
 	if (command_check_only(cmd))
 		return command_check_done(cmd);
+
+	/* If this corresponds to one or more channels' PSBT, upgrade
+	 * those to signed versions! */
+	for (p = peer_node_id_map_first(ld->peers, &it);
+	     p;
+	     p = peer_node_id_map_next(ld->peers, &it)) {
+		struct channel *c;
+
+		list_for_each(&p->channels, c, list) {
+			bool was_withheld;
+
+			if (!c->funding_psbt)
+				continue;
+			if (psbt_is_finalized(c->funding_psbt))
+				continue;
+			if (!psbt_equivalent(psbt, c->funding_psbt))
+				continue;
+
+			/* Found one! */
+			tal_free(c->funding_psbt);
+			c->funding_psbt = clone_psbt(c, sending->psbt);
+			was_withheld = c->withheld;
+			c->withheld = false;
+			wallet_channel_save(ld->wallet, c);
+			log_info(c->log,
+				 "Funding PSBT sent, and stored for rexmit%s",
+				 was_withheld ? " (was withheld)" : "");
+		}
+	}
 
 	for (size_t i = 0; i < tal_count(sending->utxos); i++) {
 		if (!wallet_reserve_utxo(ld->wallet, sending->utxos[i],
@@ -1141,36 +1294,22 @@ json_signmessagewithkey(struct command *cmd, const char *buffer,
 		    "HSM does not support signing BIP137 signing.");
 	}
 
-	const u32 bip32_max_index =
-	    db_get_intvar(cmd->ld->wallet->db, "bip32_max_index", 0);
-        bool match_found = false;
 	u32 keyidx;
-        enum addrtype addrtype;
+	enum addrtype addrtype;
 
-	/* loop over all generated keys, find a matching key */
-	for (keyidx = 1; keyidx <= bip32_max_index; keyidx++) {
-		bip32_pubkey(cmd->ld, &pubkey, keyidx);
-		u8 *redeemscript_p2wpkh;
-		char *out_p2wpkh = encode_pubkey_to_addr(
-		    cmd, &pubkey, ADDR_BECH32, &redeemscript_p2wpkh);
-		if (!out_p2wpkh) {
-			abort();
-		}
-		/* wallet_get_addrtype fails for entries prior to v24.11, all
-		 * address types are assumed in that case. */
-		if (!wallet_get_addrtype(cmd->ld->wallet, keyidx, &addrtype))
-			addrtype = ADDR_ALL;
-		if (streq(addr, out_p2wpkh) &&
-		    (addrtype == ADDR_BECH32 || addrtype == ADDR_ALL)) {
-			match_found = true;
-			break;
-		}
-	}
-
-	if (!match_found) {
+	/* Use wallet_can_spend which handles both BIP32 and BIP86 addresses */
+	if (!wallet_can_spend(cmd->ld->wallet, scriptpubkey, script_len,
+			      &keyidx, &addrtype)) {
 		return command_fail(
 		    cmd, JSONRPC2_INVALID_PARAMS,
 		    "Address is not found in the wallet's database");
+	}
+
+	/* Derive the pubkey for the found key index */
+	if (cmd->ld->bip86_base) {
+		bip86_pubkey(cmd->ld, &pubkey, keyidx);
+	} else {
+		bip32_pubkey(cmd->ld, &pubkey, keyidx);
 	}
 
 	/* wire to hsmd a sign request */
@@ -1217,3 +1356,91 @@ static const struct json_command signmessagewithkey_command = {
 	json_signmessagewithkey
 };
 AUTODATA(json_command, &signmessagewithkey_command);
+
+static struct command_result *
+json_listnetworkevents(struct command *cmd,
+		       const char *buffer,
+		       const jsmntok_t *obj UNNEEDED,
+		       const jsmntok_t *params)
+{
+	struct node_id *specific_id;
+	enum wait_index *listindex;
+	u64 *liststart;
+	u32 *listlimit;
+	struct db_stmt *stmt;
+	struct json_stream *response;
+
+	if (!param(cmd, buffer, params,
+		   p_opt("id", param_node_id, &specific_id),
+		   p_opt("index", param_index, &listindex),
+		   p_opt_def("start", param_u64, &liststart, 0),
+		   p_opt("limit", param_u32, &listlimit),
+		   NULL))
+		return command_param_failed();
+
+	response = json_stream_success(cmd);
+	json_array_start(response, "networkevents");
+	stmt = wallet_network_events_first(cmd->ld->wallet,
+					   specific_id,
+					   *liststart,
+					   listlimit);
+	while (stmt) {
+		u64 id;
+		struct node_id peer_id;
+		enum network_event etype;
+		const char *reason;
+		u64 timestamp, duration_nsec;
+		bool connect_attempted;
+
+		wallet_network_events_extract(tmpctx, stmt,
+					      &id, &peer_id, &timestamp, &etype,
+					      &reason, &duration_nsec,
+					      &connect_attempted);
+		json_object_start(response, NULL);
+		json_add_u64(response, "created_index", id);
+		json_add_node_id(response, "peer_id", &peer_id);
+		json_add_string(response, "type", network_event_name(etype));
+		json_add_u64(response, "timestamp", timestamp);
+		if (reason)
+			json_add_string(response, "reason", reason);
+		if (duration_nsec)
+			json_add_u64(response, "duration_nsec", duration_nsec);
+		if (etype == NETWORK_EVENT_CONNECTFAIL)
+			json_add_bool(response, "connect_attempted", connect_attempted);
+		json_object_end(response);
+		stmt = wallet_network_events_next(cmd->ld->wallet, stmt);
+	}
+	json_array_end(response);
+	return command_success(cmd, response);
+}
+
+static const struct json_command listnetworkevents_cmd = {
+	"listnetworkevents",
+	json_listnetworkevents
+};
+AUTODATA(json_command, &listnetworkevents_cmd);
+
+static struct command_result *json_delnetworkevent(struct command *cmd,
+						   const char *buffer,
+						   const jsmntok_t *obj UNNEEDED,
+						   const jsmntok_t *params)
+{
+	u64 *created_index;
+
+	if (!param(cmd, buffer, params,
+		   p_req("created_index", param_u64, &created_index),
+		   NULL))
+		return command_param_failed();
+
+	if (!wallet_network_event_delete(cmd->ld->wallet, *created_index))
+		return command_fail(cmd, DELNETWORKEVENT_NOT_FOUND,
+				    "Could not find that networkevent");
+
+	return command_success(cmd, json_stream_success(cmd));
+}
+
+static const struct json_command delnetworkevent_command = {
+	"delnetworkevent",
+	json_delnetworkevent,
+};
+AUTODATA(json_command, &delnetworkevent_command);

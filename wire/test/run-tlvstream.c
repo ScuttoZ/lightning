@@ -9,7 +9,9 @@ static const char *reason;
 #include <common/amount.c>
 #include <common/bigsize.c>
 #include <common/channel_type.h>
+#include <common/memleak.h>
 #include <common/node_id.c>
+#include <common/randbytes.h>
 #include <common/setup.h>
 
 #include <wire/peer_wiregen.c>
@@ -28,6 +30,12 @@ int chainparams_get_ln_port(const struct chainparams *params UNNEEDED)
 bool fromwire_channel_id(const u8 **cursor UNNEEDED, size_t *max UNNEEDED,
 			 struct channel_id *channel_id UNNEEDED)
 { fprintf(stderr, "fromwire_channel_id called!\n"); abort(); }
+/* Generated stub for randbytes_ */
+void randbytes_(void *bytes UNNEEDED, size_t num_bytes UNNEEDED, u64 *offset UNNEEDED)
+{ fprintf(stderr, "randbytes_ called!\n"); abort(); }
+/* Generated stub for randbytes_overridden */
+bool randbytes_overridden(void)
+{ fprintf(stderr, "randbytes_overridden called!\n"); abort(); }
 /* Generated stub for towire_channel_id */
 void towire_channel_id(u8 **pptr UNNEEDED, const struct channel_id *channel_id UNNEEDED)
 { fprintf(stderr, "towire_channel_id called!\n"); abort(); }

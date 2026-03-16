@@ -1,46 +1,23 @@
 #include "config.h"
-#include <arpa/inet.h>
 #include <bitcoin/feerate.h>
 #include <bitcoin/script.h>
-#include <bitcoin/tx.h>
 #include <ccan/array_size/array_size.h>
 #include <ccan/asort/asort.h>
-#include <ccan/cast/cast.h>
-#include <ccan/io/io.h>
-#include <ccan/mem/mem.h>
-#include <ccan/noerr/noerr.h>
-#include <ccan/str/str.h>
-#include <ccan/take/take.h>
 #include <ccan/tal/str/str.h>
 #include <channeld/channeld_wiregen.h>
 #include <common/addr.h>
-#include <common/closing_fee.h>
-#include <common/configdir.h>
-#include <common/dev_disconnect.h>
-#include <common/features.h>
+#include <common/channel_id.h>
 #include <common/htlc_trim.h>
 #include <common/initial_commit_tx.h>
 #include <common/json_channel_type.h>
 #include <common/json_command.h>
-#include <common/json_param.h>
-#include <common/jsonrpc_errors.h>
-#include <common/key_derive.h>
-#include <common/scb_wiregen.h>
-#include <common/shutdown_scriptpubkey.h>
-#include <common/status.h>
 #include <common/timeout.h>
-#include <common/utils.h>
 #include <common/version.h>
 #include <common/wire_error.h>
 #include <connectd/connectd_wiregen.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <gossipd/gossipd_wiregen.h>
 #include <hsmd/hsmd_wiregen.h>
-#include <inttypes.h>
 #include <lightningd/anchorspend.h>
-#include <lightningd/bitcoind.h>
-#include <lightningd/chaintopology.h>
 #include <lightningd/channel.h>
 #include <lightningd/channel_control.h>
 #include <lightningd/channel_gossip.h>
@@ -48,31 +25,27 @@
 #include <lightningd/closing_control.h>
 #include <lightningd/connect_control.h>
 #include <lightningd/dual_open_control.h>
-#include <lightningd/gossip_control.h>
 #include <lightningd/hsm_control.h>
-#include <lightningd/jsonrpc.h>
-#include <lightningd/lightningd.h>
-#include <lightningd/log.h>
 #include <lightningd/memdump.h>
 #include <lightningd/notification.h>
 #include <lightningd/onchain_control.h>
 #include <lightningd/opening_common.h>
 #include <lightningd/opening_control.h>
-#include <lightningd/options.h>
 #include <lightningd/peer_control.h>
 #include <lightningd/peer_fd.h>
 #include <lightningd/peer_htlcs.h>
 #include <lightningd/plugin_hook.h>
-#include <lightningd/subd.h>
-#include <limits.h>
 #include <onchaind/onchaind_wiregen.h>
 #include <openingd/dualopend_wiregen.h>
 #include <openingd/openingd_wiregen.h>
-#include <stdlib.h>
 #include <unistd.h>
-#include <wally_bip32.h>
-#include <wire/onion_wire.h>
-#include <wire/wire_sync.h>
+
+/* FIXME: Reorder! */
+static void peer_disconnected(struct lightningd *ld,
+			      const struct node_id *id,
+			      u64 connectd_counter,
+			      u64 connected_time_nsec,
+			      bool fail_connect_attempts);
 
 /* Common pattern: create a sockpair for this channel, return one as a peer_fd */
 struct peer_fd *sockpair(const tal_t *ctx, struct channel *channel,
@@ -231,7 +204,12 @@ u8 *p2wpkh_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
 {
 	struct pubkey shutdownkey;
 
-	bip32_pubkey(ld, &shutdownkey, keyidx);
+	/* Use BIP86 derivation if wallet has BIP86 base, otherwise use BIP32 */
+	if (ld->bip86_base) {
+		bip86_pubkey(ld, &shutdownkey, keyidx);
+	} else {
+		bip32_pubkey(ld, &shutdownkey, keyidx);
+	}
 	return scriptpubkey_p2wpkh(ctx, &shutdownkey);
 }
 
@@ -239,7 +217,12 @@ u8 *p2tr_for_keyidx(const tal_t *ctx, struct lightningd *ld, u64 keyidx)
 {
 	struct pubkey shutdownkey;
 
-	bip32_pubkey(ld, &shutdownkey, keyidx);
+	/* Use BIP86 derivation if wallet has BIP86 base, otherwise use BIP32 */
+	if (ld->bip86_base) {
+		bip86_pubkey(ld, &shutdownkey, keyidx);
+	} else {
+		bip32_pubkey(ld, &shutdownkey, keyidx);
+	}
 
 	return scriptpubkey_p2tr(ctx, &shutdownkey);
 }
@@ -371,6 +354,17 @@ void drop_to_chain(struct lightningd *ld, struct channel *channel,
 	struct channel_inflight *inflight;
 	const char *cmd_id;
 
+	/* If we withheld the funding tx, we simply close */
+	if (channel->withheld) {
+		log_info(channel->log,
+			 "Withheld channel: not sending a close transaction");
+		resolve_close_command(ld, channel, cooperative,
+				      tal_arr(tmpctx, const struct bitcoin_tx *, 0));
+		free_htlcs(ld, channel);
+		delete_channel(channel, false);
+		return;
+	}
+
 	/* If we're not already (e.g. close before channel fully open),
 	 * make sure we're watching for the funding spend */
 	if (!channel->funding_spend_watch) {
@@ -497,6 +491,47 @@ void resend_closing_transactions(struct lightningd *ld)
 				continue;
 			}
 			abort();
+		}
+	}
+}
+
+static void resend_funding_done(struct bitcoind *bitcoind,
+				bool success,
+				const char *msg,
+				struct channel *channel)
+{
+	if (success)
+		log_info(channel->log, "Successfully rexmitted funding tx");
+	else
+		log_unusual(channel->log, "Failed to re-transmit funding tx: %s", msg);
+}
+
+void resend_opening_transactions(struct lightningd *ld)
+{
+	struct peer *peer;
+	struct channel *channel;
+	struct peer_node_id_map_iter it;
+
+	for (peer = peer_node_id_map_first(ld->peers, &it);
+	     peer;
+	     peer = peer_node_id_map_next(ld->peers, &it)) {
+		list_for_each(&peer->channels, channel, list) {
+			struct wally_tx *wtx;
+			if (channel_state_uncommitted(channel->state))
+				continue;
+			if (!channel->funding_psbt || channel->withheld)
+				continue;
+			if (channel->depth != 0)
+				continue;
+			wtx = psbt_final_tx(tmpctx, channel->funding_psbt);
+			if (!wtx)
+				continue;
+			bitcoind_sendrawtx(channel,
+					   ld->topology->bitcoind,
+					   NULL,
+					   tal_hex(tmpctx,
+						   linearize_wtx(tmpctx, wtx)),
+					   false, resend_funding_done, channel);
 		}
 	}
 }
@@ -744,7 +779,7 @@ static void subtract_offered_htlcs(const struct channel *channel,
 	     hout = htlc_out_map_next(ld->htlcs_out, &outi)) {
 		if (hout->key.channel != channel)
 			continue;
-		if (!amount_msat_sub(amount, *amount, hout->msat))
+		if (!amount_msat_deduct(amount, hout->msat))
 			*amount = AMOUNT_MSAT(0);
 	}
 }
@@ -761,7 +796,7 @@ static void subtract_received_htlcs(const struct channel *channel,
 	     hin = htlc_in_map_next(ld->htlcs_in, &ini)) {
 		if (hin->key.channel != channel)
 			continue;
-		if (!amount_msat_sub(amount, *amount, hin->msat))
+		if (!amount_msat_deduct(amount, hin->msat))
 			*amount = AMOUNT_MSAT(0);
 	}
 }
@@ -782,9 +817,9 @@ struct amount_msat channel_amount_spendable(const struct channel *channel)
 
 	/* If we're opener, subtract txfees we'll need to spend this */
 	if (channel->opener == LOCAL) {
-		if (!amount_msat_sub_sat(&spendable, spendable,
-					 commit_txfee(channel, spendable,
-						      LOCAL)))
+		if (!amount_msat_deduct_sat(&spendable,
+					    commit_txfee(channel, spendable,
+							 LOCAL)))
 			return AMOUNT_MSAT(0);
 	}
 
@@ -826,9 +861,9 @@ struct amount_msat channel_amount_receivable(const struct channel *channel)
 
 	/* If they're opener, subtract txfees they'll need to spend this */
 	if (channel->opener == REMOTE) {
-		if (!amount_msat_sub_sat(&receivable, receivable,
-					 commit_txfee(channel,
-						      receivable, REMOTE)))
+		if (!amount_msat_deduct_sat(&receivable,
+					    commit_txfee(channel,
+							 receivable, REMOTE)))
 			return AMOUNT_MSAT(0);
 	}
 
@@ -1059,11 +1094,8 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 		json_add_string(response, NULL, "option_static_remotekey");
 	if (channel_has(channel, OPT_ANCHOR_OUTPUTS_DEPRECATED))
 		json_add_string(response, NULL, "option_anchor_outputs");
-	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX)) {
-		if (command_deprecated_out_ok(cmd, "features", "v24.08", "v25.08"))
-			json_add_string(response, NULL, "option_anchors_zero_fee_htlc_tx");
+	if (channel_has(channel, OPT_ANCHORS_ZERO_FEE_HTLC_TX))
 		json_add_string(response, NULL, "option_anchors");
-	}
 	if (channel_has(channel, OPT_ZEROCONF))
 		json_add_string(response, NULL, "option_zeroconf");
 	if (channel_has(channel, OPT_SCID_ALIAS))
@@ -1137,6 +1169,9 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 				     channel->push);
 	}
 
+	if (channel->funding_psbt)
+		json_add_psbt(response, "psbt", channel->funding_psbt);
+	json_add_bool(response, "withheld", channel->withheld);
 	json_object_end(response);
 
 	if (!amount_sat_to_msat(&funding_msat, channel->funding_sats)) {
@@ -1162,7 +1197,7 @@ static void NON_NULL_ARGS(1, 2, 4, 5) json_add_channel(struct command *cmd,
 	json_add_amount_sat_msat(response, "dust_limit_msat",
 				 channel->our_config.dust_limit);
 	if (command_deprecated_out_ok(cmd, "max_total_htlc_in_msat",
-				      "v25.02", "v26.02"))
+				      "v25.02", "v26.03"))
 		json_add_amount_msat(response, "max_total_htlc_in_msat",
 				     channel->our_config.max_htlc_value_in_flight);
 	json_add_amount_msat(
@@ -1275,6 +1310,7 @@ struct peer_connected_hook_payload {
 	struct lightningd *ld;
 	struct wireaddr_internal addr;
 	struct wireaddr *remote_addr;
+	u8 *their_features;
 	bool incoming;
 	/* We don't keep a pointer to peer: it might be freed! */
 	struct node_id peer_id;
@@ -1288,17 +1324,12 @@ peer_connected_serialize(struct peer_connected_hook_payload *payload,
 	json_object_start(stream, "peer");
 	json_add_node_id(stream, "id", &payload->peer_id);
 	json_add_string(stream, "direction", payload->incoming ? "in" : "out");
-	json_add_string(
-	    stream, "addr",
-	    fmt_wireaddr_internal(stream, &payload->addr));
+	json_add_string(stream, "addr",
+			fmt_wireaddr_internal(tmpctx, &payload->addr));
 	if (payload->remote_addr)
-		json_add_string(
-		    stream, "remote_addr",
-		    fmt_wireaddr(stream, payload->remote_addr));
-	/* Since this is start of hook, peer is always in table! */
-	json_add_hex_talarr(stream, "features",
-			    peer_by_id(payload->ld, &payload->peer_id)
-			    ->their_features);
+		json_add_string(stream, "remote_addr",
+				fmt_wireaddr(tmpctx, payload->remote_addr));
+	json_add_hex_talarr(stream, "features", payload->their_features);
 	json_object_end(stream); /* .peer */
 }
 
@@ -1722,16 +1753,17 @@ REGISTER_PLUGIN_HOOK(peer_connected,
 		     peer_connected_serialize,
 		     struct peer_connected_hook_payload *);
 
-/* Connectd tells us a peer has connected: it never hands us duplicates, since
+/* Connectd tells us a peer has connected/reconnected: it never hands us duplicates, since
  * it holds them until we say peer_disconnected. */
-void peer_connected(struct lightningd *ld, const u8 *msg)
+void handle_peer_connected(struct lightningd *ld, const u8 *msg)
 {
 	struct node_id id;
-	u8 *their_features;
 	struct peer *peer;
 	struct peer_connected_hook_payload *hook_payload;
 	u64 connectd_counter;
 	const char *cmd_id;
+	char *connect_reason;
+	u64 connect_nsec;
 	struct wireaddr *last_known_addr;
 
 	hook_payload = tal(NULL, struct peer_connected_hook_payload);
@@ -1742,9 +1774,34 @@ void peer_connected(struct lightningd *ld, const u8 *msg)
 					      &hook_payload->addr,
 					      &hook_payload->remote_addr,
 					      &hook_payload->incoming,
-					      &their_features))
-		fatal("Connectd gave bad CONNECT_PEER_CONNECTED message %s",
-		      tal_hex(msg, msg));
+					      &hook_payload->their_features,
+					      &connect_reason,
+					      &connect_nsec)) {
+		u64 prev_connectd_counter, connected_time_nsec;
+		if (!fromwire_connectd_peer_reconnected(hook_payload, msg,
+							&id, &prev_connectd_counter,
+							&connectd_counter,
+							&hook_payload->addr,
+							&hook_payload->remote_addr,
+							&hook_payload->incoming,
+							&hook_payload->their_features,
+							&connected_time_nsec)) {
+			fatal("Connectd gave bad CONNECT_PEER_(RE)CONNECTED message %s",
+			      tal_hex(msg, msg));
+		}
+		/* Reconnect?  Mark the disconnect *first*, but don't
+		 * fail any connect attempts: this is a race. */
+		log_peer_debug(ld->log, &id, "peer reconnected");
+		peer_disconnected(ld, &id, prev_connectd_counter, connected_time_nsec, false);
+		connect_reason = tal_strdup(hook_payload, "");
+		connect_nsec = 0;
+	}
+
+	wallet_save_network_event(ld, &id,
+				  NETWORK_EVENT_CONNECT,
+				  hook_payload->incoming ? NULL : connect_reason,
+				  connect_nsec,
+				  false);
 
 	/* If we connected, and it's a normal address */
 	if (!hook_payload->incoming
@@ -1771,10 +1828,12 @@ void peer_connected(struct lightningd *ld, const u8 *msg)
 		/* If we connected to them, we know this is a good address. */
 		peer = new_peer(ld, 0, &id, &hook_payload->addr,
 				last_known_addr,
-				take(their_features), hook_payload->incoming);
+				hook_payload->their_features,
+				hook_payload->incoming);
 	} else {
 		tal_free(peer->their_features);
-		peer->their_features = tal_steal(peer, their_features);
+		peer->their_features = tal_dup_talarr(peer, u8,
+						      hook_payload->their_features);
 
 		/* Update known address. */
 		tal_free(peer->last_known_addr);
@@ -1819,6 +1878,8 @@ void peer_connected(struct lightningd *ld, const u8 *msg)
 		}
 	}
 
+	/* Free connection reason string to keep memleak detection happy. */
+	tal_free(connect_reason);
 	plugin_hook_call_peer_connected(ld, cmd_id, hook_payload);
 }
 
@@ -1881,7 +1942,7 @@ static void send_reestablish(struct peer *peer,
  * a subd.  Normally this is a race, but it happens for real when opening
  * a new channel, or referring to a channel we no longer want to talk to
  * it about. */
-void peer_spoke(struct lightningd *ld, const u8 *msg)
+void handle_peer_spoke(struct lightningd *ld, const u8 *msg)
 {
 	struct node_id id;
 	u16 msgtype;
@@ -2081,41 +2142,45 @@ static void destroy_disconnect_command(struct disconnect_command *dc)
 	list_del(&dc->list);
 }
 
-void peer_disconnect_done(struct lightningd *ld, const u8 *msg)
+/* This is also called when we reconnect, but we don't fail connect attempts */
+static void peer_disconnected(struct lightningd *ld,
+			      const struct node_id *id,
+			      u64 connectd_counter,
+			      u64 connected_time_nsec,
+			      bool fail_connect_attempts)
 {
-	struct node_id id;
-	u64 connectd_counter;
 	struct disconnect_command *i, *next;
 	struct peer *p;
 
-	if (!fromwire_connectd_peer_disconnect_done(msg, &id, &connectd_counter))
-		fatal("Connectd gave bad PEER_DISCONNECT_DONE message %s",
-		      tal_hex(msg, msg));
+	wallet_save_network_event(ld, id,
+				  NETWORK_EVENT_DISCONNECT,
+				  NULL, connected_time_nsec, false);
 
 	/* If we still have peer, it's disconnected now */
-	/* FIXME: We should keep peers until it tells us they're disconnected,
-	 * and not free when no more channels. */
-	p = peer_by_id(ld, &id);
+	p = peer_by_id(ld, id);
 	if (p) {
 		struct channel *channel;
 		assert(p->connectd_counter == connectd_counter);
-		log_peer_debug(ld->log, &id, "peer_disconnect_done");
+		log_peer_debug(ld->log, id, "peer_disconnected");
 		p->connected = PEER_DISCONNECTED;
 
+		/* Note: we don't force subds to stop.  They should exit soon,
+		 * but if we get a (re)connection we'll force them to stop */
 		list_for_each(&p->channels, channel, list)
 			channel_gossip_channel_disconnect(channel);
 	}
 
 	/* If you were trying to connect, it failed. */
-	connect_failed_disconnect(ld, &id,
-				  p && !p->connected_incoming ? &p->addr : NULL);
+	if (fail_connect_attempts)
+		connect_failed_disconnect(ld, id,
+					  p && !p->connected_incoming ? &p->addr : NULL);
 
 	/* Fire off plugin notifications */
-	notify_disconnect(ld, &id);
+	notify_disconnect(ld, id);
 
 	/* Wake any disconnect commands (removes self from list) */
 	list_for_each_safe(&ld->disconnect_commands, i, next, list) {
-		if (!node_id_eq(&i->id, &id))
+		if (!node_id_eq(&i->id, id))
 			continue;
 
 		was_pending(command_success(i->cmd,
@@ -2125,6 +2190,21 @@ void peer_disconnect_done(struct lightningd *ld, const u8 *msg)
 	/* If connection was only thing keeping it, this will delete it. */
 	if (p)
 		maybe_delete_peer(p);
+}
+
+void handle_peer_disconnected(struct lightningd *ld, const u8 *msg)
+{
+	struct node_id id;
+	u64 connectd_counter, connected_time_nsec;
+
+	if (!fromwire_connectd_peer_disconnected(msg,
+						 &id,
+						 &connectd_counter,
+						 &connected_time_nsec))
+		fatal("Connectd gave bad PEER_DISCONNECTED message %s",
+		      tal_hex(msg, msg));
+
+	peer_disconnected(ld, &id, connectd_counter, connected_time_nsec, true);
 }
 
 void update_channel_from_inflight(struct lightningd *ld,
@@ -2225,7 +2305,7 @@ static enum watch_result funding_depth_cb(struct lightningd *ld,
 			/* That's not entirely unexpected in early states */
 			log_debug(channel->log, "Funding tx %s reorganized out!",
 				  fmt_bitcoin_txid(tmpctx, txid));
-			channel->scid = tal_free(channel->scid);
+			channel_set_scid(channel, NULL);
 			return KEEP_WATCHING;
 
 		/* But it's often Bad News in later states */
@@ -2351,6 +2431,14 @@ void channel_watch_wrong_funding(struct lightningd *ld, struct channel *channel)
 	}
 }
 
+/* We need to do this before we change channel funding (for splice), otherwise
+ * funding_depth_cb will fail the assertion that it's the current funding tx */
+void channel_unwatch_funding(struct lightningd *ld, struct channel *channel)
+{
+	tal_free(find_txwatch(ld->topology,
+			      &channel->funding.txid, funding_depth_cb, channel));
+}
+
 void channel_watch_funding(struct lightningd *ld, struct channel *channel)
 {
 	log_debug(channel->log, "Watching for funding txid: %s",
@@ -2449,15 +2537,35 @@ static void json_add_scb(struct command *cmd,
 			 struct json_stream *response,
 			 struct channel *c)
 {
-	u8 *scb = tal_arr(cmd, u8, 0);
+	u8 *scb_wire = tal_arr(cmd, u8, 0);
+	struct modern_scb_chan *scb;
 
-	/* Update shachain & basepoints in SCB. */
-	c->scb->tlvs->shachain = &c->their_shachain.chain;
-	c->scb->tlvs->basepoints = &c->channel_info.theirbase;
-	towire_modern_scb_chan(&scb, c->scb);
+	/* Don't do scb for unix domain sockets. */
+	if (c->peer->addr.itype != ADDR_INTERNAL_WIREADDR)
+		return;
 
-	json_add_hex_talarr(response, fieldname,
-			    scb);
+	scb = tal(tmpctx, struct modern_scb_chan);
+	scb->id = c->dbid;
+	/* More useful to have last_known_addr, if avail */
+	if (c->peer->last_known_addr)
+		scb->addr = *c->peer->last_known_addr;
+	else
+		scb->addr = c->peer->addr.u.wireaddr.wireaddr;
+	scb->node_id = c->peer->id;
+	scb->funding = c->funding;
+	scb->cid = c->cid;
+	scb->funding_sats = c->funding_sats;
+	scb->type = channel_type_dup(scb, c->type);
+
+	scb->tlvs = tlv_scb_tlvs_new(scb);
+	scb->tlvs->shachain = &c->their_shachain.chain;
+	scb->tlvs->basepoints = &c->channel_info.theirbase;
+	scb->tlvs->opener = &c->opener;
+	scb->tlvs->remote_to_self_delay = &c->channel_info.their_config.to_self_delay;
+
+	towire_modern_scb_chan(&scb_wire, scb);
+
+	json_add_hex_talarr(response, fieldname, scb_wire);
 }
 
 /* This will return a SCB for all the channels currently loaded
@@ -2482,8 +2590,7 @@ static struct command_result *json_staticbackup(struct command *cmd,
 	     peer = peer_node_id_map_next(cmd->ld->peers, &it)) {
 		struct channel *channel;
 		list_for_each(&peer->channels, channel, list){
-			/* cppcheck-suppress uninitvar - false positive on channel */
-			if (!channel->scb)
+			if (channel_state_uncommitted(channel->state))
 				continue;
 			json_add_scb(cmd, NULL, response, channel);
 		}
@@ -2524,16 +2631,22 @@ static struct command_result *json_listpeerchannels(struct command *cmd,
 	struct peer *peer;
 	struct json_stream *response;
 	struct short_channel_id *scid;
+	struct channel_id *cid;
 
 	if (!param_check(cmd, buffer, params,
 			 p_opt("id", param_node_id, &peer_id),
 			 p_opt("short_channel_id", param_short_channel_id, &scid),
+			 p_opt("channel_id", param_channel_id, &cid),
 			 NULL))
 		return command_param_failed();
 
-	if (scid && peer_id)
+	int count = (peer_id != NULL) + (scid != NULL) + (cid != NULL);
+	if (count > 1) {
 		return command_fail(cmd, JSONRPC2_INVALID_PARAMS,
-				    "Cannot specify both short_channel_id and id");
+				    "Must not specify more than one of "
+					 "short_channel_id, channel_id or id"
+		);
+	}
 
 	response = json_stream_success(cmd);
 	json_array_start(response, "channels");
@@ -2544,6 +2657,10 @@ static struct command_result *json_listpeerchannels(struct command *cmd,
 			json_add_peerchannels(cmd, response, peer);
 	} else if (scid) {
 		const struct channel *c = any_channel_by_scid(cmd->ld, *scid, true);
+		if (c)
+			json_add_channel(cmd, response, NULL, c, c->peer);
+	} else if (cid) {
+		const struct channel *c = channel_by_cid(cmd->ld, cid);
 		if (c)
 			json_add_channel(cmd, response, NULL, c, c->peer);
 	} else {
@@ -2661,7 +2778,9 @@ static void setup_peer(struct peer *peer)
 	/* Make sure connectd knows to try reconnecting (unless
 	 * --dev-no-reconnect). */
 	if (connect && ld->reconnect)
-		connectd_connect_to_peer(ld, peer, important);
+		connectd_connect_to_peer(ld, peer,
+					 "started with channel",
+					 important);
 }
 
 void setup_peers(struct lightningd *ld)
@@ -3153,7 +3272,7 @@ static void set_channel_config(struct command *cmd, struct channel *channel,
 	    || (htlc_max
 		&& amount_msat_less(*htlc_max, channel->htlc_maximum_msat))) {
 		channel->old_feerate_timeout
-			= timeabs_add(time_now(), time_from_sec(delaysecs));
+			= timemono_add(time_mono(), time_from_sec(delaysecs));
 		channel->old_feerate_base = channel->feerate_base;
 		channel->old_feerate_ppm = channel->feerate_ppm;
 		channel->old_htlc_minimum_msat = channel->htlc_minimum_msat;

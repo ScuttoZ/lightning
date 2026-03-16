@@ -407,9 +407,10 @@ def test_invoice_expiry(node_factory, executor):
 
     # Test expiration waiting.
     # The second invoice created expires first.
-    l2.rpc.invoice('any', 'inv1', 'description', 10)
-    l2.rpc.invoice('any', 'inv2', 'description', 4)
-    l2.rpc.invoice('any', 'inv3', 'description', 16)
+    # Times should be long enough even for our terrible CI runners!
+    l2.rpc.invoice('any', 'inv1', 'description', 16)
+    l2.rpc.invoice('any', 'inv2', 'description', 10)
+    l2.rpc.invoice('any', 'inv3', 'description', 22)
 
     # Check waitinvoice correctly waits
     w1 = executor.submit(l2.rpc.waitinvoice, 'inv1')
@@ -419,19 +420,18 @@ def test_invoice_expiry(node_factory, executor):
     assert not w1.done()
     assert not w2.done()
     assert not w3.done()
-    time.sleep(4)  # total 6
+    time.sleep(7)  # total 9
     assert not w1.done()
 
-    with pytest.raises(RpcError):
+    with pytest.raises(RpcError):  # total 10
         w2.result()
     assert not w3.done()
 
-    time.sleep(6)  # total 12
-    with pytest.raises(RpcError):
+    time.sleep(5)  # total 15
+    with pytest.raises(RpcError):  # total 16
         w1.result()
     assert not w3.done()
 
-    time.sleep(8)  # total 20
     with pytest.raises(RpcError):
         w3.result()
 
@@ -571,19 +571,20 @@ def test_waitanyinvoice_reversed(node_factory, executor):
 def test_decode_unknown(node_factory):
     l1 = node_factory.get_node()
 
-    b11 = l1.rpc.decode('lntb30m1pw2f2yspp5s59w4a0kjecw3zyexm7zur8l8n4scw674w8sftjhwec33km882gsdpa2pshjmt9de6zqun9w96k2um5ypmkjargypkh2mr5d9cxzun5ypeh2ursdae8gxqruyqvzddp68gup69uhnzwfj9cejuvf3xshrwde68qcrswf0d46kcarfwpshyaplw3skw0tdw4k8g6tsv9e8gu2etcvsym36pdjpz04wm9nn96f9ntc3t3h5r08pe9d62p3js5wt5rkurqnrl7zkj2fjpvl3rmn7wwazt80letwxlm22hngu8n88g7hsp542qpl')
+    # Made with "devtools/bolt11-cli encode 41bfd2660762506c9933ade59f1debf7e6495b10c14a92dbcd2d623da2507d3d s=0000000000000000000000000000000000000000000000000000000000000000 timestamp=1554294928 p=850aeaf5f69670e8889936fc2e0cff3ceb0c3b5eab8f04ae57767118db673a91 d='Payment request with multipart support' x=28800 118=0d011a07081c011a051c1713020e0912051819121c0c0911061017030e0d191a07001803100e090f0d151a16181d03090e011017041d011f0e1110160e0f0b0d0e151607081a0b100c05190708" amount=3000000000 currency=tb
+    b11 = l1.rpc.decode('lntb30m1pw2f2yssp5qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqpp5s59w4a0kjecw3zyexm7zur8l8n4scw674w8sftjhwec33km882gsdpa2pshjmt9de6zqun9w96k2um5ypmkjargypkh2mr5d9cxzun5ypeh2ursdae8gxqruyqcqpjvzddp68gup69uhnzwfj9cejuvf3xshrwde68qcrswf0d46kcarfwpshyaplw3skw0tdw4k8g6tsv9e8g02pjf6p8tqx0fy6vmxnrvsjmnx7us54ml9uk0927wy4mq5wne8pr6g6mmew03y60lt5mvzyksf7yjwq4qxlun5cca9amgkxggr2xkvcqukuyuf')
     assert b11['type'] == 'bolt11 invoice'
     assert b11['currency'] == 'tb'
     assert b11['created_at'] == 1554294928
     assert b11['payment_hash'] == '850aeaf5f69670e8889936fc2e0cff3ceb0c3b5eab8f04ae57767118db673a91'
     assert b11['description'] == 'Payment request with multipart support'
     assert b11['expiry'] == 28800
-    assert b11['payee'] == '02330d13587b67a85c0a36ea001c4dba14bcd48dda8988f7303275b040bffb6abd'
+    assert b11['payee'] == '0266e4598d1d3c415f572a8488830b60f7e744ed9235eb0b1ba93283b315c03518'
     assert b11['min_final_cltv_expiry'] == 18
     extra = only_one(b11['extra'])
     assert extra['tag'] == 'v'
     assert extra['data'] == 'dp68gup69uhnzwfj9cejuvf3xshrwde68qcrswf0d46kcarfwpshyaplw3skw0tdw4k8g6tsv9e8g'
-    assert b11['signature'] == '3045022100e2b2bc3204dc7416c8227d5db2ce65d24b35e22b8de8379c392b74a0c650a397022041db8304c7ff0ad25264167e23dcfce7744b3bff95b8dfda9579a38799ce8f5e'
+    assert b11['signature'] == '304402207a8324e827580cf4934cd9a636425b99bdc852bbf97967955e712bb051d3c9c202203d235bde5cf8934ffae9b60896827c49381501bfc9d318e97bb458c840d46b33'
     assert 'fallbacks' not in b11
     assert 'routes' not in b11
 
@@ -667,7 +668,7 @@ def test_wait_invoices(node_factory, executor):
 
     # Now ask for 1.
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'created', 'nextvalue': 1})
-    time.sleep(1)
+    l2.daemon.wait_for_log('waiting on invoices created 1')
 
     inv = l2.rpc.invoice(42, 'invlabel', 'invdesc')
     waitres = waitfut.result(TIMEOUT)
@@ -690,7 +691,7 @@ def test_wait_invoices(node_factory, executor):
                        'updated': 0}
 
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'updated', 'nextvalue': 1})
-    time.sleep(1)
+    l2.daemon.wait_for_log('waiting on invoices updated 1')
     l1.rpc.pay(inv['bolt11'])
     waitres = waitfut.result(TIMEOUT)
     assert waitres == {'subsystem': 'invoices',
@@ -723,7 +724,7 @@ def test_wait_invoices(node_factory, executor):
                        'deleted': 0}
 
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'deleted', 'nextvalue': 1})
-    time.sleep(1)
+    l2.daemon.wait_for_log('waiting on invoices deleted 1')
     l2.rpc.delinvoice('invlabel', 'paid')
     waitres = waitfut.result(TIMEOUT)
 
@@ -740,7 +741,8 @@ def test_wait_invoices(node_factory, executor):
 
     # Now check autoclean works.
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'deleted', 'nextvalue': 2})
-    time.sleep(2)
+    l2.daemon.wait_for_log('waiting on invoices deleted 2')
+    time.sleep(1)
     l2.rpc.autoclean_once('expiredinvoices', 1)
     waitres = waitfut.result(TIMEOUT)
 
@@ -752,7 +754,7 @@ def test_wait_invoices(node_factory, executor):
 
     # Creating a new on gives us 3, not another 2!
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'created', 'nextvalue': 3})
-    time.sleep(1)
+    l2.daemon.wait_for_log('waiting on invoices created 3')
     inv = l2.rpc.invoice(42, 'invlabel2', 'invdesc2', deschashonly=True)
     waitres = waitfut.result(TIMEOUT)
     assert waitres == {'subsystem': 'invoices',
@@ -765,7 +767,7 @@ def test_wait_invoices(node_factory, executor):
 
     # Deleting a description causes updated to fire!
     waitfut = executor.submit(l2.rpc.call, 'wait', {'subsystem': 'invoices', 'indexname': 'updated', 'nextvalue': 3})
-    time.sleep(1)
+    l2.daemon.wait_for_log('waiting on invoices updated 3')
     l2.rpc.delinvoice('invlabel2', status='unpaid', desconly=True)
     waitres = waitfut.result(TIMEOUT)
     assert waitres == {'subsystem': 'invoices',
@@ -818,7 +820,7 @@ def test_invoice_deschash(node_factory, chainparams):
     assert inv['description'] == b11['description_hash']
 
 
-def test_listinvoices_index(node_factory, executor):
+def test_listinvoices_index(node_factory):
     l1, l2 = node_factory.line_graph(2)
 
     invs = {}
@@ -862,7 +864,7 @@ def test_listinvoices_index(node_factory, executor):
         assert only_one(l2.rpc.listinvoices(index='updated', start=i, limit=1)['invoices'])['label'] == str(70 + 1 - i)
 
 
-def test_unified_invoices(node_factory, executor, bitcoind):
+def test_unified_invoices(node_factory, bitcoind):
     l1, l2 = node_factory.line_graph(2, opts={'invoices-onchain-fallback': None})
     amount_sat = 1000
     inv = l1.rpc.invoice(amount_sat * 1000, "inv1", "test_unified_invoices")
@@ -917,6 +919,7 @@ def test_invoices_wait_db_migration(node_factory, bitcoind):
     bitcoind.generate_block(28)
     l2 = node_factory.get_node(node_id=2,
                                dbfile='invoices_pre_waitindex.sqlite3.xz',
+                               old_hsmsecret=True,
                                options={'database-upgrade': True})
 
     # And now we crash:
@@ -931,8 +934,125 @@ def test_invoice_botched_migration(node_factory, chainparams):
     Error executing statement: wallet/db.c:1684: UPDATE vars SET name = 'last_invoices_created_index' WHERE name = 'last_invoice_created_index': UNIQUE constraint failed: vars.name
     """
     l1 = node_factory.get_node(dbfile='invoices_botched_waitindex_migrate.sqlite3.xz',
+                               old_hsmsecret=True,
                                options={'database-upgrade': True})
 
     assert ([(i['created_index'], i['label']) for i in l1.rpc.listinvoices()["invoices"]]
             == [(1, "made_after_bad_migration"), (2, "label1")])
     assert l1.rpc.invoice(100, "test", "test")["created_index"] == 3
+
+
+def test_payment_fronting(node_factory):
+    # Nodes will not front for offers if they don't have an advertized address, so allow localhost.
+    l1, l2 = node_factory.get_nodes(2, opts={'dev-allow-localhost': None})
+    l3, l4 = node_factory.get_nodes(2, opts=[{'payment-fronting-node': l1.info['id'],
+                                              'dev-allow-localhost': None},
+                                             {'payment-fronting-node': [l1.info['id'], l2.info['id']],
+                                              'dev-allow-localhost': None}])
+
+    assert l3.rpc.listconfigs('payment-fronting-node') == {'configs': {'payment-fronting-node': {'sources': ['cmdline'], 'values_str': [l1.info['id']]}}}
+    assert l4.rpc.listconfigs('payment-fronting-node') == {'configs': {'payment-fronting-node': {'sources': ['cmdline', 'cmdline'], 'values_str': [l1.info['id'], l2.info['id']]}}}
+
+    # l1  <----> l3
+    #   \
+    #    \-----> l4 <----> l2
+    node_factory.join_nodes([l1, l3], wait_for_announce=True)
+    node_factory.join_nodes([l1, l4], wait_for_announce=True)
+    node_factory.join_nodes([l2, l4], wait_for_announce=True)
+
+    l3inv = l3.rpc.invoice(1000, 'l3inv', 'l3inv')['bolt11']
+    assert only_one(only_one(l3.rpc.decode(l3inv)['routes']))['pubkey'] == l1.info['id']
+
+    l4inv = l4.rpc.invoice(1000, 'l4inv', 'l4inv')['bolt11']
+    assert [only_one(r)['pubkey'] for r in l4.rpc.decode(l4inv)['routes']] == [l1.info['id'], l2.info['id']]
+
+    l1.rpc.xpay(l3inv)
+    l1.rpc.xpay(l4inv)
+
+    # Now test offers.
+    l3offer = l3.rpc.offer(1000, 'l3offer', 'l3offer')['bolt12']
+    assert only_one(l3.rpc.decode(l3offer)['offer_paths'])['first_node_id'] == l1.info['id']
+
+    l4offer = l4.rpc.offer(1000, 'l4offer', 'l4offer')['bolt12']
+    assert [r['first_node_id'] for r in l4.rpc.decode(l4offer)['offer_paths']] == [l1.info['id'], l2.info['id']]
+
+    l3invb12 = l1.rpc.fetchinvoice(l3offer)['invoice']
+    l4invb12 = l1.rpc.fetchinvoice(l4offer)['invoice']
+
+    assert only_one(l3.rpc.decode(l3invb12)['invoice_paths'])['first_node_id'] == l1.info['id']
+    # Given multiple, it will pick one.
+    assert only_one(l3.rpc.decode(l4invb12)['invoice_paths'])['first_node_id'] in (l1.info['id'], l2.info['id'])
+
+    l1.rpc.xpay(l3invb12)
+    l1.rpc.xpay(l4invb12)
+
+    # Balance so l3 can pay ->l1->l4.
+    l3inv2 = l3.rpc.invoice(10000000, 'l3inv2', 'l3inv2')['bolt11']
+    l1.rpc.xpay(l3inv2)
+
+    # When l3 creates an invoice request, it will also use the fronting nodes.
+    l3invreq = l3.rpc.invoicerequest(amount=1000, description='l3invreq')['bolt12']
+    assert only_one(l3.rpc.decode(l3invreq)['invreq_paths'])['first_node_id'] == l1.info['id']
+    l4.rpc.sendinvoice(invreq=l3invreq, label='l3invreq')
+
+    # We can explicitly override offers: make it use a specific node
+    l4offer_front2 = l4.rpc.offer(1000, 'l4offer', 'l4offer', fronting_nodes=[l2.info['id']])['bolt12']
+    assert [r['first_node_id'] for r in l4.rpc.decode(l4offer_front2)['offer_paths']] == [l2.info['id']]
+
+    # ... or make it not front at all
+    l4offer_nofront = l4.rpc.offer(1000, 'l4offer', 'l4offer', fronting_nodes=[])['bolt12']
+    assert 'offer_paths' not in l4.rpc.decode(l4offer_nofront)
+
+
+def test_offer_fronting(node_factory):
+    # l1 -> l2 -> l3
+    #         \   /
+    #          l4
+    # Nodes will not front for offers if they don't have an advertized address.
+    l1, l2, l3, l4 = node_factory.get_nodes(4, opts={'dev-allow-localhost': None})
+    node_factory.join_nodes([l1, l2, l3], wait_for_announce=True)
+    node_factory.join_nodes([l2, l4], wait_for_announce=True)
+    node_factory.join_nodes([l3, l4], wait_for_announce=True)
+
+    offer_nofront = l4.rpc.offer("any", "nofront")['bolt12']
+    assert 'offer_paths' not in l1.rpc.decode(offer_nofront)
+    offer_front_l2 = l4.rpc.offer("any", "frontl2", fronting_nodes=[l2.info['id']])['bolt12']
+    assert only_one(l1.rpc.decode(offer_front_l2)['offer_paths'])['first_node_id'] == l2.info['id']
+    offer_front_l2l3 = l4.rpc.offer("any", "frontl2l3", fronting_nodes=[l2.info['id'], l3.info['id']])['bolt12']
+    assert [p['first_node_id'] for p in l1.rpc.decode(offer_front_l2l3)['offer_paths']] == [l2.info['id'], l3.info['id']]
+
+    inv_nofront = l1.rpc.fetchinvoice(offer_nofront, 1)['invoice']
+    assert only_one(l1.rpc.decode(inv_nofront)['invoice_paths'])['first_node_id'] == l4.info['id']
+    l1.rpc.xpay(inv_nofront)
+
+    inv_front_l2 = l1.rpc.fetchinvoice(offer_front_l2, 2)['invoice']
+    assert only_one(l1.rpc.decode(inv_front_l2)['invoice_paths'])['first_node_id'] == l2.info['id']
+    l1.rpc.xpay(inv_front_l2)
+
+    inv_front_l2l3 = l1.rpc.fetchinvoice(offer_front_l2l3, 3)['invoice']
+    assert only_one(l1.rpc.decode(inv_front_l2l3)['invoice_paths'])['first_node_id'] in (l2.info['id'], l3.info['id'])
+    l1.rpc.xpay(inv_front_l2l3)
+
+
+def test_invoice_maxdesc(node_factory, chainparams):
+    l1, l2 = node_factory.line_graph(2)
+
+    # BOLT #11:
+    #
+    # Note that the maximum length of a Tagged Field's `data` is constricted
+    # by the maximum value of `data_length`. This is 1023 x 5 bits, or 639
+    # bytes.
+    maxdesc = "x" * 639
+
+    # This should fail!
+    with pytest.raises(RpcError, match=r'Description greater than 639 bytes invalid \(description length 641\)'):
+        l1.rpc.invoice(123000, 'test_invoice_maxdesc', maxdesc + 'xx')
+
+    # This should also fail, but used to produce
+    # lnbcrt1230n1p5dm097sp545trjl795r3mm86mk4ln5jpjvnh04x8aryl3qadjt99vspu646zspp52hf43ln8vg0564ljwccs8d84xc70ls8n7wdmp75ygp7ll8rprqzsdqq0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rc0pu8s7rcxqyjw5qcqp99qxpqysgqr6l8swzm6jc42ehy4v7s83jrggtwa9ua39cvy46c46tmqwn97mn43ycww7e9cf4w5ws8lxnef2k3m5nfa5c34nz54jaxhzc5e72q0ccq26n9fx
+    with pytest.raises(RpcError, match=r'Description greater than 639 bytes invalid \(description length 640\)'):
+        l1.rpc.invoice(123000, 'test_invoice_maxdesc2', maxdesc + 'x')
+
+    # This should succeed.
+    inv = l1.rpc.invoice(123000, 'test_invoice_maxdesc3', maxdesc)
+    assert l1.rpc.decode(inv['bolt11'])['description'] == maxdesc

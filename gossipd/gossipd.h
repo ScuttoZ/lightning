@@ -2,16 +2,14 @@
 #define LIGHTNING_GOSSIPD_GOSSIPD_H
 #include "config.h"
 #include <ccan/ccan/opt/opt.h>
+#include <ccan/htable/htable_type.h>
 #include <ccan/timer/timer.h>
 #include <common/node_id.h>
 #include <lightningd/options.h>
 #include <wire/peer_wire.h>
 
-/* We talk to `hsmd` to sign our gossip messages with the node key */
-#define HSM_FD 3
-/* connectd asks us for help finding nodes, and gossip fds for new peers */
-#define CONNECTD_FD 4
-#define CONNECTD2_FD 5
+/* connectd forwards gossip messages to us. */
+#define CONNECTD_FD 3
 
 struct chan;
 struct peer;
@@ -65,8 +63,8 @@ struct daemon {
 	/* Features lightningd told us to set. */
 	struct feature_set *our_features;
 
-	/* Override local time for gossip messages */
-	struct timeabs *dev_gossip_time;
+	/* Program to run to compact the datastore */
+	char *compactd_helper;
 
 	/* Speed up gossip. */
 	bool dev_fast_gossip;
@@ -162,17 +160,5 @@ void tell_lightningd_peer_update(struct daemon *daemon,
 				 u16 cltv_delta,
 				 struct amount_msat htlc_minimum,
 				 struct amount_msat htlc_maximum);
-
-/**
- * Get the local time.
- *
- * This gets overridden in dev mode so we can use canned (stale) gossip.
- */
-struct timeabs gossip_time_now(const struct daemon *daemon);
-
-/**
- * Is this gossip timestamp reasonable?
- */
-bool timestamp_reasonable(const struct daemon *daemon, u32 timestamp);
 
 #endif /* LIGHTNING_GOSSIPD_GOSSIPD_H */
