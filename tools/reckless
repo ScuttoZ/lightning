@@ -22,7 +22,7 @@ from urllib.request import urlopen
 import venv
 
 
-__VERSION__ = 'v25.12'
+__VERSION__ = 'v26.04rc1'
 
 logging.basicConfig(
     level=logging.INFO,
