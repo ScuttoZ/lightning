@@ -20,7 +20,7 @@ for v in jammy noble resolute; do
 	bash -c "apt-get update && apt-get install -y debootstrap && debootstrap $v /build/$v"
   sudo tar -C $v -c . | sudo docker import - $v
   echo "$v release:"
-  sudo docker run ubuntu:$v cat /etc/lsb-release
+  sudo docker run "$v" cat /etc/lsb-release
   echo "Building CL repro $v:"
   # shellcheck disable=SC2024
   sudo docker build --no-cache -t cl-repro-$v - < "$LIGHTNING_DIR"/contrib/reprobuild/Dockerfile.$v
